@@ -470,6 +470,7 @@ class Dispatch {
    * EOF after the final reply (the peer may half-close after sending its calls and still read the replies).
    */
   #gone(): boolean {
+    // Belt and braces: onClosed (session.closedSignal) normally marked the call gone already.
     if (!this.#done && this.#session.state === "closed") this.#markClosedUnder();
     return this.#dead || this.#closedUnder;
   }
@@ -606,8 +607,8 @@ class Dispatch {
       bytes = make();
     } catch (e) {
       if (this.#session.state !== "open") {
-        // Closed under us (client gone, shutdown): replies are dropped silently, and the handler learns that
-        // the connection is gone (ctx.signal aborts, notify rejects) even if the driver did not abort its signal.
+        // Closed under us (client gone, shutdown): replies are dropped silently. Belt and braces: onClosed
+        // (session.closedSignal) has normally marked the call gone already.
         this.#markClosedUnder();
         return "dropped";
       }
@@ -617,6 +618,9 @@ class Dispatch {
     } finally {
       this.#producing = false;
     }
+    // The session closed while producing this reply (a lost upgrade remainder: nothing is confirmed, `make()`
+    // returned null and onClosed marked the call gone): report it as dropped so a notify-style reply rejects.
+    if (this.#closedUnder) return "dropped";
     if (final) this.#done = true;
     if (bytes !== null) {
       const chunk = bytes;

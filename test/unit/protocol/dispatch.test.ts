@@ -849,7 +849,7 @@ describe("ctx.notify (rule 15)", () => {
     assert.equal(sent.length, 0);
   });
 
-  test("a generator yielding after session.close() (no signal listener involved): dropped, return() runs", async () => {
+  test("a generator yielding after session.close(): ctx.signal already aborted, the yield is dropped, return() runs", async () => {
     const session = new ServerSession();
     session.receive(msg({ method: `${I}.Monitor`, more: true }));
     const ev = session.nextEvent();
@@ -1475,6 +1475,30 @@ describe("onError, send failures, aborts, upgrade, oneway", () => {
     assert.equal(r.output.length, 0); // the peer never sees "upgraded"
     assert.deepEqual(reported, []); // no InternalError attempt, no upgrade-unclaimed
     assert.equal(session.state, "closed");
+    assert.ok(r.close?.type === "close" && r.close.error instanceof MessageTooLargeError);
+  });
+
+  test("upgrade: remainder lost, notify-style confirmation: notify rejects, ctx.signal aborted, nothing written", async () => {
+    const session = new ServerSession({ maxMessageSize: 64 });
+    let rejection: unknown;
+    let aborted = false;
+    const table = tableOf([FTL], {
+      [`${I}.Up`]: async (_p: unknown, ctx: CallContext) => {
+        rejection = await ctx.notify({ ok: true }).then(
+          () => null,
+          (e: unknown) => e,
+        );
+        aborted = ctx.signal.aborted;
+      },
+    });
+    const r = await serve(
+      [concat([msg({ method: `${I}.Up`, upgrade: true }), new Uint8Array(100).fill(0x78)]), new Uint8Array(8)],
+      table,
+      { session, eof: false },
+    );
+    assert.ok(rejection instanceof ConnectionClosedError);
+    assert.equal(aborted, true);
+    assert.equal(r.output.length, 0);
     assert.ok(r.close?.type === "close" && r.close.error instanceof MessageTooLargeError);
   });
 

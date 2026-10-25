@@ -130,15 +130,15 @@ export class ServerSession {
       const text = this.#framer.next();
       if (text === null) {
         if (!this.#eof) return null;
-        this.#setClosed();
         this.#closeDelivered = true;
+        this.#setClosed();
         return { type: "close" };
       }
       call = decodeCall(this.#codec.decode(text));
     } catch (e) {
-      this.#setClosed();
       this.#closeDelivered = true;
       const error = e instanceof ProtocolError ? e : new ProtocolError("malformed message", { cause: e });
+      this.#setClosed();
       return { type: "close", error };
     }
     const id = this.#nextId++;
@@ -229,6 +229,8 @@ export class ServerSession {
     return this.#closedController.signal;
   }
 
+  /** Sets the state to `closed` and then aborts {@link closedSignal}: call it last, once every other field is
+   *  updated, so listeners see a consistent session (pending close event included). */
   #setClosed(): void {
     this.#state = "closed";
     if (!this.#closedController.signal.aborted) this.#closedController.abort();
@@ -245,9 +247,10 @@ export class ServerSession {
    */
   close(): void {
     const wasOpen = this.#state === "open";
-    this.#setClosed();
+    this.#state = "closed";
     this.#active = null;
     if (wasOpen && !this.#closeDelivered && this.#closeEvent === null) this.#closeEvent = { type: "close" };
+    this.#setClosed();
   }
 
   /**
@@ -282,11 +285,12 @@ export class ServerSession {
       return true;
     } catch (e) {
       // Upgraded bytes were dropped by the size limit: the stream cannot be handed over intact.
-      this.#setClosed();
+      this.#state = "closed";
       this.#closeEvent = {
         type: "close",
         error: e instanceof ProtocolError ? e : new ProtocolError("upgrade remainder lost", { cause: e }),
       };
+      this.#setClosed();
       return false;
     }
   }

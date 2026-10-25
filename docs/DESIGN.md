@@ -626,7 +626,10 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   delivered, then `{type: "close"}`. `close()` is local: nothing more is produced. There is at most one close
   event, and the driver always gets it: a `close()` before one was delivered (by the driver, or by dispatch after a
   failed send or an unencodable `InternalError`) makes the next `nextEvent()` return one, keeping a pending error
-  (e.g. the lost upgrade remainder's `MessageTooLargeError`), else `{type: "close"}`; then null.
+  (e.g. the lost upgrade remainder's `MessageTooLargeError`), else `{type: "close"}`; then null. `closedSignal`
+  aborts whenever the state becomes `closed`, after every other field (the pending close event included) is
+  updated; dispatch listens to it while its call is unanswered. The driver awaits `dispatchCall` before taking the
+  next call, so at most one dispatch listens at a time.
 - **Dispatch** (`dispatchCall(session, id, call, table, send, options)`, never rejects, resolves when the call is
   finished): checks in order 1. `parseMethodName` (last dot; interface and member grammar) → `InvalidParameter
   {parameter: "method"}`; 2. `InterfaceNotFound {interface}` / `MethodNotFound {method}`; 3. `requires` more →
