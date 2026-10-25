@@ -71,6 +71,15 @@ test("varlink-js exports the types and errors API (M2)", () => {
   assert.equal("parseInterface" in root, false); // the IDL API lives in varlink-js/idl
 });
 
+test("varlink-js exports the handler-facing protocol API, varlink-js/testing the channels (M3)", () => {
+  assert.equal(typeof root.streamOf, "function");
+  assert.equal(root.DEFAULT_MAX_MESSAGE_SIZE, 16 * 1024 * 1024);
+  for (const internal of ["ServerSession", "ClientSession", "Framer", "dispatchCall", "encodeCall"])
+    assert.equal(internal in root, false, internal); // core-internal until M4
+  assert.equal(typeof testing.pair, "function");
+  assert.equal(typeof testing.faulty, "function");
+});
+
 test("bin points at the compiled CLI entry", () => {
   assert.deepEqual(pkg.bin, { "varlink-js": "./dist/cli/main.js" });
   assert.ok(existsSync(resolve("src/cli/main.ts")));

@@ -355,7 +355,8 @@ vendor extensions: kept in `ext`, otherwise ignored); `parameters` neither objec
 Rules that need call context (a `continues` reply to a call without `more`, a reply with no pending call)
 are enforced in the sessions (§4.5), not in the decoder. A syntactically valid message whose `method`
 is not a fully-qualified `interface.Method` gets a reply (§5.4), not a close.
-Encoding omits defaults (no `parameters:{}`, no `continues:false`; F17).
+Encoding always writes `parameters` (`{}` when empty, as sd-varlink does: some peers index it directly) and
+omits false flags (no `continues:false`, `oneway:false`, …) and an absent `error` (F17).
 
 ### 4.5 Sessions (sans-IO state machines)
 
@@ -558,6 +559,91 @@ entry.
   (`varlink-js.UpgradePending`), `OperationNotSupportedError` (`varlink-js.OperationNotSupported`),
   `ValidationError` and `IntegerRangeError` (`org.varlink.service.InvalidParameter`).
 
+### 4.10 Protocol and sessions (M3)
+
+`src/core/protocol/`: `channel.ts` (the §4.1 types), `framer.ts`, `messages.ts`, `client-session.ts`,
+`server-session.ts`, `dispatch.ts`, all re-exported by `src/core/index.ts`; the root entry exports only the
+handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the `ByteChannel` types and
+`DEFAULT_MAX_MESSAGE_SIZE`); M4 decides on exposing sessions. `src/testing/` (`varlink-js/testing`): `pair()`,
+`faulty()`.
+- **Framer**: one growable `Uint8Array` (doubling, compacted with `copyWithin` once the read offset passes half the
+  buffer or before growing); each byte is scanned for NUL once, on push, so 1-byte pushes stay O(n). Size = bytes
+  before the NUL; `> maxMessageSize` (default 16 MiB, a positive safe integer) is an error, exactly the limit is
+  fine. As soon as the incomplete message is over the limit, a `MessageTooLargeError` is recorded and later pushes
+  are dropped (memory ≤ limit + one chunk + complete messages); `next()` still returns the complete messages before
+  it, then throws it. UTF-8 is decoded with `fatal` and `ignoreBOM` (a leading U+FEFF stays in the text, so JSON
+  parsing rejects it); invalid UTF-8 is a `ProtocolError` (`cause` = the `TypeError`) when that message is reached.
+  After `next()` threw, it rethrows the same error and `push()` is a no-op. `completeMessages` counts buffered
+  complete messages (server backpressure); `accepting` is false once push would be ignored. `takeRemainder()`
+  (upgrade) returns a copy of the unconsumed bytes and finishes the framer; it throws the pending
+  `MessageTooLargeError` if bytes were dropped, so a truncated stream is never handed over. `frameMessage()`
+  refuses U+0000 and lone surrogates (`TypeError`).
+- **Messages**: decode = §4.4 (null ≡ absent for every header; a key containing `.` goes to `ext`, built with own
+  data properties; a header valid only in the other direction is an unknown key; `method` syntax is dispatch's
+  job; the error name is not checked). Errors name the header and quote a peer key only via `JSON.stringify`, cut
+  to 64 characters. Decoded `parameters` are used by reference. Encode key order: call `method, parameters,
+  oneway|more|upgrade, ext…`; reply `error?, parameters, continues?, ext…`; caller bugs (bad types, several flags,
+  `continues` with `error`, an ext key without `.`) are `TypeError`s, as are codec failures.
+- **ClientSession**: `call(init)` returns `{id, bytes}` (ids from 1, increasing); oneway calls get an id but never
+  enter the reply FIFO. `call()` throws `UpgradePendingError` while an upgrade call is pending and
+  `ConnectionClosedError` when closed or upgraded, and never changes state when it throws. `receive()` returns
+  events (`reply`, `error`, `upgraded`, `failed`, `closed`) in stream order; a violation (decode/framer error,
+  reply with no pending call, `continues` for a `single`/`upgrade` entry) fails every pending entry with
+  `ConnectionClosedError` (`cause` = the `ProtocolError`) after the events decoded before it, then `closed` with
+  the error. A final non-error reply to the upgrade call stops decoding at once: state `upgraded`, the bytes after
+  its NUL (and later `receive()`s) are `takeUpgradeRemainder()` (once). An error reply to it keeps the session
+  open. `receiveEnd()` (EOF) fails pending calls with "connection closed by peer" and discards a partial message;
+  `close(reason)` is idempotent.
+- **ServerSession**: `nextEvent()` decodes lazily and hands out one call at a time (ids from 1); the next one only
+  after the previous finished (final reply produced, or `finish(id)` for oneway, whose `reply()`/`error()` return
+  null). `wantsInput` is false while `maxQueuedCalls` (default 64) complete messages are buffered, while paused
+  after an upgrade call, after EOF or a framing error, and when not open. A malformed message, when reached, is
+  `{type: "close", error}` (calls before it are answered first, nothing is written for it). An upgrade call pauses
+  splitting until it ends: an error reply resumes, a final non-error reply makes the state `upgraded` and every
+  byte after the call's NUL (also bytes received later) is `takeUpgradeRemainder()`. A second final reply, a wrong
+  id, `continues` without `more` or any reply when not open is a `TypeError` with no state change; an encode
+  failure rethrows and leaves the call active. After EOF the buffered calls are still delivered, then `{type:
+  "close"}`. `close()` is local: nothing more is produced.
+- **Dispatch** (`dispatchCall(session, id, call, table, send, options)`, never rejects, resolves when the call is
+  finished): checks in order 1. `parseMethodName` (last dot; interface and member grammar) → `InvalidParameter
+  {parameter: "method"}`; 2. `InterfaceNotFound {interface}` / `MethodNotFound {method}`; 3. `requires` more →
+  `ExpectedMore`; 4. `requires` upgrade → `ExpectedUpgrade`; 5. `upgrade` on a method without upgrade support →
+  `InvalidParameter {parameter: "upgrade"}` (Q4, provisional: sd-varlink does not check this at all; M9 decides);
+  6. no handler → `MethodNotImplemented`; 7. `input.decode(…, {unknownFields: "reject"})`, a `ValidationError` →
+  `InvalidParameter {parameter}`, anything else → `InternalError`. Then the handler runs (a sync throw counts as a
+  rejection). An async-iterator result streams (each yield a `continues` reply, awaiting `send` first; the return
+  value, or `{}`, is final); without `more` the first yield (or the return value) is the single reply and
+  `return()` closes the iterator (a throw there is `cleanup-threw`). Other results: a plain object or `undefined`
+  (→ `{}`); anything else is `bad-result` and `InternalError`. Thrown values: a `VarlinkError` with a valid name is
+  checked with `table.errorValidator` (unknown interface: sent as is; known interface without that error, or
+  parameters that do not encode: `InternalError` + `invalid-error`); anything else is `InternalError` +
+  `handler-threw`, with nothing about it on the wire. `validateReplies` (`"warn"` default) applies to every reply
+  value when the entry has `output`: `"warn"` sends the encoded value, or the original one plus `invalid-reply`;
+  `"throw"` ends the call with `InternalError` (stopping a generator first). A reply the session cannot encode is
+  `invalid-reply` and `InternalError`. A rejected `send` aborts `ctx.signal`, stops the generator, reports
+  `send-failed` and closes the session; `options.signal` aborts `ctx.signal` and replies after the session closed
+  are dropped silently. Oneway: nothing is sent, non-`VarlinkError` throws are still `handler-threw`, then
+  `finish(id)`. A confirmed upgrade with nobody to take the stream is `upgrade-unclaimed` (M9 adds
+  `ctx.upgrade()`). `onError` exceptions are swallowed.
+- **`ctx.notify(v)`**: with `more`, a `continues` reply serialized with the other sends (resolves when written;
+  validated like any reply, a `"throw"` failure ends the call with `InternalError` and rejects). Without `more`
+  the first notify is the single final reply and later notify calls and the return value are dropped (a later
+  throw goes to `onError` only). sd_varlink_notify answers `ExpectedMore` there instead; we follow the generator
+  rule ("Monitor without more = current state") so a handler does not need two code paths. Oneway: a no-op. After
+  the handler settled and the call ended: resolves without sending, `late-notify`.
+- **Testing channels**: `pair({highWaterMark})` (default 64 KiB): chunks arrive in order as written (copied, never
+  merged); `write()` resolves once the peer's unread bytes are ≤ `highWaterMark` and rejects after this side's
+  `end()`/`close()` or the peer's `close()`; `read()` gives `null` after the peer's `end()` once drained and after
+  this side's `close()`; `close()` lets the peer drain what was queued; `closed` resolves on `close()` or after
+  both `end()` and reading EOF; concurrent `read()` is a `TypeError`; no timers. `faulty(channel, plan)` splits reads
+  and/or writes (`"every-byte"`, a max size, or cut offsets), simulates a reset after N bytes read or written
+  (`ConnectionClosedError("connection reset (faulty)")`, inner channel closed) and awaits `delay()` before every
+  read and write.
+- **Leftovers**: `JSON.parse` keeps the last of duplicate keys while sd-varlink rejects duplicates; not detectable
+  without a custom parser. sd-varlink rejects `null` flags; we accept them per UAPI (null ≡ absent). Upgraded data
+  pipelined behind an upgrade call that is not yet processed counts against `maxMessageSize`; if it overflows, the
+  server session closes with `MessageTooLargeError` instead of handing over a truncated stream.
+
 ---
 
 ## 5. Public API sketch
@@ -739,7 +825,7 @@ Handler context `ctx`: `signal` (aborts when the client disconnects or the serve
 | Plain handler, call with `more` | single reply without `continues` (allowed by spec) |
 | Method requires `upgrade` (`[Requires 'upgrade' flag]` or `requiresUpgrade`), call without `upgrade` | `org.varlink.service.ExpectedUpgrade` |
 | Method only *supports* `upgrade`, call without it | handler runs as a plain call (`ctx.upgrade` unavailable) |
-| `upgrade` set on a method that does not support it | `InvalidParameter {parameter: "upgrade"}`? (open question Q4) |
+| `upgrade` set on a method that does not support it | provisional (M3): `InvalidParameter {parameter: "upgrade"}`; M9 settles Q4 |
 | Handler throws `VarlinkError` | that error (name + params) |
 | Handler throws anything else | `onError` hook, then the internal error reply (see Q2); no details leak |
 | Generator throws after yielding | error reply ends the stream (an error is always final) |
