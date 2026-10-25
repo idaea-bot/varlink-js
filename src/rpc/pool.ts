@@ -96,12 +96,18 @@ export class Pool {
   /** Registered with addInterface(), in order. */
   readonly #interfaces: PoolInterface[] = [];
   /**
-   * Per connection: how many of #interfaces it has applied (a lease does not recompile them) and the errors of
-   * the entries it rejected, by name and by the rejected descriptors' methods.
+   * Per connection: how many of #interfaces it has applied (a lease does not recompile them), the errors of the
+   * entries it rejected, by name and by the rejected descriptors' methods, and the methods of the descriptors it
+   * accepted.
    */
   readonly #applied = new WeakMap<
     Connection,
-    { count: number; failed: Map<string, unknown>; failedMethods: WeakMap<object, unknown> }
+    {
+      count: number;
+      failed: Map<string, unknown>;
+      failedMethods: WeakMap<object, unknown>;
+      acceptedMethods: WeakSet<object>;
+    }
   >();
   #closed = false;
 
@@ -131,9 +137,10 @@ export class Pool {
    * different IDL under a registered name a TypeError (the built-ins accept a compatible one: see
    * {@link Connection.addInterface}). The `ints` match is checked per connection
    * ({@link Connection.addInterface}): if a connection rejects an entry, the operations on that connection that use
-   * it reject with that error (the connection is released): the rejected descriptor's methods always, other
-   * descriptors and method names of the interface while the connection has no registration of that name (from
-   * another entry or its own `interfaces` option). Other operations are not affected.
+   * it reject with that error (the connection is released): the rejected descriptor's methods unless the
+   * connection accepted another descriptor with the same method objects (a spread copy; same name, so same IDL
+   * text), other descriptors and method names of the interface while the connection has no registration of that name
+   * (from another entry or its own `interfaces` option). Other operations are not affected.
    *
    * @throws {TypeError} for a different IDL under a registered name, a built-in text incompatible with the
    *   built-in definition, or a descriptor mismatch.
@@ -318,28 +325,33 @@ export class Pool {
   /**
    * Registers the interfaces added since this connection was last leased, each on its own: what addInterface
    * throws is recorded for that entry. Then throws the recorded error for the operation's `method` (undefined:
-   * none, e.g. getInfo): a method descriptor of a rejected descriptor, or a name (or descriptor) of an interface
-   * the connection has no registration of (from no entry, nor its own `interfaces` option).
+   * none, e.g. getInfo): a method descriptor of a rejected descriptor (unless it is also one of an accepted
+   * descriptor), or a name (or descriptor) of an interface the connection has no registration of (from no entry,
+   * nor its own `interfaces` option).
    */
   #apply(conn: Connection, method: string | AnyMethod | undefined): void {
     let state = this.#applied.get(conn);
     if (state === undefined) {
-      state = { count: 0, failed: new Map(), failedMethods: new WeakMap() };
+      state = { count: 0, failed: new Map(), failedMethods: new WeakMap(), acceptedMethods: new WeakSet() };
       this.#applied.set(conn, state);
     }
     for (; state.count < this.#interfaces.length; state.count++) {
       const entry = this.#interfaces[state.count];
       if (entry === undefined) break;
+      const methods = typeof entry.value === "string" ? [] : Object.values(entry.value.methods);
       try {
         conn.addInterface(entry.value);
+        for (const md of methods) state.acceptedMethods.add(md);
       } catch (e) {
         if (!state.failed.has(entry.name)) state.failed.set(entry.name, e);
-        if (typeof entry.value !== "string")
-          for (const md of Object.values(entry.value.methods)) state.failedMethods.set(md, e);
+        for (const md of methods) state.failedMethods.set(md, e);
       }
     }
     if (method === undefined) return;
-    if (typeof method === "object" && state.failedMethods.has(method)) throw state.failedMethods.get(method);
+    // Spread copies of a descriptor share its method objects: one the connection accepted (same name, so the same
+    // IDL text) registered what they need, as on a Connection given the same sequence.
+    if (typeof method === "object" && state.failedMethods.has(method) && !state.acceptedMethods.has(method))
+      throw state.failedMethods.get(method);
     const iface = interfaceOf(method);
     if (iface !== undefined && state.failed.has(iface) && !connectionInternals(conn).has(iface))
       throw state.failed.get(iface);

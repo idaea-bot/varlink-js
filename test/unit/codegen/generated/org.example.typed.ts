@@ -159,9 +159,8 @@ export type OrgExampleTyped_Descriptor = {
   readonly NotFound: typeof NotFound;
   readonly Busy: typeof Busy;
   /**
-   * A typed client over a connection or pool (registers this interface on it). It binds this constant:
-   * `({ ...OrgExampleTyped, ints }).client(target)` still binds the generated `ints`; for another mode use
-   * `createClient({ ...OrgExampleTyped, ints }, target)`.
+   * A typed client over a connection or pool (registers this interface on it). An interface without `int`
+   * binds in either `ints` mode; otherwise regenerate with `generate(idl, { ints })` for the target's mode.
    */
   client(target: $vjs.Connection | $vjs.Pool): OrgExampleTyped_Client;
 };

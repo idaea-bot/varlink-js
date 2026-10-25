@@ -18,8 +18,7 @@ import { DEFAULT_MAX_QUEUED_CALLS, ServerSession } from "../core/protocol/server
 import { jsonCodec, type Codec } from "../core/types/codec.ts";
 import { compileInterfaceText, type CompiledInterface, type IntsMode } from "../core/types/compile.ts";
 import {
-  assertIntsMode,
-  compileDescriptor,
+  bindDescriptor,
   type InterfaceDescriptor,
   type MethodInput,
   type MethodOutput,
@@ -445,13 +444,13 @@ export class Server {
    * MethodNotImplemented. Allowed while serving (new calls see it).
    *
    * @throws {TypeError} for a built-in or already registered name, an unknown handler key, a bad handler value,
-   *   a descriptor that does not match its IDL, or an `ints` mismatch.
+   *   a descriptor that does not match its IDL, or an `ints` mismatch (only for an interface that uses `int`: one
+   *   without binds in either mode).
    */
   // NoInfer: D comes from the descriptor alone; inferring it from inline handlers too would widen their results'
   // literals (`kind: "large"` → string) before the contextual type is known.
   implement<D extends InterfaceDescriptor>(descriptor: D, handlers: NoInfer<Handlers<D>>): void {
-    assertIntsMode(descriptor, this.#ints);
-    const compiled = compileDescriptor(descriptor, { codec: this.#codec });
+    const compiled = bindDescriptor(descriptor, this.#ints, { codec: this.#codec });
     this.#register(compiled, descriptor.idl, handlers);
   }
 

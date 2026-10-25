@@ -555,7 +555,10 @@ entry.
   `MethodOutput`), `InterfaceDescriptor {name, idl, ints, methods, errors}`, `JsonValue`. `compileDescriptor`
   checks the descriptor against its IDL both ways (names, `more`/`upgrade`/`experimental`, error names; every
   IDL method and error present); `JsonValue` admits readonly arrays; `assertIntsMode` checks `ints` at bind
-  time.
+  time. Connection, Server and Pool bind through the internal `bindDescriptor(desc, runtimeInts, options)`: the
+  checks of `compileDescriptor`, then an interface with no `int` anywhere (`usesInt` walks every member, field and
+  element type, nested, nullable, array, map and inline) compiles with the runtime's `ints` whatever `desc.ints`
+  says (its TS types are the same in both modes); one that uses `int` goes through `assertIntsMode`.
 - **Errors**: `VarlinkError`/`isVarlinkError` (brand, §6), the seven `org.varlink.service` classes (IDL text:
   `ORG_VARLINK_SERVICE_IDL`, verbatim UAPI) and `InternalError` (Q2: `INTERNAL_ERROR_INTERFACE` and its IDL
   `INTERNAL_ERROR_INTERFACE_IDL`), each with `errorName` and `is()`. The class `InternalError` shadows
@@ -784,7 +787,7 @@ over `pair()`, unix and tcp sockets.
   definition`), since the built-in (UAPI) definition stays in charge of validation and a member it lacks or types
   otherwise would make generated types lie; a descriptor's classes fill only the registry's gaps (generated
   built-ins map to the core classes, so a client generated from another implementation's `org.varlink.service`
-  binds); descriptors go through `assertIntsMode` + `compileDescriptor`. Typed overloads (descriptor must be registered) exist
+  binds); descriptors go through `bindDescriptor` (§4.9: an `int`-free one binds in either `ints` mode). Typed overloads (descriptor must be registered) exist
   for `call`, `oneway`, `stream`, `collect`. `getInfo`/`getInterfaceDescription` always validate their replies
   (`"throw"`); `getInterface` parses + validates and checks the declared name (`TypeError` otherwise).
 - **Proxy** (`conn.proxy(name, {validateReplies = "throw"})`): `getInterface` + a private `compileInterface` (not
@@ -813,9 +816,14 @@ over `pair()`, unix and tcp sockets.
   its own; same value again a no-op, a different IDL under a registered name a `TypeError`, except for the built-in
   names, which take a compatible text as on a Connection and throw for an incompatible one at once); the `ints`
   match is checked per connection when applied. Each entry is applied on its own and a failure (ints mismatch, a
-  different IDL already on that connection) is recorded for that connection: an operation then rejects with the
-  recorded error (and releases the connection) only if it uses the failed entry — a method descriptor of a rejected
-  descriptor always; a name or another descriptor of the interface while the leased connection itself has no
+  different IDL already on that connection) is recorded for that connection and that entry: an operation then
+  rejects with the recorded error (and releases the connection) only if it uses the failed entry — a method
+  descriptor of a rejected descriptor unless that connection also accepted a descriptor holding the same method
+  object (spread copies share method objects; such an entry has the same name, hence the same IDL text, and
+  registered the interface: as on a Connection given the same sequence, where the rejected `addInterface`
+  registers nothing, so failures are per entry, not per shared method object); a method object only of rejected
+  entries stays rejected even if another descriptor registered the interface (its types were generated for the
+  other `ints` mode); a name or another descriptor of the interface while the leased connection itself has no
   registration of that name (asked through the internal `has(name)`, so one from another entry or from the
   connection's own `interfaces` option counts). Everything else (`getInfo` & co., other interfaces, a correct
   client of the same interface) keeps working. Typed descriptor overloads of `call`/`oneway`/`stream`/`collect` mirror
@@ -1128,8 +1136,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   inherited function although `m[k]` is typed `T | undefined`.
 - **Docs**: TSDoc on the IDL const and descriptor const (interface doc), types, fields, classes and the
   descriptor's method entries (type and const); `*/` → `*\/`; doc text from the IDL has every `@` followed by an ASCII
-  letter written as the text `@` (the generated comments contain no `@internal`/`@deprecated`/… substring, so a
-  peer's doc adds no tag and `stripInternal`, which matches `@internal` by substring, cannot drop declarations;
+  letter, `_` or `$` written as the text `\u0040` (the generated comments contain no `@internal`/`@deprecated`/
+  `@__PURE__`/… substring, so a peer's doc adds no tag or bundler hint and `stripInternal`, which matches `@internal` by substring, cannot drop declarations;
   tested with `ts.transpileDeclaration`), and every C0 control
   (TAB too), DEL, C1 and Bidi_Control character and ESLint's irregular whitespace as `\uXXXX` text (no raw control
   bytes, no "Trojan Source" reordering); enum-value docs become a ``- `v`: doc`` list in the owning type's or
@@ -1153,26 +1161,28 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   /Pool's `addInterface`/`call`/`stream`/`collect`/`oneway` (duck-typed, else `TypeError`; `typed-client.ts`
   imports Connection and Pool as types only, so rpc/connection.ts → src/interfaces → runtime.ts →
   typed-client.ts is no cycle; a fresh-process test imports service.ts first). It calls
-  `target.addInterface(desc)` (a Connection: idempotent, `TypeError` for an ints mismatch or a different IDL; a Pool:
+  `target.addInterface(desc)` (a Connection: idempotent, `TypeError` for an ints mismatch of an interface that
+  uses `int` or a different IDL; a Pool:
   as in §4.11) and returns a frozen null-prototype object with one frozen function per method (`.stream()`,
   `.collect()`, `.oneway()`; `.upgrade()` comes with M9) over the target's typed overloads. `TypedMethod`'s
   parameters are optional iff the input has no required field. Replies are always decoded: the connection's
   `validateReplies` `"off"` (the default) acts as `"warn"` for typed calls (§4.11), so valid replies match their
   types, while an invalid one under `"off"`/`"warn"` is delivered raw and reported to `onError` (`invalid-reply`);
   `"throw"` rejects it (use it for a hard guarantee); error replies
-  of the interface become the generated classes (`instanceof` works). `<C>.client` closes over the generated
-  constant (documented in its TSDoc): `({ ...C, ints }).client(target)` still binds the generated `ints`; use
-  `createClient({ ...C, ints }, target)` for another mode.
+  of the interface become the generated classes (`instanceof` works). `ints` (said in `<C>.client`'s TSDoc): an
+  interface without `int` binds in either mode (`bindDescriptor`, §4.9); otherwise regenerate with
+  `generate(idl, { ints })` for the target's mode. Spreading a descriptor with another `ints` would change only the
+  runtime check, not the generated types (an `int` typed `number` would arrive as `bigint`), so it is not advised.
   `Handlers<D>` (server.ts) gives the precise input/result types (a `@ts-expect-error` test covers wrong
   parameter use, results, unknown keys and client parameters).
 - **Built-ins** (deviation from §5.7, which said "at build time"): `interfaces/org.varlink.service.varlink` and
   `interfaces/<INTERNAL_ERROR_INTERFACE>.varlink` (byte-identical to the core IDL constants) are generated by
   `scripts/gen-interfaces.ts` with `importPath: "./runtime.ts"` into `src/interfaces/` and committed;
   `builtins.test.ts` fails when they are stale, when a source differs from its constant, or when a built-in IDL
-  contains `int` (the `ints` override needs that). rpc imports them through `src/interfaces/index.ts`, so the
+  contains `int` (so they bind in both modes). rpc imports them through `src/interfaces/index.ts`, so the
   internal interface's name stays in one place in hand-written code. A generated built-in descriptor says
-  `ints: "number"`; on a bigint connection use `createClient({ ...OrgVarlinkService, ints: "bigint" }, conn)` (or
-  `conn.getInfo()`). A client generated from another implementation's `org.varlink.service` text (libvarlink,
+  `ints: "number"` and, being `int`-free, binds on a bigint connection or server as is (`bindDescriptor`, the same
+  rule as for any descriptor; no built-in override): `OrgVarlinkService.client(bigintConn)` works. A client generated from another implementation's `org.varlink.service` text (libvarlink,
   python, rust, systemd) binds too: connections and pools accept a text under the built-in names that is
   compatible with the built-in definition (§4.11; all five corpus texts are), and reject others. Not generated here: `org.varlink.certification` (M5's interface file) and
   `org.varlink.resolver` (M8).

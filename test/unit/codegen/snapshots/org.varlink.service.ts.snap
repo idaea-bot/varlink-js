@@ -139,9 +139,8 @@ export type OrgVarlinkService_Descriptor = {
   readonly ExpectedMore: typeof ExpectedMore;
   readonly ExpectedUpgrade: typeof ExpectedUpgrade;
   /**
-   * A typed client over a connection or pool (registers this interface on it). It binds this constant:
-   * `({ ...OrgVarlinkService, ints }).client(target)` still binds the generated `ints`; for another mode use
-   * `createClient({ ...OrgVarlinkService, ints }, target)`.
+   * A typed client over a connection or pool (registers this interface on it). An interface without `int`
+   * binds in either `ints` mode; otherwise regenerate with `generate(idl, { ints })` for the target's mode.
    */
   client(target: $vjs.Connection | $vjs.Pool): OrgVarlinkService_Client;
 };

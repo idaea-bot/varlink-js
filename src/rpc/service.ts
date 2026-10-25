@@ -8,7 +8,7 @@ import { parseInterface } from "../core/idl/parser.ts";
 import type { Handler, MethodEntry } from "../core/protocol/dispatch.ts";
 import type { Codec } from "../core/types/codec.ts";
 import type { CompiledInterface, IntsMode } from "../core/types/compile.ts";
-import { compileDescriptor, type InterfaceDescriptor } from "../core/types/descriptors.ts";
+import { bindDescriptor } from "../core/types/descriptors.ts";
 import {
   InternalErrorInterface,
   OrgVarlinkService,
@@ -65,15 +65,6 @@ export interface BuiltinHost {
   description(name: string): string | undefined;
 }
 
-/**
- * A built-in descriptor compiled for the server's or connection's `ints` mode. The built-in IDLs contain no `int`
- * (test/unit/codegen/builtins.test.ts checks it), so their types are the same in both modes and overriding the
- * descriptor's `ints` (generated as "number") is sound.
- */
-export function builtinDescriptor<D extends InterfaceDescriptor>(descriptor: D, ints: IntsMode): D {
-  return { ...descriptor, ints };
-}
-
 /** A member's signature for {@link assertBuiltinCompatible}: its kind and types, without docs or markers. */
 function signature(member: Member): string {
   if (member.kind === "method") return `method ${formatType(member.input)} -> ${formatType(member.output)}`;
@@ -119,10 +110,9 @@ export function builtinInterfaces(
   host: BuiltinHost,
   options: { ints: IntsMode; codec: Codec },
 ): { service: RegisteredInterface; internal: RegisteredInterface } {
-  const service = compileDescriptor(builtinDescriptor(OrgVarlinkService, options.ints), { codec: options.codec });
-  const internal = compileDescriptor(builtinDescriptor(InternalErrorInterface, options.ints), {
-    codec: options.codec,
-  });
+  // The built-in IDLs contain no `int` (test/unit/codegen/builtins.test.ts checks it): they bind in either mode.
+  const service = bindDescriptor(OrgVarlinkService, options.ints, { codec: options.codec });
+  const internal = bindDescriptor(InternalErrorInterface, options.ints, { codec: options.codec });
   const handlers = {
     GetInfo: (): GetInfo_Output => ({ ...host.info(), interfaces: host.interfaceNames() }),
     GetInterfaceDescription: (p: GetInterfaceDescription_Input): GetInterfaceDescription_Output => {

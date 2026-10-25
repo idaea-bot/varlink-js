@@ -15,8 +15,7 @@ import type { CallInit } from "../core/protocol/messages.ts";
 import { jsonCodec, type Codec } from "../core/types/codec.ts";
 import { compileInterfaceText, type CompiledInterface, type IntsMode, type Validator } from "../core/types/compile.ts";
 import {
-  assertIntsMode,
-  compileDescriptor,
+  bindDescriptor,
   type InterfaceDescriptor,
   type MethodDescriptor,
   type MethodInput,
@@ -24,7 +23,7 @@ import {
 } from "../core/types/descriptors.ts";
 import { InternalErrorInterface, OrgVarlinkService } from "../interfaces/index.ts";
 import { createProxy, type InterfaceProxy, type ProxyOptions } from "./proxy.ts";
-import { assertBuiltinCompatible, builtinDescriptor } from "./service.ts";
+import { assertBuiltinCompatible } from "./service.ts";
 import { checkMode, checkPositiveInt, checkTimeout, splitName } from "./util.ts";
 
 /** Default call timeout in ms (sd-varlink's 45 s). */
@@ -403,8 +402,8 @@ export class Connection {
       maxMessageSize: checkMaxMessageSize(options?.maxMessageSize),
     });
     // The built-ins from their generated descriptors; their core error classes fill only the gaps of `errors`.
-    this.addInterface(builtinDescriptor(OrgVarlinkService, this.#ints));
-    this.addInterface(builtinDescriptor(InternalErrorInterface, this.#ints));
+    this.addInterface(OrgVarlinkService);
+    this.addInterface(InternalErrorInterface);
     for (const i of options?.interfaces ?? []) this.addInterface(i);
     this.closed = new Promise((resolve) => {
       this.#resolveClosed = resolve;
@@ -439,7 +438,7 @@ export class Connection {
    * have no class yet.
    *
    * @throws {TypeError} on a different IDL under a taken name (for a built-in: an incompatible one), a descriptor
-   *   mismatch or an `ints` mismatch.
+   *   mismatch or an `ints` mismatch (only for an interface that uses `int`: one without binds in either mode).
    * @throws {IdlSyntaxError} for invalid IDL.
    */
   addInterface(descriptorOrIdl: InterfaceDescriptor | string): void {
@@ -450,9 +449,8 @@ export class Connection {
       idl = descriptorOrIdl;
       compiled = compileInterfaceText(idl, { ints: this.#ints, codec: this.#codec });
     } else {
-      assertIntsMode(descriptorOrIdl, this.#ints);
       idl = descriptorOrIdl.idl;
-      compiled = compileDescriptor(descriptorOrIdl, { codec: this.#codec });
+      compiled = bindDescriptor(descriptorOrIdl, this.#ints, { codec: this.#codec });
       classes = Object.values(descriptorOrIdl.errors);
     }
     if (BUILTIN_NAMES.has(compiled.name)) {

@@ -125,11 +125,12 @@ function templateLiteral(text: string): string {
 }
 
 /**
- * Doc text from the IDL for a TSDoc comment: an `@` before an ASCII letter is written as the text `@`, so a
- * peer's doc cannot add tags, nor contain `@internal` (which `stripInternal` finds by substring).
+ * Doc text from the IDL for a TSDoc comment: an `@` before an ASCII letter, `_` or `$` is written as the text
+ * `\u0040`, so a peer's doc cannot add tags or bundler hints (`@__PURE__`), nor contain `@internal` (which
+ * `stripInternal` finds by substring).
  */
 function docText(text: string): string {
-  return text.replace(/@(?=[A-Za-z])/g, "\\u0040");
+  return text.replace(/@(?=[A-Za-z_$])/g, "\\u0040");
 }
 
 /** A TSDoc comment from text lines (empty: none). `*\/` cannot end it early. */
@@ -461,9 +462,8 @@ export function generate(idl: string, options?: GenerateOptions): GeneratedFile 
     ...errors.map((e) => `readonly ${e}: typeof ${e};`),
     [
       comment([
-        "A typed client over a connection or pool (registers this interface on it). It binds this constant:",
-        `\`({ ...${C}, ints }).client(target)\` still binds the generated \`ints\`; for another mode use`,
-        `\`createClient({ ...${C}, ints }, target)\`.`,
+        "A typed client over a connection or pool (registers this interface on it). An interface without `int`",
+        "binds in either `ints` mode; otherwise regenerate with `generate(idl, { ints })` for the target's mode.",
       ]),
       group([
         "client(",

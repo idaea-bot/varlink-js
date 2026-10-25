@@ -3,8 +3,9 @@
 // renaming INTERNAL_ERROR_INTERFACE without regenerating fails here.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
 import { generate } from "../../../src/codegen/index.ts";
 import {
@@ -90,15 +91,26 @@ describe("built-in interfaces", () => {
   });
 
   test("importing rpc's service.ts (or a generated built-in) first in a fresh process works (no import cycle)", () => {
-    for (const first of ["./src/rpc/service.ts", "./src/interfaces/index.ts", "./src/rpc/typed-client.ts"]) {
-      const script = [
-        `await import(${JSON.stringify(first)});`,
-        `const { createServer } = await import("./src/index.ts");`,
-        `const { OrgVarlinkService } = await import("./src/interfaces/index.ts");`,
-        `createServer();`,
-        `if (OrgVarlinkService.methods.GetInfo.method !== "org.varlink.service.GetInfo") process.exit(2);`,
-      ].join("\n");
-      execFileSync(process.execPath, ["--input-type=module", "-e", script], { stdio: "pipe" });
+    // A script file with absolute module URLs, so it runs the same under Node, Deno and Bun (the Runtimes job).
+    const dir = mkdtempSync(join(tmpdir(), "vjs-cycle-"));
+    try {
+      const url = (path: string): string => JSON.stringify(new URL(`../../../${path}`, import.meta.url).href);
+      for (const first of ["src/rpc/service.ts", "src/interfaces/index.ts", "src/rpc/typed-client.ts"]) {
+        const script = [
+          `await import(${url(first)});`,
+          `const { createServer } = await import(${url("src/index.ts")});`,
+          `const { OrgVarlinkService } = await import(${url("src/interfaces/index.ts")});`,
+          `createServer();`,
+          `if (OrgVarlinkService.methods.GetInfo.method !== "org.varlink.service.GetInfo") throw new Error("bad");`,
+          ``,
+        ].join("\n");
+        const file = join(dir, "first.mts");
+        writeFileSync(file, script);
+        const args = "deno" in process.versions ? ["run", "-A", "--no-check", file] : [file];
+        execFileSync(process.execPath, args, { stdio: "pipe" });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

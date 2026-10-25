@@ -213,8 +213,8 @@ describe('ints: "bigint"', () => {
     const conn = dial(server, { ints: "bigint" });
     const info = await conn.getInfo();
     assert.deepEqual(info.interfaces, ["org.varlink.service", "org.example.typed", "io.github.pzmarzly.varlinkjs"]);
-    // The generated built-in says ints "number"; it has no int, so it binds to a bigint connection re-moded.
-    const svc = createClient({ ...OrgVarlinkService, ints: "bigint" }, conn);
+    // The generated built-in says ints "number"; it has no int, so it binds to a bigint connection as is.
+    const svc = OrgVarlinkService.client(conn);
     assert.equal(
       (await svc.GetInterfaceDescription({ interface: "org.varlink.service" })).description,
       OrgVarlinkService.idl,

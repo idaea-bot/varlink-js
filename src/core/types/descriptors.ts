@@ -1,6 +1,6 @@
 // What codegen emits for an interface (DESIGN.md §5.3, §5.7): method descriptors with phantom input/output
 // types, error classes and the verbatim IDL. compileDescriptor() checks a descriptor against its own IDL.
-import type { MethodMember } from "../idl/ast.ts";
+import type { Interface, MethodMember, Type } from "../idl/ast.ts";
 import { parseInterface } from "../idl/parser.ts";
 import type { ErrorClass } from "../errors/varlink-error.ts";
 import { compileInterface, type CompiledInterface, type CompileOptions, type IntsMode } from "./compile.ts";
@@ -68,6 +68,11 @@ export function compileDescriptor(
   desc: InterfaceDescriptor,
   options?: Omit<CompileOptions, "ints">,
 ): CompiledInterface {
+  return compileInterface(checkDescriptor(desc), { ...options, ints: desc.ints });
+}
+
+/** Parses `desc.idl` and checks the descriptor against it (see {@link compileDescriptor}). */
+function checkDescriptor(desc: InterfaceDescriptor): Interface {
   const iface = parseInterface(desc.idl);
   if (iface.name !== desc.name) mismatch(desc, `the IDL declares interface ${iface.name}`);
   const methods = new Map<string, MethodMember>();
@@ -93,7 +98,7 @@ export function compileDescriptor(
     if (!Object.hasOwn(desc.methods, name)) mismatch(desc, `IDL method ${name} is missing from methods`);
   for (const name of errors)
     if (!Object.hasOwn(desc.errors, name)) mismatch(desc, `IDL error ${name} is missing from errors`);
-  return compileInterface(iface, { ...options, ints: desc.ints });
+  return iface;
 }
 
 /**
@@ -104,4 +109,45 @@ export function compileDescriptor(
 export function assertIntsMode(desc: Pick<InterfaceDescriptor, "name" | "ints">, runtimeInts: IntsMode): void {
   if (desc.ints !== runtimeInts)
     throw new TypeError(`${desc.name} was generated for ints: "${desc.ints}", but the runtime uses "${runtimeInts}"`);
+}
+
+function typeUsesInt(type: Type): boolean {
+  switch (type.kind) {
+    case "int":
+      return true;
+    case "struct":
+      return type.fields.some((f) => typeUsesInt(f.type));
+    case "array":
+    case "map":
+    case "nullable":
+      return typeUsesInt(type.element);
+    default:
+      return false;
+  }
+}
+
+/** True if any type of the interface (members, fields, elements, inline types, at any depth) is `int`. */
+export function usesInt(iface: Interface): boolean {
+  return iface.members.some((m) =>
+    m.kind === "method" ? typeUsesInt(m.input) || typeUsesInt(m.output) : typeUsesInt(m.type),
+  );
+}
+
+/**
+ * Compiles a descriptor for a client/server whose `ints` mode is `runtimeInts` (§5.7), after the checks of
+ * {@link compileDescriptor}. An interface with no `int` anywhere compiles with `runtimeInts` whatever `desc.ints`
+ * says (its TS types are the same in both modes); any other must have been generated for `runtimeInts`
+ * ({@link assertIntsMode}).
+ *
+ * @throws {TypeError} on a descriptor or `ints` mismatch.
+ * @throws {IdlSyntaxError} if the IDL is invalid.
+ */
+export function bindDescriptor(
+  desc: InterfaceDescriptor,
+  runtimeInts: IntsMode,
+  options?: Omit<CompileOptions, "ints">,
+): CompiledInterface {
+  const iface = checkDescriptor(desc);
+  if (usesInt(iface)) assertIntsMode(desc, runtimeInts);
+  return compileInterface(iface, { ...options, ints: runtimeInts });
 }
