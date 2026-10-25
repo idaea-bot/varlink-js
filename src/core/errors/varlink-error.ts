@@ -27,7 +27,7 @@ export class VarlinkError<P extends Record<string, unknown> = Record<string, unk
   readonly parameters: P;
 
   constructor(error: string, parameters?: P, options?: ErrorOptions) {
-    super(isErrorName(error) && error.length <= 256 ? error : safeQuote(String(error)), options);
+    super(isErrorName(error) && error.length <= 256 ? error : safeQuote(error), options);
     this.name = new.target.name;
     this.error = error;
     this.parameters = parameters ?? ({} as P);
