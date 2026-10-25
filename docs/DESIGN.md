@@ -366,8 +366,8 @@ are thin. This makes the protocol logic unit-testable without sockets, and the s
 Node, Deno, Bun and WebSocket.
 
 ClientSession:
-- FIFO of pending calls (pipelining). Each entry: kind `single | more | oneway | upgrade`.
-- `oneway` entries complete when written; they never consume a reply.
+- FIFO of pending calls (pipelining). Each entry: kind `single | more | upgrade`.
+- `oneway` calls never enter the FIFO (they complete when written; they never consume a reply).
 - A reply is matched to the head entry. `continues` keeps the head; final reply or error pops it.
 - Reply without a pending call, or `continues` for a non-`more` call ⇒ protocol error ⇒ close.
 - While an `upgrade` call is pending, new calls are rejected locally (`UpgradePendingError`). If the reply is an
@@ -378,9 +378,11 @@ ServerSession:
 - Decodes ahead at most `maxQueuedCalls` calls, but **stops splitting the byte stream right after a call
   with `upgrade: true`** until that call resolves. Bytes after it may belong to the upgraded protocol
   and must never reach the JSON decoder.
-- Processes calls strictly in order; does not start call N+1 until call N is finished: its final reply was
-  written, or, for `oneway`, its handler settled (keeps side effects ordered). This is the UAPI ordering
-  rule, and it also avoids reading past an `upgrade`. After an `upgrade` error reply, reading resumes.
+- Processes calls strictly in order; does not hand out call N+1 until call N is finished: its final reply was
+  produced by the session, or, for `oneway`, its handler settled (keeps side effects ordered). The driver
+  awaits `dispatchCall`, which resolves only after `send` of the final reply resolved, so call N+1 starts after
+  call N's reply was written. This is the UAPI ordering rule, and it also avoids reading past an `upgrade`.
+  After an `upgrade` error reply, reading resumes.
 - Produces exactly one final reply per non-oneway call, zero for oneway (F5, F7).
 - Dispatch rules: §5.4.
 
@@ -567,7 +569,10 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
 `DEFAULT_MAX_MESSAGE_SIZE`); M4 decides on exposing sessions. `src/testing/` (`varlink-js/testing`): `pair()`,
 `faulty()`.
 - **Framer**: one growable `Uint8Array` (doubling, compacted with `copyWithin` once the read offset passes half the
-  buffer or before growing); each byte is scanned for NUL once, on push, so 1-byte pushes stay O(n). Size = bytes
+  buffer, or when it needs room and the read offset is at least a quarter of the buffer; otherwise it grows and
+  copies only the unconsumed bytes); each byte is scanned for NUL once, on push, so 1-byte pushes stay O(n). When
+  `next()` empties a buffer larger than 64 KiB it is dropped and re-allocated lazily (4 KiB) on the next push, so
+  one big message does not pin its memory; `capacity` (tests/diagnostics) is the buffer's size. Size = bytes
   before the NUL; `> maxMessageSize` (default 16 MiB, a positive safe integer) is an error, exactly the limit is
   fine. As soon as the incomplete message is over the limit, a `MessageTooLargeError` is recorded and later pushes
   are dropped (memory ≤ limit + one chunk + complete messages); `next()` still returns the complete messages before
@@ -580,8 +585,9 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   refuses U+0000 and lone surrogates (`TypeError`).
 - **Messages**: decode = §4.4 (null ≡ absent for every header; a key containing `.` goes to `ext`, built with own
   data properties; a header valid only in the other direction is an unknown key; `method` syntax is dispatch's
-  job; the error name is not checked). Errors name the header and quote a peer key only via `JSON.stringify`, cut
-  to 64 characters. Decoded `parameters` are used by reference. Encode key order: call `method, parameters,
+  job; the error name is not checked). Errors name the header and quote a peer key cut to 64 code units (on a
+  code point boundary) and then log-safe quoted like §4.9 messages (`safeQuote`: control, bidi, U+2028/2029 and
+  other format characters escaped). Decoded `parameters` are used by reference. Encode key order: call `method, parameters,
   oneway|more|upgrade, ext…`; reply `error?, parameters, continues?, ext…`; caller bugs (bad types, several flags,
   `continues` with `error`, an ext key without `.`) are `TypeError`s, as are codec failures.
 - **ClientSession**: `call(init)` returns `{id, bytes}` (ids from 1, increasing); oneway calls get an id but never
@@ -591,16 +597,23 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   reply with no pending call, `continues` for a `single`/`upgrade` entry) fails every pending entry with
   `ConnectionClosedError` (`cause` = the `ProtocolError`) after the events decoded before it, then `closed` with
   the error. A final non-error reply to the upgrade call stops decoding at once: state `upgraded`, the bytes after
-  its NUL (and later `receive()`s) are `takeUpgradeRemainder()` (once). An error reply to it keeps the session
+  its NUL (and later `receive()`s) are `takeUpgradeRemainder()` (repeated takes allowed: each returns what arrived
+  since the previous one). An error reply to it keeps the session
   open. `receiveEnd()` (EOF) fails pending calls with "connection closed by peer" and discards a partial message;
   `close(reason)` is idempotent.
 - **ServerSession**: `nextEvent()` decodes lazily and hands out one call at a time (ids from 1); the next one only
   after the previous finished (final reply produced, or `finish(id)` for oneway, whose `reply()`/`error()` return
-  null). `wantsInput` is false while `maxQueuedCalls` (default 64) complete messages are buffered, while paused
+  null). `wantsInput` is false while `maxQueuedCalls` (default 64) complete messages are buffered, while at least
+  one complete message is buffered and the buffered bytes reach `maxMessageSize` (like sd-varlink's 16 MiB input
+  buffer cap, json-stream.c:1240, with room for one partial message: without a complete message reading goes on,
+  the framer caps the partial one; so at most about 2 × `maxMessageSize` + one chunk per connection), while paused
   after an upgrade call, after EOF or a framing error, and when not open. A malformed message, when reached, is
   `{type: "close", error}` (calls before it are answered first, nothing is written for it). An upgrade call pauses
   splitting until it ends: an error reply resumes, a final non-error reply makes the state `upgraded` and every
-  byte after the call's NUL (also bytes received later) is `takeUpgradeRemainder()`. A second final reply, a wrong
+  byte after the call's NUL (also bytes received later; repeated takes allowed, each returns what arrived since the
+  previous one) is `takeUpgradeRemainder()`. If that remainder was lost to the size limit, the confirming `reply()`
+  returns null instead of bytes and the session closes (`{type: "close", error}` with the `MessageTooLargeError`):
+  the peer never sees a confirmation. A second final reply, a wrong
   id, `continues` without `more` or any reply when not open is a `TypeError` with no state change; an encode
   failure rethrows and leaves the call active. After EOF the buffered calls are still delivered, then `{type:
   "close"}`. `close()` is local: nothing more is produced.
@@ -614,19 +627,23 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   rejection). An async-iterator result streams (each yield a `continues` reply, awaiting `send` first; the return
   value, or `{}`, is final); without `more` the first yield (or the return value) is the single reply and
   `return()` closes the iterator (a throw there is `cleanup-threw`). Other results: a plain object or `undefined`
-  (→ `{}`); anything else is `bad-result` and `InternalError`. Thrown values: a `VarlinkError` with a valid name is
-  checked with `table.errorValidator` (unknown interface: sent as is; known interface without that error, or
-  parameters that do not encode: `InternalError` + `invalid-error`); anything else is `InternalError` +
+  (→ `{}`); anything else (also a value whose prototype cannot be read, e.g. a throwing Proxy) is `bad-result` and
+  `InternalError`. Thrown values: a `VarlinkError` with a valid name is checked with `table.errorValidator`
+  (unknown interface: sent as is; known interface without that error, or parameters that do not validate or that
+  the codec cannot encode: `InternalError` + `invalid-error`); anything else is `InternalError` +
   `handler-threw`, with nothing about it on the wire. `validateReplies` (`"warn"` default) applies to every reply
   value when the entry has `output`: `"warn"` sends the encoded value, or the original one plus `invalid-reply`;
   `"throw"` ends the call with `InternalError` (stopping a generator first). A reply the session cannot encode is
-  `invalid-reply` and `InternalError`. A rejected `send` aborts `ctx.signal`, stops the generator, reports
+  `invalid-reply` and `InternalError`; if even the `InternalError` cannot be produced (a broken codec) while the
+  session is open, the session is closed (`ctx.signal` aborted), so the connection never hangs on a call that
+  cannot end. A generator is never resumed once the call ended while its reply was being written. A rejected `send` aborts `ctx.signal`, stops the generator, reports
   `send-failed` and closes the session; `options.signal` aborts `ctx.signal` and replies after the session closed
   are dropped silently. Oneway: nothing is sent, non-`VarlinkError` throws are still `handler-threw`, then
   `finish(id)`. A confirmed upgrade with nobody to take the stream is `upgrade-unclaimed` (M9 adds
   `ctx.upgrade()`). `onError` exceptions are swallowed.
 - **`ctx.notify(v)`**: with `more`, a `continues` reply serialized with the other sends (resolves when written;
-  validated like any reply, a `"throw"` failure ends the call with `InternalError` and rejects). Without `more`
+  validated like any reply, a `"throw"` failure ends the call with `InternalError` and rejects; the rejected
+  promise has a no-op handler attached, so a fire-and-forget notify is never an unhandled rejection). Without `more`
   the first notify is the single final reply and later notify calls and the return value are dropped (a later
   throw goes to `onError` only). sd_varlink_notify answers `ExpectedMore` there instead; we follow the generator
   rule ("Monitor without more = current state") so a handler does not need two code paths. Oneway: a no-op. After
@@ -637,8 +654,9 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   this side's `close()`; `close()` lets the peer drain what was queued; `closed` resolves on `close()` or after
   both `end()` and reading EOF; concurrent `read()` is a `TypeError`; no timers. `faulty(channel, plan)` splits reads
   and/or writes (`"every-byte"`, a max size, or cut offsets), simulates a reset after N bytes read or written
-  (`ConnectionClosedError("connection reset (faulty)")`, inner channel closed) and awaits `delay()` before every
-  read and write.
+  (`ConnectionClosedError("connection reset (faulty)")`, inner channel closed; after a write reset every later
+  write rejects, also a zero-length one) and awaits `delay()` before every read and write. Writes are serialized
+  (each starts after the previous one settled), so concurrent writes arrive in order and never interleave.
 - **Leftovers**: `JSON.parse` keeps the last of duplicate keys while sd-varlink rejects duplicates; not detectable
   without a custom parser. sd-varlink rejects `null` flags; we accept them per UAPI (null ≡ absent). Upgraded data
   pipelined behind an upgrade call that is not yet processed counts against `maxMessageSize`; if it overflows, the

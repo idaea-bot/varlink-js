@@ -130,6 +130,42 @@ describe("decodeCall", () => {
     );
   });
 
+  test("peer keys in error messages are log-safe: bidi overrides and line separators are escaped", () => {
+    const ch = (c: number): string => String.fromCodePoint(c);
+    const cases: [string, string][] = [
+      [`${ch(0x202e)}evil`, '"\\u202eevil"'],
+      [`a${ch(0x2028)}b`, '"a\\u2028b"'],
+      [`z${ch(0x200b)}${ch(0xfeff)}`, '"z\\u200b\\ufeff"'],
+    ];
+    const unsafe = [0x202e, 0x2028, 0x200b, 0xfeff].map(ch);
+    for (const [key, quoted] of cases) {
+      assert.throws(
+        () => decodeCall({ method: M, [key]: 1 }),
+        (e: unknown) =>
+          e instanceof ProtocolError &&
+          e.message === `unknown call header ${quoted}` &&
+          unsafe.every((u) => !e.message.includes(u)),
+      );
+    }
+    // Also on encode (ext keys are caller-chosen but may come from elsewhere).
+    assert.throws(
+      () => encodeCall({ method: M, ext: { [ch(0x202e)]: 1 } }, jsonCodec),
+      (e: unknown) => e instanceof TypeError && e.message.includes('"\\u202e"'),
+    );
+  });
+
+  test("a long key is cut on a code point boundary before quoting", () => {
+    // The emoji's surrogate pair spans code units 63 and 64: the cut must not split it.
+    const key = `${"k".repeat(63)}${String.fromCodePoint(0x1f600)}${"k".repeat(10)}`;
+    assert.throws(
+      () => decodeCall({ method: M, [key]: 1 }),
+      (e: unknown) =>
+        e instanceof ProtocolError &&
+        e.message === `unknown call header "${"k".repeat(63)}…"` &&
+        e.message.isWellFormed(),
+    );
+  });
+
   test("null-prototype objects are objects", () => {
     const value = Object.assign(Object.create(null) as object, { method: M });
     assert.equal(decodeCall(value).method, M);

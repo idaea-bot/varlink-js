@@ -163,102 +163,179 @@ export async function serve(
 
 // --- script driver (property tests) --------------------------------------------------------------------
 
-/** One pipelined call of a script; the server's responder reads `kind`/`n` from the parameters. */
-export type Step = { kind: "single" } | { kind: "more"; n: number } | { kind: "oneway" } | { kind: "error" };
+/**
+ * One pipelined call of a script; the server's responder reads `kind`/`n`/`rest` from the parameters. `upgrade`
+ * may only be the last step: after it the client sends `rest` as raw upgraded bytes, and the server answers the
+ * confirmation followed by `rest` reversed as its own raw bytes.
+ */
+export type Step =
+  | { kind: "single" }
+  | { kind: "more"; n: number }
+  | { kind: "oneway" }
+  | { kind: "error" }
+  | { kind: "upgrade"; rest: readonly number[] };
 
-/** Delivery plan: alternately feed `size` bytes client→server (`toServer`) or server→client. */
-export type Schedule = readonly { toServer: boolean; size: number }[];
+/**
+ * Delivery plan, cycled: each step feeds `size` bytes client→server (`toServer`, only while the server wants
+ * input) or server→client; a call the server picks up during a step is answered `defer` steps later.
+ */
+export type Schedule = readonly { toServer: boolean; size: number; defer: number }[];
 
 /** What a script run produced. */
 export interface ScriptResult {
   clientEvents: ClientEvent[];
   serverEvents: ServerEvent[];
+  /** Upgraded bytes the server session handed over (every takeUpgradeRemainder() joined), or null. */
+  serverRemainder: Uint8Array | null;
+  /** Same for the client session. */
+  clientRemainder: Uint8Array | null;
 }
 
-/** Answers the server session's calls synchronously, as the call's parameters say. */
-function respond(server: ServerSession, events: ServerEvent[], out: Uint8Array[]): void {
-  for (;;) {
-    const ev = server.nextEvent();
-    if (ev === null) return;
-    events.push(ev);
-    if (ev.type === "close") return;
-    const { id, call } = ev;
-    const kind = call.parameters.kind;
-    const push = (b: Uint8Array | null): void => {
-      if (b !== null) out.push(b);
-    };
-    if (kind === "oneway") {
-      server.finish(id);
-    } else if (kind === "error") {
-      push(server.error(id, "org.example.test.Failed", { step: call.parameters.step }));
-    } else if (kind === "more") {
-      const n = Number(call.parameters.n);
-      for (let i = 0; i < n; i++) push(server.reply(id, { step: call.parameters.step, i }, { continues: true }));
-      push(server.reply(id, { step: call.parameters.step, last: true }));
-    } else {
-      push(server.reply(id, { step: call.parameters.step }));
-    }
+/** Answers one call as its parameters say. */
+function answer(server: ServerSession, ev: ServerEvent & { type: "call" }, out: Uint8Array[]): void {
+  const { id, call } = ev;
+  const kind = call.parameters.kind;
+  const push = (b: Uint8Array | null): void => {
+    if (b !== null) out.push(b);
+  };
+  if (kind === "oneway") {
+    server.finish(id);
+  } else if (kind === "error") {
+    push(server.error(id, "org.example.test.Failed", { step: call.parameters.step }));
+  } else if (kind === "more") {
+    const n = Number(call.parameters.n);
+    for (let i = 0; i < n; i++) push(server.reply(id, { step: call.parameters.step, i }, { continues: true }));
+    push(server.reply(id, { step: call.parameters.step, last: true }));
+  } else if (kind === "upgrade") {
+    push(server.reply(id, { step: call.parameters.step, upgraded: true }));
+    const rest = call.parameters.rest as number[];
+    if (server.state === "upgraded") out.push(Uint8Array.from(rest.toReversed()));
+  } else {
+    push(server.reply(id, { step: call.parameters.step }));
   }
 }
 
+/** Upper bound on driver iterations (a hang is a test failure, not a timeout). */
+const MAX_ITERATIONS = 100_000;
+
 /**
  * Runs `steps` as pipelined calls from a ClientSession to a ServerSession with a scripted responder. Bytes move
- * in both directions per `schedule` (cycled); without a schedule everything is delivered unsplit.
+ * in both directions per `schedule` (cycled), honouring `wantsInput`; without a schedule everything is delivered
+ * unsplit and answered at once.
  */
 export function runScript(steps: readonly Step[], schedule?: Schedule, maxQueuedCalls?: number): ScriptResult {
   const client = new ClientSession();
   const server = new ServerSession(maxQueuedCalls === undefined ? {} : { maxQueuedCalls });
   const clientEvents: ClientEvent[] = [];
   const serverEvents: ServerEvent[] = [];
+  const serverRest: Uint8Array[] = [];
+  const clientRest: Uint8Array[] = [];
   const toServer = concat(
-    steps.map((s, step) => {
+    steps.flatMap((s, step) => {
       const parameters = { ...s, step };
-      return client.call({
+      const { bytes } = client.call({
         method: "org.example.test.Run",
         parameters,
         oneway: s.kind === "oneway",
         more: s.kind === "more",
-      }).bytes;
+        upgrade: s.kind === "upgrade",
+      });
+      return s.kind === "upgrade" ? [bytes, Uint8Array.from(s.rest)] : [bytes];
     }),
   );
   const fromServer: Uint8Array[] = [];
   let sentToServer = 0;
   let sentToClient = 0;
   let serverStream: Uint8Array = new Uint8Array(0);
+  let active: { ev: ServerEvent & { type: "call" }; wait: number } | null = null;
+
+  /** Whether the driver may read for the server: it wants input, or the stream was handed over (upgraded). */
+  const canFeedServer = (): boolean =>
+    sentToServer < toServer.length && (server.wantsInput || server.state === "upgraded");
   const feedServer = (n: number): void => {
     server.receive(toServer.subarray(sentToServer, sentToServer + n));
     sentToServer = Math.min(toServer.length, sentToServer + n);
-    respond(server, serverEvents, fromServer);
   };
+  /** Takes calls and answers them after `defer` pump steps. True if anything happened. */
+  const pump = (defer: number): boolean => {
+    let progressed = false;
+    for (;;) {
+      if (active === null) {
+        const ev = server.nextEvent();
+        if (ev === null) break;
+        serverEvents.push(ev);
+        progressed = true;
+        if (ev.type === "close") break;
+        active = { ev, wait: defer };
+      }
+      if (active.wait > 0) {
+        active.wait--;
+        progressed = true;
+        break;
+      }
+      answer(server, active.ev, fromServer);
+      active = null;
+      progressed = true;
+    }
+    if (server.state === "upgraded") serverRest.push(server.takeUpgradeRemainder());
+    return progressed;
+  };
+  const serverPending = (): number =>
+    serverStream.length - sentToClient + fromServer.reduce((sum, b) => sum + b.length, 0);
   const feedClient = (n: number): void => {
     if (fromServer.length > 0) serverStream = concat([serverStream, ...fromServer.splice(0)]);
     const piece = serverStream.subarray(sentToClient, sentToClient + n);
     sentToClient += piece.length;
     clientEvents.push(...client.receive(piece));
+    if (client.state === "upgraded") clientRest.push(client.takeUpgradeRemainder());
   };
-  const serverPending = (): number =>
-    serverStream.length - sentToClient + fromServer.reduce((sum, b) => sum + b.length, 0);
+
+  let iterations = 0;
+  const guard = (): void => {
+    if (++iterations > MAX_ITERATIONS) throw new Error("runScript: no progress (driver hang)");
+  };
   if (schedule !== undefined && schedule.length > 0) {
     let i = 0;
     let idle = 0;
-    while ((sentToServer < toServer.length || serverPending() > 0) && idle < schedule.length) {
-      const s = schedule[i % schedule.length] ?? { toServer: true, size: 1 };
+    while (idle < schedule.length) {
+      guard();
+      const s = schedule[i % schedule.length] ?? { toServer: true, size: 1, defer: 0 };
       i++;
-      if (s.toServer && sentToServer < toServer.length) {
+      let progressed = false;
+      if (s.toServer && canFeedServer()) {
         feedServer(s.size);
-        idle = 0;
+        progressed = true;
       } else if (!s.toServer && serverPending() > 0) {
         feedClient(s.size);
-        idle = 0;
-      } else {
-        idle++;
+        progressed = true;
       }
+      if (pump(s.defer)) progressed = true;
+      idle = progressed ? 0 : idle + 1;
     }
   }
-  feedServer(toServer.length);
+  for (;;) {
+    guard();
+    let progressed = false;
+    if (canFeedServer()) {
+      feedServer(toServer.length);
+      progressed = true;
+    }
+    if (pump(0)) progressed = true;
+    if (serverPending() > 0) {
+      feedClient(Number.MAX_SAFE_INTEGER);
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  if (sentToServer < toServer.length) throw new Error("runScript: the server stopped wanting input for good");
   server.receiveEnd();
-  respond(server, serverEvents, fromServer);
+  pump(0);
   feedClient(Number.MAX_SAFE_INTEGER);
   clientEvents.push(...client.receiveEnd());
-  return { clientEvents, serverEvents };
+  return {
+    clientEvents,
+    serverEvents,
+    serverRemainder: server.state === "upgraded" ? concat(serverRest) : null,
+    clientRemainder: client.state === "upgraded" ? concat(clientRest) : null,
+  };
 }

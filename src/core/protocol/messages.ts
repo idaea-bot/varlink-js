@@ -1,5 +1,5 @@
 // Call and reply messages (DESIGN.md §4.4, §4.10): UAPI header validation on decode, minimal encoding (F17).
-import { ProtocolError } from "../errors/local.ts";
+import { ProtocolError, safeQuote } from "../errors/local.ts";
 import type { Codec } from "../types/codec.ts";
 
 /** A decoded method call. Absent/null headers are normalized: `parameters` `{}`, flags `false`. */
@@ -51,9 +51,20 @@ export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-/** A peer-chosen key for an error message: cut to 64 code units, JSON-quoted. */
+/** Longest peer-chosen key quoted in an error message, in UTF-16 code units, before the "…" marking a cut. */
+const MAX_QUOTED_KEY = 64;
+
+/**
+ * A peer-chosen key for an error message: cut to 64 code units on a code point boundary, then quoted log-safe
+ * ({@link safeQuote}: control and format characters such as bidi overrides and U+2028 escaped).
+ */
 function quoteKey(key: string): string {
-  return JSON.stringify(key.length > 64 ? `${key.slice(0, 64)}…` : key);
+  if (key.length <= MAX_QUOTED_KEY) return safeQuote(key);
+  let end = MAX_QUOTED_KEY;
+  const last = key.charCodeAt(end - 1);
+  const next = key.charCodeAt(end);
+  if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--; // keep the pair together
+  return safeQuote(`${key.slice(0, end)}…`);
 }
 
 function defineData(target: Record<string, unknown>, key: string, value: unknown): void {

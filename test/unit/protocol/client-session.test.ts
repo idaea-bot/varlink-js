@@ -210,7 +210,12 @@ describe("ClientSession upgrade", () => {
     assert.deepEqual(s.receive(utf8(" more")), []);
     assert.throws(() => s.call({ method: M }), ConnectionClosedError);
     assert.deepEqual(s.takeUpgradeRemainder(), utf8("RAW\0{not json more"));
-    assert.throws(() => s.takeUpgradeRemainder(), TypeError);
+    assert.deepEqual(s.takeUpgradeRemainder(), new Uint8Array(0));
+    // Bytes received after a take (a read that was in flight) are kept for the next take.
+    assert.deepEqual(s.receive(utf8("late")), []);
+    assert.deepEqual(s.receive(utf8("+r")), []);
+    assert.deepEqual(s.takeUpgradeRemainder(), utf8("late+r"));
+    assert.deepEqual(s.takeUpgradeRemainder(), new Uint8Array(0));
     assert.deepEqual(s.receiveEnd(), []);
     assert.deepEqual(brief(s.close()), [{ type: "closed" }]);
   });

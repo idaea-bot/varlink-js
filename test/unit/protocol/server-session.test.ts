@@ -124,6 +124,46 @@ describe("ServerSession backpressure", () => {
     assert.equal(DEFAULT_MAX_QUEUED_CALLS, 64);
   });
 
+  test("wantsInput also bounds bytes: 64 pipelined ~1 MiB calls never buffer more than 2 MiB + one chunk", () => {
+    const max = 1024 * 1024;
+    const chunk = 64 * 1024;
+    const s = new ServerSession({ maxMessageSize: max });
+    const one = msg({ method: M, parameters: { x: "x".repeat(max - 100) } });
+    assert.ok(one.length - 1 <= max && one.length > max - 100);
+    const stream = concat(Array.from({ length: 64 }, () => one));
+    let sent = 0;
+    let calls = 0;
+    let maxBuffered = 0;
+    // A driver: read while wantsInput, else take (and answer) one call.
+    while (calls < 64) {
+      if (s.wantsInput && sent < stream.length) {
+        s.receive(stream.subarray(sent, sent + chunk));
+        sent = Math.min(stream.length, sent + chunk);
+        const buffered = sent - calls * one.length; // every call taken consumed exactly one message
+        maxBuffered = Math.max(maxBuffered, buffered);
+        assert.ok(buffered <= 2 * max + chunk, `buffered ${String(buffered)} after ${String(sent)} bytes`);
+        continue;
+      }
+      const { id } = callOf(s.nextEvent());
+      reply(s, id);
+      calls++;
+    }
+    assert.equal(sent, stream.length);
+    assert.ok(maxBuffered > max); // the bound was actually exercised
+  });
+
+  test("wantsInput byte bound: only with a complete message buffered; a lone partial message keeps reading", () => {
+    const s = new ServerSession({ maxMessageSize: 100 });
+    s.receive(utf8(`{"method":"${M}","parameters":{"x":"${"x".repeat(20)}`));
+    assert.equal(s.wantsInput, true);
+    s.receive(utf8('"}}\0{"method":'));
+    assert.equal(s.wantsInput, true); // one complete message, but buffered < maxMessageSize
+    s.receive(utf8(`"${M}","parameters":{"x":"${"y".repeat(30)}`));
+    assert.equal(s.wantsInput, false); // a complete message and ≥ maxMessageSize bytes
+    reply(s, callOf(s.nextEvent()).id);
+    assert.equal(s.wantsInput, true); // only the partial one is left: it needs more bytes
+  });
+
   test("maxQueuedCalls must be a positive integer", () => {
     for (const bad of [0, -1, 1.5]) assert.throws(() => new ServerSession({ maxQueuedCalls: bad }), RangeError);
   });
@@ -213,22 +253,34 @@ describe("ServerSession upgrade", () => {
     assert.equal(s.nextEvent(), null);
     s.receive(utf8("+after"));
     assert.deepEqual(s.takeUpgradeRemainder(), utf8("not json\0[]\0later+after"));
-    assert.throws(() => s.takeUpgradeRemainder(), TypeError);
     assert.throws(() => s.reply(id, {}), TypeError);
+  });
+
+  test("bytes received after takeUpgradeRemainder accumulate for the next take", () => {
+    const s = new ServerSession();
+    s.receive(concat([msg({ method: M, upgrade: true }), utf8("one")]));
+    reply(s, callOf(s.nextEvent()).id);
+    assert.deepEqual(s.takeUpgradeRemainder(), utf8("one"));
+    assert.deepEqual(s.takeUpgradeRemainder(), new Uint8Array(0));
+    s.receive(utf8("two"));
+    s.receive(utf8("+three"));
+    assert.deepEqual(s.takeUpgradeRemainder(), utf8("two+three"));
+    assert.deepEqual(s.takeUpgradeRemainder(), new Uint8Array(0));
   });
 
   test("takeUpgradeRemainder only when upgraded", () => {
     assert.throws(() => new ServerSession().takeUpgradeRemainder(), TypeError);
   });
 
-  test("upgraded bytes lost to the size limit close the session instead of a truncated handover", () => {
+  test("upgraded bytes lost to the size limit: no confirmation, the session closes instead of a truncated handover", () => {
     const s = new ServerSession({ maxMessageSize: 64 });
     s.receive(concat([msg({ method: M }), msg({ method: M, upgrade: true }), utf8("x".repeat(100))]));
     s.receive(utf8("dropped"));
     reply(s, callOf(s.nextEvent()).id);
     const { id } = callOf(s.nextEvent());
-    reply(s, id);
+    assert.equal(s.reply(id, { ok: true }), null); // the peer must not see "upgraded"
     assert.equal(s.state, "closed");
+    assert.throws(() => s.takeUpgradeRemainder(), TypeError);
     const close = s.nextEvent();
     assert.ok(close?.type === "close" && close.error instanceof MessageTooLargeError);
   });

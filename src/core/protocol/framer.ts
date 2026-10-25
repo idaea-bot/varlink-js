@@ -12,6 +12,8 @@ export interface FramerOptions {
 }
 
 const INITIAL_CAPACITY = 4096;
+/** A buffer larger than this is dropped when it empties (next() consumed everything). */
+const SHRINK_THRESHOLD = 64 * 1024;
 const NUL = 0;
 
 /** The `maxMessageSize` option checked: a positive safe integer, default {@link DEFAULT_MAX_MESSAGE_SIZE}. */
@@ -56,6 +58,11 @@ export class Framer {
   /** Unconsumed bytes currently held. */
   get buffered(): number {
     return this.#end - this.#start;
+  }
+
+  /** Size of the internal buffer in bytes (≥ {@link buffered}). For tests and diagnostics. */
+  get capacity(): number {
+    return this.#buf.length;
   }
 
   /** Number of complete (NUL-terminated) messages currently buffered and not yet returned by next(). */
@@ -108,6 +115,9 @@ export class Framer {
     }
     if (this.#start === this.#end) {
       this.#start = this.#end = this.#msgStart = 0;
+      // Give a large buffer back once it is empty (re-allocated lazily on the next push): one big message must
+      // not pin its memory for the rest of the connection.
+      if (this.#buf.length > SHRINK_THRESHOLD) this.#buf = new Uint8Array(0);
     } else if (this.#start > this.#buf.length / 2) {
       this.#compact();
     }
@@ -157,12 +167,21 @@ export class Framer {
   /** Makes room for `n` more bytes after #end. */
   #reserve(n: number): void {
     if (this.#buf.length - this.#end >= n) return;
-    if (this.#start > 0) this.#compact();
-    if (this.#buf.length - this.#end >= n) return;
-    const need = this.#end + n;
+    // Compact only when that frees at least a quarter of the buffer: each compaction then moves at most 3/4 of
+    // the capacity for ≥ 1/4 of it consumed, so copying stays amortised O(n) (otherwise grow).
+    if (this.#start >= this.#buf.length / 4) {
+      this.#compact();
+      if (this.#buf.length - this.#end >= n) return;
+    }
+    // Growing copies anyway: copy only the unconsumed bytes, to the front.
+    const shift = this.#start;
+    const need = this.#end - shift + n;
     const grown = new Uint8Array(Math.max(INITIAL_CAPACITY, this.#buf.length * 2, need));
-    grown.set(this.#buf.subarray(0, this.#end));
+    grown.set(this.#buf.subarray(shift, this.#end));
     this.#buf = grown;
+    this.#end -= shift;
+    this.#msgStart -= shift;
+    this.#start = 0;
   }
 
   /** Moves the unconsumed bytes to the front of the buffer. */

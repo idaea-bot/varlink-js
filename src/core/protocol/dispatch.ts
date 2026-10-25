@@ -142,6 +142,15 @@ function asAsyncIterator(v: unknown): AsyncIterator<unknown, unknown, undefined>
   return null;
 }
 
+/** {@link isPlainObject} for handler values: false (never a throw) for a Proxy whose getPrototypeOf trap throws. */
+function isPlainReply(v: unknown): v is Record<string, unknown> {
+  try {
+    return isPlainObject(v);
+  } catch {
+    return false;
+  }
+}
+
 function describe(v: unknown): string {
   if (v === null) return "null";
   if (Array.isArray(v)) return "an array";
@@ -329,7 +338,10 @@ class Dispatch {
         return;
       }
       await this.#chain; // backpressure: the reply is written before the next value is pulled
-      if (this.#dead || this.#session.state !== "open") {
+      // The call may have ended while the write was pending (a failed write, a closed session, a notify() from
+      // the generator that ended it with InternalError): never pull another value then.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- #done can change during the await
+      if (this.#dead || this.#done || this.#session.state !== "open") {
         this.#done = true;
         await this.#closeIterator(it);
         this.#settled = true;
@@ -370,7 +382,11 @@ class Dispatch {
     if (outcome === "invalid") {
       const problem = this.#lastProblem;
       this.#sendError(InternalError.errorName, {});
-      return Promise.reject(problem instanceof Error ? problem : new TypeError("invalid notify() value"));
+      const rejected = Promise.reject(problem instanceof Error ? problem : new TypeError("invalid notify() value"));
+      // Already reported through onError: a fire-and-forget notify() must not become an unhandled rejection.
+      // Callers that await still see it.
+      rejected.catch(() => undefined);
+      return rejected;
     }
     return this.#chain;
   }
@@ -382,7 +398,7 @@ class Dispatch {
   #reply(value: unknown, continues: boolean): Outcome {
     if (this.#done || this.#dead) return "dropped";
     if (value === undefined) value = {};
-    if (!isPlainObject(value)) {
+    if (!isPlainReply(value)) {
       const problem = new TypeError(`${this.#call.method}: a reply must be a plain object, not ${describe(value)}`);
       this.#lastProblem = problem;
       this.#report("bad-result", problem);
@@ -447,19 +463,33 @@ class Dispatch {
     const outcome = this.#produce(
       () => this.#session.error(this.#id, name, parameters as Record<string, unknown>),
       true,
+      "invalid-error",
     );
     if (outcome === "invalid") this.#sendError(InternalError.errorName, {});
   }
 
-  /** A final error reply; falls back to InternalError (which always encodes) if it cannot be produced. */
+  /**
+   * A final error reply; falls back to InternalError if it cannot be produced. If even that fails (a codec that
+   * cannot encode it) while the session is open, the session is closed so the connection cannot hang with a call
+   * that never ends.
+   */
   #sendError(name: string, parameters: Record<string, unknown>): void {
-    const outcome = this.#produce(() => this.#session.error(this.#id, name, parameters), true);
+    let outcome = this.#produce(() => this.#session.error(this.#id, name, parameters), true);
     if (outcome === "invalid" && name !== InternalError.errorName)
-      this.#produce(() => this.#session.error(this.#id, InternalError.errorName, {}), true);
+      outcome = this.#produce(() => this.#session.error(this.#id, InternalError.errorName, {}), true);
+    if (outcome !== "invalid") return;
+    // #produce reported the failure ("invalid-reply").
+    this.#done = true;
+    this.#controller.abort(this.#lastProblem);
+    try {
+      this.#session.close();
+    } catch {
+      // close() does not throw; keep dispatch from rejecting regardless.
+    }
   }
 
   /** Runs a session reply/error call and queues its bytes for writing, in order. */
-  #produce(make: () => Uint8Array | null, final: boolean): Outcome {
+  #produce(make: () => Uint8Array | null, final: boolean, reason: DispatchErrorReason = "invalid-reply"): Outcome {
     if (this.#done || this.#dead) return "dropped";
     let bytes: Uint8Array | null;
     try {
@@ -471,7 +501,7 @@ class Dispatch {
         return "dropped";
       }
       this.#lastProblem = e;
-      this.#report("invalid-reply", e);
+      this.#report(reason, e);
       return "invalid";
     }
     if (final) this.#done = true;

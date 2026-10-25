@@ -3,7 +3,7 @@
 import { ProtocolError } from "../errors/local.ts";
 import { jsonCodec, type Codec } from "../types/codec.ts";
 import { concat } from "./client-session.ts";
-import { Framer, frameMessage } from "./framer.ts";
+import { checkMaxMessageSize, Framer, frameMessage } from "./framer.ts";
 import { decodeCall, encodeReply, type Call } from "./messages.ts";
 
 /** Default `maxQueuedCalls`: complete messages buffered before the driver stops reading. */
@@ -42,6 +42,7 @@ export class ServerSession {
   readonly #codec: Codec;
   readonly #framer: Framer;
   readonly #maxQueued: number;
+  readonly #maxMessageSize: number;
   #state: "open" | "upgraded" | "closed" = "open";
   #active: Active | null = null;
   #lastFinished = 0;
@@ -50,13 +51,11 @@ export class ServerSession {
   #paused = false;
   #closeEvent: ServerEvent | null = null;
   #remainder: Uint8Array[] | null = null;
-  #remainderTaken = false;
 
   constructor(options?: ServerSessionOptions) {
     this.#codec = options?.codec ?? jsonCodec;
-    this.#framer = new Framer(
-      options?.maxMessageSize === undefined ? undefined : { maxMessageSize: options.maxMessageSize },
-    );
+    this.#maxMessageSize = checkMaxMessageSize(options?.maxMessageSize);
+    this.#framer = new Framer({ maxMessageSize: this.#maxMessageSize });
     const max = options?.maxQueuedCalls ?? DEFAULT_MAX_QUEUED_CALLS;
     if (!Number.isSafeInteger(max) || max <= 0) throw new RangeError("maxQueuedCalls must be a positive safe integer");
     this.#maxQueued = max;
@@ -68,16 +67,22 @@ export class ServerSession {
   }
 
   /**
-   * False while maxQueuedCalls complete messages are buffered, while paused after an upgrade call, after EOF, after
-   * a framing error, or when not open: the driver stops reading (backpressure).
+   * False while maxQueuedCalls complete messages are buffered, while at least one complete message is buffered and
+   * the buffered bytes reach maxMessageSize, while paused after an upgrade call, after EOF, after a framing error,
+   * or when not open: the driver stops reading (backpressure). The byte bound is like sd-varlink's 16 MiB input
+   * buffer cap (json-stream.c:1240), with room for one partial message: without a complete message the driver
+   * keeps reading (the partial message needs it; the framer caps it at maxMessageSize). So a connection buffers at
+   * most about 2 × maxMessageSize + one read chunk.
    */
   get wantsInput(): boolean {
+    const complete = this.#framer.completeMessages;
     return (
       this.#state === "open" &&
       !this.#eof &&
       !this.#paused &&
       this.#framer.accepting &&
-      this.#framer.completeMessages < this.#maxQueued
+      complete < this.#maxQueued &&
+      (complete === 0 || this.#framer.buffered < this.#maxMessageSize)
     );
   }
 
@@ -125,7 +130,9 @@ export class ServerSession {
   }
 
   /**
-   * Encodes and frames a reply for the active call. Returns null for a oneway call (nothing is ever written).
+   * Encodes and frames a reply for the active call. Returns null for a oneway call (nothing is ever written), and
+   * for the final reply to an upgrade call whose upgraded bytes were lost to the size limit: the session is then
+   * closed (its close event carries the MessageTooLargeError) and no confirmation must reach the peer.
    * `continues: true` is only allowed when the call has `more`. A non-continues reply is final and ends the call
    * (except oneway: see {@link finish}).
    *
@@ -147,7 +154,7 @@ export class ServerSession {
     if (continues) init.continues = true;
     if (options?.ext !== undefined) init.ext = options.ext;
     const bytes = frameMessage(encodeReply(init, this.#codec));
-    if (!continues) this.#finishActive(false);
+    if (!continues && !this.#finishActive(false)) return null;
     return bytes;
   }
 
@@ -179,11 +186,14 @@ export class ServerSession {
     if (id !== this.#lastFinished || id === 0) throw new TypeError(`call ${String(id)} is not active`);
   }
 
-  /** Every byte after the upgrade call's NUL (including bytes received later). Only in state `upgraded`, once. */
+  /**
+   * Every byte after the upgrade call's NUL received so far. Only in state `upgraded`. May be called again: bytes
+   * passed to {@link receive} later accumulate, and each call returns what arrived since the previous one (an empty
+   * array if nothing did).
+   */
   takeUpgradeRemainder(): Uint8Array {
-    if (this.#state !== "upgraded" || this.#remainder === null || this.#remainderTaken)
-      throw new TypeError("no upgrade remainder: the session is not upgraded or it was taken already");
-    this.#remainderTaken = true;
+    if (this.#state !== "upgraded" || this.#remainder === null)
+      throw new TypeError("no upgrade remainder: the session is not upgraded");
     const chunks = this.#remainder;
     this.#remainder = [];
     return concat(chunks);
@@ -203,18 +213,20 @@ export class ServerSession {
     return active;
   }
 
-  #finishActive(isError: boolean): void {
+  /** Ends the active call. False iff an upgrade could not be handed over (the session is closed then). */
+  #finishActive(isError: boolean): boolean {
     const active = this.#active;
-    if (active === null) return;
+    if (active === null) return true;
     this.#active = null;
     this.#lastFinished = active.id;
-    if (!active.call.upgrade) return;
+    if (!active.call.upgrade) return true;
     this.#paused = false;
-    if (isError) return;
+    if (isError) return true;
     try {
       const rest = this.#framer.takeRemainder();
       this.#remainder = rest.length > 0 ? [rest] : [];
       this.#state = "upgraded";
+      return true;
     } catch (e) {
       // Upgraded bytes were dropped by the size limit: the stream cannot be handed over intact.
       this.#state = "closed";
@@ -222,6 +234,7 @@ export class ServerSession {
         type: "close",
         error: e instanceof ProtocolError ? e : new ProtocolError("upgrade remainder lost", { cause: e }),
       };
+      return false;
     }
   }
 }

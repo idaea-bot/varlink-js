@@ -175,6 +175,76 @@ describe("faulty()", () => {
     assert.deepEqual(await readAll(b), ["ab", "cd"]);
   });
 
+  test("after a write reset every later write rejects, also a zero-length one", async () => {
+    const [a] = pair();
+    let innerWrites = 0;
+    // An inner channel that would accept writes even after close(): the rejection must come from faulty().
+    const inner: ByteChannel = {
+      read: () => a.read(),
+      end: () => a.end(),
+      close: (reason?: unknown) => {
+        a.close(reason);
+      },
+      closed: a.closed,
+      capabilities: a.capabilities,
+      write: () => {
+        innerWrites++;
+        return Promise.resolve();
+      },
+    };
+    const fa = faulty(inner, { resetAfterWriteBytes: 2 });
+    await assert.rejects(fa.write(utf8("abc")), ConnectionClosedError);
+    assert.equal(innerWrites, 1);
+    await assert.rejects(fa.write(new Uint8Array(0)), ConnectionClosedError);
+    await assert.rejects(fa.write(utf8("x")), ConnectionClosedError);
+    assert.equal(innerWrites, 1);
+  });
+
+  test("concurrent writes are serialized: split every byte, they never interleave", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { splitWrites: "every-byte" });
+    const w1 = fa.write(utf8("abc"));
+    const w2 = fa.write(utf8("xyz"));
+    await Promise.all([w1, w2]);
+    await fa.end();
+    assert.deepEqual(await readAll(b), ["a", "b", "c", "x", "y", "z"]);
+  });
+
+  test("concurrent writes are serialized: a delay resolving out of order does not reorder them", async () => {
+    const [a, b] = pair();
+    let calls = 0;
+    let release: () => void = () => undefined;
+    // The first delay resolves last: without serialization the second write would overtake the first.
+    const delay = (): Promise<void> => {
+      calls++;
+      return calls === 1
+        ? new Promise((r) => {
+            release = r;
+          })
+        : Promise.resolve();
+    };
+    const fa = faulty(a, { delay });
+    const w1 = fa.write(utf8("first"));
+    const w2 = fa.write(utf8("second"));
+    await tick();
+    assert.equal(calls, 1); // the second write has not started: the first one's delay is still pending
+    release();
+    await Promise.all([w1, w2]);
+    assert.equal(calls, 2);
+    await fa.end();
+    assert.deepEqual(await readAll(b), ["first", "second"]);
+  });
+
+  test("a failed write does not block the writes queued behind it", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { splitWrites: 1 });
+    b.close(); // a's writes now reject
+    const w1 = fa.write(utf8("ab"));
+    const w2 = fa.write(utf8("cd"));
+    await assert.rejects(w1, ConnectionClosedError);
+    await assert.rejects(w2, ConnectionClosedError);
+  });
+
   test("delay is awaited before every read and write", async () => {
     const [a, b] = pair();
     let calls = 0;

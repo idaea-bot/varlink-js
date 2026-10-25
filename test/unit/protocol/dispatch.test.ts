@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   InvalidParameterError,
+  MessageTooLargeError,
   PermissionDeniedError,
   ValidationError,
   VarlinkError,
@@ -22,7 +23,7 @@ import {
   type Handler,
   type MethodEntry,
 } from "../../../src/core/protocol/index.ts";
-import { compileInterfaceText, jsonCodec } from "../../../src/core/types/index.ts";
+import { compileInterfaceText, jsonCodec, type Codec } from "../../../src/core/types/index.ts";
 import { concat, frame, messages, msg, serve, tableOf, type Served } from "./helpers.ts";
 
 const IDL = `interface org.example.ftl
@@ -422,6 +423,89 @@ describe("streaming handler contract", () => {
     assert.equal(finalized, true);
   });
 
+  test("a yielded Proxy whose getPrototypeOf throws → bad-result, generator closed with return(), InternalError", async () => {
+    const hostile = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error("trap");
+        },
+      },
+    );
+    for (const more of [true, false]) {
+      let finalized = false;
+      const r = await run(
+        {
+          List: async function* () {
+            try {
+              yield hostile;
+              yield { name: "never" };
+            } finally {
+              finalized = true;
+            }
+          },
+        },
+        { method: `${I}.List`, more },
+      );
+      assert.deepEqual(r.replies, [internal]);
+      assert.deepEqual(reasons(r), ["bad-result"]);
+      assert.equal(finalized, true);
+    }
+  });
+
+  test("a notify() that ends the call while a yield's send is pending: the generator is not resumed", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.List`, more: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let afterYield = false;
+    let finalized = false;
+    let rejection: unknown;
+    const table = tableOf([FTL], {
+      [`${I}.List`]: async function* (_p: unknown, ctx: CallContext) {
+        try {
+          // Fires while dispatch awaits the send of the first yield.
+          setImmediate(() => {
+            ctx.notify({ size: "not an int" }).catch((e: unknown) => {
+              rejection = e;
+            });
+          });
+          yield { name: "a" };
+          afterYield = true;
+          yield { name: "b" };
+        } finally {
+          finalized = true;
+        }
+      },
+    });
+    const written: unknown[] = [];
+    const reported: DispatchErrorReason[] = [];
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const done = dispatchCall(
+      session,
+      ev.id,
+      ev.call,
+      table,
+      async (bytes) => {
+        await gate;
+        written.push(...messages(bytes));
+      },
+      { validateReplies: "throw", onError: (_e, info) => reported.push(info.reason) },
+    );
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(reported, ["invalid-reply"]); // the notify ran while the first send was pending
+    release();
+    await done;
+    assert.equal(afterYield, false);
+    assert.equal(finalized, true);
+    assert.ok(rejection instanceof ValidationError);
+    assert.deepEqual(written, [{ parameters: { name: "a" }, continues: true }, internal]);
+  });
+
   test("a throwing return() after the single reply → cleanup-threw, the reply is out", async () => {
     const r = await run(
       {
@@ -601,6 +685,34 @@ describe("ctx.notify (rule 15)", () => {
     assert.deepEqual(r.replies, [internal]);
     assert.deepEqual(reasons(r), ["invalid-reply"]);
   });
+
+  test('a fire-and-forget notify failing in "throw" mode is never an unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const listener = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", listener);
+    try {
+      for (const more of [true, false]) {
+        const r = await run(
+          {
+            Plain: (_p: unknown, ctx: CallContext) => {
+              void ctx.notify({ n: "not an int" });
+              return { n: 1 };
+            },
+          },
+          { method: `${I}.Plain`, more },
+          { validateReplies: "throw" },
+        );
+        assert.deepEqual(r.replies, [internal]);
+        assert.deepEqual(reasons(r), ["invalid-reply"]);
+      }
+      for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+  });
 });
 
 describe("thrown values (rule 9)", () => {
@@ -774,7 +886,7 @@ describe("encode failures (rule 11)", () => {
     assert.deepEqual(reasons(r), ["invalid-reply"]);
   });
 
-  test("an error whose parameters cannot be encoded → InternalError", async () => {
+  test("an error whose parameters cannot be encoded → InternalError + invalid-error", async () => {
     const r = await run(
       {
         Plain: () => {
@@ -784,7 +896,36 @@ describe("encode failures (rule 11)", () => {
       { method: `${I}.Plain` },
     );
     assert.deepEqual(r.replies, [internal]);
-    assert.deepEqual(reasons(r), ["invalid-reply"]);
+    assert.deepEqual(reasons(r), ["invalid-error"]);
+  });
+
+  test("not even InternalError can be encoded: the session is closed, nothing written, the call ends", async () => {
+    const broken = new Error("codec broken");
+    const codec: Codec = {
+      decode: (text) => jsonCodec.decode(text),
+      encode: () => {
+        throw broken;
+      },
+      losslessInts: jsonCodec.losslessInts,
+    };
+    const session = new ServerSession({ codec });
+    let signal: AbortSignal | undefined;
+    const r = await run(
+      {
+        Plain: (_p: unknown, ctx: CallContext) => {
+          signal = ctx.signal;
+          return { n: 1 };
+        },
+      },
+      { method: `${I}.Plain` },
+      { session, eof: false },
+    );
+    assert.deepEqual(r.replies, []);
+    assert.deepEqual(reasons(r), ["invalid-reply", "invalid-reply"]);
+    assert.ok(r.reported.every((x) => x.error === broken));
+    assert.equal(session.state, "closed"); // the driver sees it and drops the connection instead of hanging
+    assert.equal(session.wantsInput, false);
+    assert.equal(signal?.aborted, true);
   });
 });
 
@@ -909,6 +1050,28 @@ describe("onError, send failures, aborts, upgrade, oneway", () => {
     assert.deepEqual(r.replies, [{ error: "org.varlink.service.PermissionDenied", parameters: {} }]);
     assert.equal(session.state, "open");
     assert.deepEqual(r.reported, []);
+  });
+
+  test("upgrade: remainder lost to the size limit → no confirmation written, session closed, call finished", async () => {
+    const session = new ServerSession({ maxMessageSize: 64 });
+    const reported: DispatchErrorReason[] = [];
+    let ran = false;
+    const table = tableOf([FTL], {
+      [`${I}.Up`]: () => {
+        ran = true;
+        return { ok: true };
+      },
+    });
+    const r = await serve(
+      [concat([msg({ method: `${I}.Up`, upgrade: true }), new Uint8Array(100).fill(0x78)]), new Uint8Array(8)],
+      table,
+      { session, eof: false, onError: (_e, info) => reported.push(info.reason) },
+    );
+    assert.equal(ran, true);
+    assert.equal(r.output.length, 0); // the peer never sees "upgraded"
+    assert.deepEqual(reported, []); // no InternalError attempt, no upgrade-unclaimed
+    assert.equal(session.state, "closed");
+    assert.ok(r.close?.type === "close" && r.close.error instanceof MessageTooLargeError);
   });
 
   test("supports-upgrade method called without upgrade runs as a plain call", async () => {

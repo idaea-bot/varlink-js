@@ -19,7 +19,10 @@ export interface FaultPlan {
    * (faulty)") and the inner channel is closed (simulated RST mid-message).
    */
   resetAfterReadBytes?: number;
-  /** Same for writes: bytes beyond the limit are not written, write() rejects, the inner channel is closed. */
+  /**
+   * Same for writes: bytes beyond the limit are not written, write() rejects, the inner channel is closed, and
+   * every later write() rejects too.
+   */
   resetAfterWriteBytes?: number;
   /** Await this before every read and write (e.g. `() => new Promise(r => setTimeout(r, 1))` in tests). */
   delay?: () => Promise<void>;
@@ -65,7 +68,8 @@ function resetError(): ConnectionClosedError {
 
 /**
  * Wraps `channel` with the faults in `plan`. `closed`, `end`, `close` and `capabilities` delegate to the inner
- * channel. fds of a split chunk go with its first piece.
+ * channel. fds of a split chunk go with its first piece. Concurrent writes are serialized: each starts after the
+ * previous one settled, so they arrive in call order and never interleave.
  */
 export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
   checkSplit(plan.splitReads, "splitReads");
@@ -76,6 +80,8 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
   let readBytes = 0;
   let writtenBytes = 0;
   let readReset = false;
+  /** A write hit resetAfterWriteBytes: every later write rejects (also zero-length ones). */
+  let writeReset = false;
 
   async function read(): Promise<ReadChunk | null> {
     if (plan.delay !== undefined) await plan.delay();
@@ -109,8 +115,19 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
     return next;
   }
 
-  async function write(chunk: Uint8Array, fds?: readonly FdHandle[]): Promise<void> {
+  // Writes run one after another (each starts once the previous one settled), so concurrent writes reach the
+  // inner channel whole and in call order, whatever the split or the delay.
+  let writeChain: Promise<void> = Promise.resolve();
+
+  function write(chunk: Uint8Array, fds?: readonly FdHandle[]): Promise<void> {
+    const run = writeChain.then(() => writeNow(chunk, fds));
+    writeChain = run.catch(() => undefined);
+    return run;
+  }
+
+  async function writeNow(chunk: Uint8Array, fds?: readonly FdHandle[]): Promise<void> {
     if (plan.delay !== undefined) await plan.delay();
+    if (writeReset) throw resetError();
     const limit = plan.resetAfterWriteBytes;
     const pieces = split(chunk, plan.splitWrites);
     for (let i = 0; i < pieces.length; i++) {
@@ -126,6 +143,7 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
         writtenBytes += piece.length;
       }
       if (reset) {
+        writeReset = true;
         channel.close(resetError());
         throw resetError();
       }

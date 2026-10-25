@@ -54,7 +54,6 @@ export class ClientSession {
   #state: "open" | "upgraded" | "closed" = "open";
   #upgradePending = false;
   #remainder: Uint8Array[] | null = null;
-  #remainderTaken = false;
 
   constructor(options?: ClientSessionOptions) {
     this.#codec = options?.codec ?? jsonCodec;
@@ -161,12 +160,12 @@ export class ClientSession {
 
   /**
    * The bytes after the confirming reply of the upgrade call (received so far): they belong to the upgraded
-   * protocol. Only in state `upgraded`, once.
+   * protocol. Only in state `upgraded`. May be called again: bytes passed to {@link receive} later accumulate, and
+   * each call returns what arrived since the previous one (an empty array if nothing did).
    */
   takeUpgradeRemainder(): Uint8Array {
-    if (this.#state !== "upgraded" || this.#remainder === null || this.#remainderTaken)
-      throw new TypeError("no upgrade remainder: the session is not upgraded or it was taken already");
-    this.#remainderTaken = true;
+    if (this.#state !== "upgraded" || this.#remainder === null)
+      throw new TypeError("no upgrade remainder: the session is not upgraded");
     const chunks = this.#remainder;
     this.#remainder = [];
     return concat(chunks);

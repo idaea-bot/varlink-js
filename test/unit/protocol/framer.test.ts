@@ -115,6 +115,55 @@ describe("Framer splitting", () => {
       assert.equal(framer.completeMessages, queue.length);
     }
   });
+
+  test("the buffer shrinks back once a 16 MiB message was consumed", () => {
+    const framer = new Framer();
+    const mib = new Uint8Array(1024 * 1024).fill(0x20);
+    for (let i = 0; i < 15; i++) framer.push(mib);
+    framer.push(mib.subarray(2));
+    framer.push(utf8("{}\0")); // exactly DEFAULT_MAX_MESSAGE_SIZE bytes before the NUL
+    assert.ok(framer.capacity >= DEFAULT_MAX_MESSAGE_SIZE);
+    assert.equal(framer.next()?.length, DEFAULT_MAX_MESSAGE_SIZE);
+    assert.equal(framer.buffered, 0);
+    assert.ok(framer.capacity <= 4096, `capacity ${String(framer.capacity)}`);
+    framer.push(frame("{}"));
+    assert.equal(framer.capacity, 4096);
+    assert.equal(framer.next(), "{}");
+    assert.equal(framer.capacity, 4096); // small buffers are kept (no churn)
+  });
+
+  test("a large buffer is kept while unconsumed bytes remain", () => {
+    const framer = new Framer();
+    framer.push(concat([frame("x".repeat(100_000)), utf8("partial")]));
+    const capacity = framer.capacity;
+    assert.equal(framer.next()?.length, 100_000);
+    assert.equal(framer.capacity, capacity);
+    assert.equal(framer.buffered, 7);
+  });
+
+  test("needing room with less than a quarter consumed grows instead of compacting", () => {
+    const framer = new Framer();
+    framer.push(concat([frame("a"), utf8("x".repeat(4094))]));
+    assert.equal(framer.capacity, 4096);
+    assert.equal(framer.next(), "a"); // 2 bytes consumed: < 1/4 of the buffer
+    framer.push(utf8("x"));
+    assert.equal(framer.capacity, 8192); // compacting here would move ~4 KiB for 2 freed bytes
+    assert.equal(framer.buffered, 4095);
+    framer.push(new Uint8Array([0]));
+    assert.equal(framer.next(), "x".repeat(4095));
+  });
+
+  test("needing room with at least a quarter consumed compacts in place", () => {
+    const framer = new Framer();
+    const first = "a".repeat(1100);
+    framer.push(concat([frame(first), utf8("x".repeat(4096 - 1101))]));
+    assert.equal(framer.capacity, 4096);
+    assert.equal(framer.next(), first); // 1101 bytes consumed: ≥ 1/4, < 1/2 (no compaction in next())
+    framer.push(utf8("yz"));
+    assert.equal(framer.capacity, 4096);
+    framer.push(new Uint8Array([0]));
+    assert.equal(framer.next(), `${"x".repeat(4096 - 1101)}yz`);
+  });
 });
 
 describe("Framer size limit", () => {
