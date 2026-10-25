@@ -934,9 +934,10 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   later reads `null`. `write(chunk)`: non-empty `fds` → `OperationNotSupportedError`; not OPEN, or after
   `end()`/`close()`/a failure → `ConnectionClosedError`; `send()` throwing → `ConnectionClosedError(cause)`; resolves
   once `bufferedAmount <= writeHighWaterMark` (default 1 MiB; polled with `setTimeout`, 1 ms doubling to 50 ms); a
-  waiting write resolves on a clean close that we started (`end()`/`close()`/our own failure: the closing handshake
-  follows the queued data) and rejects on an unclean one or a clean one the peer started (RFC 6455 lets the peer
-  discard data frames arriving after its Close). `end()` (WebSocket has no half-close) is `close(1000)` after the queued data and resolves on the `close` event;
+  waiting write resolves on a clean close that `end()` started while the socket was OPEN (the closing handshake
+  follows the queued data; `close()` and our own failures reject waiting writes at once) and rejects on an unclean
+  close or a clean one the peer started (RFC 6455 lets the peer discard data frames arriving after its Close; two
+  Close frames crossing on the wire cannot be told apart from ours). `end()` (WebSocket has no half-close) is `close(1000)` after the queued data and resolves on the `close` event;
   reads go on until then. `close(reason?)` is an idempotent hard close: queue dropped, a pending read gives `null`,
   pending and later writes reject, `ws.close(1000)` if CONNECTING/OPEN. `closed` never rejects and settles once the
   `close` event arrived and the end of the stream was read (or after a local `close()`), one microtask after that
@@ -1035,7 +1036,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   when it is the last record of the body, and is held back by one record otherwise; simple mode has no oneway, no
   upgrade and no pipelining, and concurrent calls are unordered; neither mode carries fds. `connect()` checks the
   channel options and `timeout` before dialling but the other `ConnectionOptions` (`ints`, `interfaces`, …) only in
-  `createConnection`, after the handshake. Error messages quote addresses without their user/password.
+  `createConnection`, after the handshake. The websocket/http mode-mismatch errors quote addresses without their user/password
+  (`parseAddress`'s own "invalid varlink address" errors, a core M4 file, still quote the raw input).
 
 ---
 

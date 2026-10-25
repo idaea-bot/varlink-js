@@ -213,7 +213,7 @@ class WebSocketChannel implements ByteChannel {
     const done = new Promise<void>((resolve) => {
       this.#endWaiters.push(resolve);
     });
-    this.#closeInitiated = true;
+    if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
     closeSocket(this.#ws, 1000);
     this.#armGuard();
     return done;
@@ -227,7 +227,7 @@ class WebSocketChannel implements ByteChannel {
     this.#buffered = 0;
     this.#rejectWrites(new ConnectionClosedError("the channel was closed"));
     this.#wake();
-    this.#closeInitiated = true;
+    if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
     closeSocket(this.#ws, 1000);
     if (this.#sawClose) this.#maybeResolveClosed();
     else this.#armGuard();
@@ -293,7 +293,7 @@ class WebSocketChannel implements ByteChannel {
     this.#outcome = { error, fromErrorEvent: false };
     this.#writeShut = true;
     this.#rejectWrites(new ConnectionClosedError("the websocket is closed", { cause: error }));
-    this.#closeInitiated = true;
+    if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
     closeSocket(this.#ws, code, reason);
     this.#armGuard();
     this.#wake();
@@ -362,7 +362,7 @@ class WebSocketChannel implements ByteChannel {
         this.#outcome = null;
         this.#outcomeDelivered = true;
         reader.reject(slot.error);
-        this.#closeInitiated = true;
+        if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
         closeSocket(this.#ws, 1011, "unreadable message");
         this.#armGuard();
         this.#maybeResolveClosed();
@@ -474,13 +474,16 @@ class WebSocketChannel implements ByteChannel {
  * `ConnectionClosedError("websocket closed: code N …")`, later reads give `null`.
  *
  * `write()` sends one binary message and resolves once `bufferedAmount` is at most `writeHighWaterMark` (default
- * 1 MiB, polled); it rejects with `ConnectionClosedError` unless the socket is open, and if it closes uncleanly first,
- * and with `OperationNotSupportedError` when given fds. `end()` (no half-close in WebSocket) closes with 1000 after
+ * 1 MiB, polled); it rejects with `ConnectionClosedError` unless the socket is open, and if it closes first, unless
+ * cleanly after our `end()` (a peer that starts the close may discard what is still queued), and with
+ * `OperationNotSupportedError` when given fds. `end()` (no half-close in WebSocket) closes with 1000 after
  * the queued data and resolves on the `close` event; `close()` is the same but immediate for this side (reads give
  * `null`, writes reject; idempotent). `closed` never rejects; it settles once the `close` event arrived and the end
  * of the stream was read (a microtask after that read settled), or after `close()` — so data queued before the close
  * is never cut off by a `closed` listener. If the peer never answers the closing handshake, `closed` (and `end()`)
- * settle 5 s after `close()`/`end()`; the timer is cleared by the `close` event. All listeners are removed on the
+ * settle 5 s after `close()`/`end()`: waiting writes reject, a pending or later read rejects once with
+ * `ConnectionClosedError("the websocket did not close in time")`, then gives `null`, and the listeners are removed;
+ * the timer is cleared by the `close` event. All listeners are removed on the
  * `close` event (the socket's last event).
  *
  * Attach it synchronously in the `open` handler: messages that arrive before are not seen.

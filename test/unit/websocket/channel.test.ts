@@ -286,6 +286,21 @@ describe("fromWebSocket: writing", () => {
       ch.close();
       await ch.closed;
     }
+    // The peer's Close arrived first (CLOSING) and then we call end(): still the peer's close, the write rejects.
+    {
+      const ws = new FakeWebSocket();
+      ws.holdClose = true;
+      const ch = fromWebSocket(ws, { writeHighWaterMark: 0 });
+      ws.bufferedAmount = 1;
+      const p = ch.write(enc("x"));
+      ws.readyState = 2;
+      const ended = ch.end();
+      ws.closed(1000);
+      await assert.rejects(p, ConnectionClosedError);
+      await ended;
+      ch.close();
+      await ch.closed;
+    }
     // Our end(): the clean close completes the handshake after everything queued was sent.
     const ws = new FakeWebSocket();
     ws.holdClose = true;
