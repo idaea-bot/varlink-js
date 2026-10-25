@@ -8,6 +8,7 @@ import {
   compileInterfaceText,
   createJsonCodec,
   jsonCodec,
+  MAX_ENCODE_ARRAY_LENGTH,
   MAX_VALUE_DEPTH,
   type CompileOptions,
   type IntsMode,
@@ -211,7 +212,14 @@ describe("primitives", () => {
       { type: "float", input: 1, expect: ok(1) },
       { type: "float", input: 1e300, expect: ok(1e300) },
       { type: "float", input: 2n ** 64n, dirs: DECODE, expect: ok(2 ** 64) },
-      { type: "float", input: 2n ** 64n, dirs: ENCODE, expect: ok(2n ** 64n) },
+      // Encode: a bigint that converts exactly becomes a number (sendable without JSON.rawJSON); an inexact one is
+      // sent as given, exact on the wire.
+      { type: "float", input: 2n ** 64n, dirs: ENCODE, expect: ok(2 ** 64) },
+      { type: "float", input: 5n, dirs: ENCODE, expect: ok(5) },
+      { type: "float", input: 2n ** 1000n, dirs: ENCODE, expect: ok(2 ** 1000) },
+      { type: "float", input: -(2n ** 53n) - 1n, dirs: DECODE, expect: ok(-(2 ** 53)) },
+      { type: "float", input: -(2n ** 53n) - 1n, dirs: ENCODE, expect: ok(-(2n ** 53n) - 1n) },
+      { type: "float", input: 2n ** 64n - 1n, dirs: ENCODE, expect: ok(2n ** 64n - 1n) },
       // Number() of it is Infinity: refused both ways (encode could not write it as a float either).
       { type: "float", input: 10n ** 400n, expect: err("type") },
       { type: "float", input: -(10n ** 400n), expect: err("type") },
@@ -280,9 +288,15 @@ describe("primitives", () => {
       { type: "any", input: Infinity, expect: err("type") },
       { type: "any", input: -Infinity, expect: err("type") },
       { type: "any", input: [Infinity], dirs: DECODE, expect: ok([Infinity]) },
-      { type: "any", input: () => 0, dirs: ENCODE, expect: err("type") },
-      { type: "any", input: Symbol("s"), dirs: ENCODE, expect: err("type") },
-      { type: "any", input: new Date(0), dirs: ENCODE, expect: err("type") },
+      // The same whitelist in both directions (a pluggable codec or hand-made input may produce anything).
+      ...[() => 0, Symbol("s"), new Date(0), new Map()].map((input): Row => ({
+        type: "any",
+        input,
+        expect: err("type"),
+      })),
+      // A top-level string must be well-formed, as for `string`; nested content is not inspected.
+      ...["\uD800", "a\uDFFFb"].map((input): Row => ({ type: "any", input, expect: err("type") })),
+      { type: "any", input: ["\uD800"], expect: ok(["\uD800"]) },
       { type: "any", input: ABSENT, expect: err("missing") },
       { type: "?any", input: null, expect: ok(OMITTED) },
     ]);
@@ -290,6 +304,7 @@ describe("primitives", () => {
     assert.equal(out.v, arr);
     // undefined at the top level is a type error; in a decoded map it is null, as in arrays.
     assert.equal(validationError(() => wrapper("any").decode(undefined)).reason, "type");
+    assert.equal(validationError(() => wrapper("any").encode(undefined)).reason, "type");
     assert.equal(validationError(() => wrapper("[string]any").decode({ v: { k: undefined } })).reason, "null");
   });
 });
@@ -425,6 +440,24 @@ describe("arrays", () => {
     const e = validationError(() => wrapper("[]int").encode({ v: sparse }));
     assert.equal(e.reason, "null");
     assert.equal(e.parameter, "v.1");
+  });
+
+  test("encode refuses arrays longer than MAX_ENCODE_ARRAY_LENGTH, before copying them", () => {
+    assert.equal(MAX_ENCODE_ARRAY_LENGTH, 8 * 1024 * 1024);
+    const huge: number[] = [];
+    huge[1e9] = 1;
+    const e = validationError(() => wrapper("[]?int").encode({ v: huge }));
+    assert.equal(e.reason, "type");
+    assert.equal(e.parameter, "v");
+    assert.equal(e.message, 'invalid parameter "v": array too long to send');
+    const atLimit: unknown[] = [];
+    atLimit[MAX_ENCODE_ARRAY_LENGTH - 1] = 1;
+    assert.equal((wrapper("[]?int").encode({ v: atLimit }) as { v: unknown[] }).v.length, MAX_ENCODE_ARRAY_LENGTH);
+    atLimit.push(1);
+    assert.equal(validationError(() => wrapper("[]?int").encode({ v: atLimit })).reason, "type");
+    // Decode is bounded by the message size instead: it walks the elements.
+    const d = validationError(() => wrapper("[]int").decode({ v: huge }));
+    assert.deepEqual([d.reason, d.parameter], ["null", "v.0"]);
   });
 });
 

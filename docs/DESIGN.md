@@ -297,9 +297,9 @@ export interface Codec {
 The default codec is `JSON.parse` / `JSON.stringify` with two small additions:
 
 - **Decode is lossless and type-agnostic.** The reviver checks `context.source` (verified on Node 26): an
-  integer literal (`/^-?\d+$/`) that is not a safe integer becomes a `bigint` (integer literals of at most 1024
-  characters; longer ones become `Infinity`, §4.9). Everything else, including
-  floats like `1e300` and `1.5`, stays a `number`.
+  integer literal (`/^-?\d+$/`) that is not a safe integer becomes a `bigint` (integer literals of at most
+  1024 characters; longer ones become `Infinity`, §4.9). Everything else, including floats like `1e300` and
+  `1.5`, stays a `number`.
 - **Encode** uses a replacer that throws on non-finite numbers (plain `JSON.stringify` would silently write
   `null`) and emits `bigint` with `JSON.rawJSON`.
 
@@ -312,12 +312,17 @@ client/server with `ints`:
   intact. Codegen types `int` as `number`.
 - `"bigint"`: every `int` field is converted to `bigint` (codegen type `bigint`). This gives the full
   −2⁶³…2⁶⁴−1 range the spec recommends.
-- Values inside `object`/`any`, and untyped calls without an IDL: unsafe integers come out as `bigint`
-  (never rounded), safe ones as `number`.
+- Values inside `object`/`any`, and untyped calls without an IDL: unsafe integers come out as `bigint` (never
+  rounded), safe ones as `number`. The decoder only sees the literal, so this also applies to what we send: an
+  integer-valued JS `number` beyond ±(2⁵³−1) that we encode inside `object`/`any` (or any untyped value) is
+  written as plain digits (`JSON.stringify` does so below 1e21; `2**60` → `1152921504606847000`), and a
+  lossless peer, varlink-js included, decodes it as the `bigint` of those digits. Typed `int` slots are
+  unaffected (they reject unsafe numbers), and typed `float` slots convert it back to `number`. Use `float`
+  fields for approximate large values.
 - UAPI allows accepting decimal strings for `int`; v1 does so only with `lenientInts: true`.
 
-- `float` fields accept any finite JSON number; a `bigint` produced by the codec is converted to `number` there
-  (floats are approximate by definition).
+- `float` fields accept any finite JSON number; a `bigint` produced by the codec is converted to `number`
+  there (floats are approximate by definition).
 
 **Runtimes without `context.source`** (to check for Bun, Deno and browsers in M0/M10): the codec can't
 recover the digits or tell `1e300` from a 301-digit integer. Rules there: an `int` field holding a value
@@ -457,78 +462,97 @@ line/column) so ASTs can also be built by hand, and `validateInterface` checks t
 
 ### 4.9 Types and errors (M2)
 
-`src/core/types/` (codec, validators, descriptor types) and `src/core/errors/`, both re-exported by the root entry.
-- **Codec**: `createJsonCodec({sourceText?})` / `jsonCodec` as in §4.3. Features are detected when the codec is
-  created; `losslessInts` = `context.source` && `JSON.rawJSON`; `sourceText: false` forces plain `JSON.parse`. Any
-  `JSON.parse` failure is a `ProtocolError` with `cause`, and a non-string argument a `TypeError` (caller
-  bug); encode throws `TypeError` (also for too deep values; an engine `RangeError` becomes a `TypeError` with
-  `cause`). Limits: integer literals of at most 1024 characters become bigint (longer ones stay `Infinity`, an
-  `int-range` in `int` slots), and more than 2048 `[`/`{` levels (sd-json `DEPTH_MAX`) is a `ProtocolError` on
-  decode in both modes and a `TypeError` on encode (peers refuse it). bigints are written from the holder (read
-  via its own data property, so a getter runs once), so a `BigInt.prototype.toJSON` polyfill is ignored; a float
-  `-0` stays `-0` where `JSON.rawJSON` exists (else it is written as `0`). Encode escapes U+007F as `\u007f` (sd-json refuses it raw). Encoding a huge sparse array is
-  O(length), like `JSON.stringify`.
+`src/core/types/` (codec, validators, descriptor types) and `src/core/errors/`, both re-exported by the root
+entry.
+- **Codec**: `createJsonCodec({sourceText?})` / `jsonCodec` as in §4.3. Features are detected when the codec
+  is created; `losslessInts` = `context.source` && `JSON.rawJSON`; `sourceText: false` forces plain
+  `JSON.parse`. Any `JSON.parse` failure is a `ProtocolError` with `cause`, and a non-string argument a
+  `TypeError` (caller bug); encode throws `TypeError` (also for too deep values; an engine `RangeError`
+  becomes a `TypeError` with `cause`). Limits: integer literals of at most 1024 characters become bigint
+  (longer ones stay `Infinity`, an `int-range` in `int` slots), and more than 2048 `[`/`{` levels (sd-json
+  `DEPTH_MAX`) is a `ProtocolError` on decode in both modes and a `TypeError` on encode (peers refuse it).
+  bigints are written from the holder (read via its own data property, so a getter runs once), so a
+  `BigInt.prototype.toJSON` polyfill is ignored. That defence covers data properties only: for an accessor the
+  replacer sees only the getter's result after the polyfill's `toJSON`, and does not re-invoke the getter.
+  Validator outputs are always data properties, so only by-reference `object`/`any` content with bigint
+  getters is affected. A float `-0` stays `-0` where `JSON.rawJSON` exists (else it is written as `0`). Encode
+  escapes U+007F as `\u007f` (sd-json refuses it raw). An integer-valued unsafe `number` in untyped content
+  comes back from a lossless peer as a `bigint` (§4.3). The codec, like `JSON.stringify`, is O(length) on a
+  sparse array; validator encode refuses arrays longer than `MAX_ENCODE_ARRAY_LENGTH` (8 Mi: each element
+  needs at least 2 bytes, so a longer one cannot fit in a 16 MiB message) with `type` ("array too long to
+  send") before copying them. Decode is bounded by the message size.
 - **sd-json string rules**: systemd refuses strings containing NUL (`\u0000`); v1 allows them (valid JSON and
-  Unicode; UAPI has no rule). `string` slots reject strings that are not well-formed UTF-16 (a lone surrogate has
-  no UTF-8 encoding, and UAPI messages are UTF-8) in both directions (`type`), and so do map keys (`type`, the
-  path ends with the key); `object`/`any` content is not checked for lone surrogates (sd-json refuses them).
-- **Validators**: `compileInterface(ast, {ints, lenientInts, codec})` (runs `validateInterface` first; `"bigint"`
-  needs `codec.losslessInts`) gives per method `input`/`output`, per error and per `type` a `Validator` with
-  `decode(v, {unknownFields})` (from the peer: servers `reject` unknown struct fields, clients `drop` them in
-  replies) and `encode(v)` (what we send: unknown fields are always our bug, rejected). Both return a new value
-  and never mutate; the first problem (IDL field order, then unknown keys; array/key order) throws
-  `ValidationError {path, parameter, reason}`, reason `missing | null | type | enum | unknown-field | int-range |
-  too-deep`. `parameter` joins the path with `.` (indices in decimal, map keys raw, so a key containing `.` is
-  ambiguous); it is the `InvalidParameter` parameter. Since path segments can come from the peer, `parameter`
-  (and the message) pass string segments through `toWellFormed()` and are cut to 256 UTF-16 code units (on a
-  code point boundary, then `…`), so they can always be sent back; `path` keeps the raw segments. Messages name
-  types, never values.
-- **Per type**: `int` takes a safe-integer `number` (so `1.0`/`1e3` from JSON are 1/1000, as in sd-json; `-0` →
-  0) or a `bigint` in −2⁶³…2⁶⁴−1. A non-integer is `type`; an unsafe `number` (e.g. `1e18`, or a rounded value
-  without `context.source`) is `int-range` in **both** modes, as is an out-of-range bigint (`IntegerRangeError`).
-  Decode outputs `number` (`"number"`; an unsafe bigint is `int-range`) or `bigint` (`"bigint"`). Encode outputs a
-  `number` as is (`-0` → 0); a bigint stays a bigint in `"bigint"` mode, while in `"number"` mode a safe one
-  becomes a `number` and an unsafe one is passed through (written exactly with `JSON.rawJSON`; the codec throws
-  without it). `lenientInts` lets decode accept `/^-?(0|[1-9][0-9]*)$/` strings. `float`: finite number, or a
-  bigint whose `Number()` is finite (→ number on decode, as given on encode). `object`: a plain object (prototype
-  `Object.prototype` or `null`), returned by reference; objects from another realm (`vm`, iframes) are not plain
-  objects and are rejected (`type`). `any`: anything but `null`/`undefined`/a non-finite number on decode (a
-  top-level `Infinity` from `1e400` or a too long literal could not be sent back; nested content is not
-  inspected); on encode a boolean, finite number, bigint, string, array or plain object. Structs are plain objects; a field is present iff it is an own
-  enumerable key (inherited `toString` etc. are never read). **Absent ≡ null ≡ undefined for `?T` fields, and the
-  output omits them**; in arrays and maps a `?T` null stays `null` (array holes encode as `null`; `undefined` map
-  values are skipped on encode, like `JSON.stringify`). `?[]T`/`?[string]T`: `[]`/`{}` are values, not null. Map
-  outputs are built with own data properties (`"__proto__"` is a plain key). Named types compile lazily, so
-  recursive types work; more than `MAX_VALUE_DEPTH` (1024) struct/array/map levels is `too-deep` (also stops
-  cyclic values on encode). A non-finite number in an `int` slot is `int-range` (NaN: `type`); `JSON.rawJSON`
-  objects are not plain objects; an `undefined` map value on decode is `null`, as in arrays.
-- Validators let exceptions from user getters/Proxies propagate as-is (only locally built values can have them).
+  Unicode; UAPI has no rule). `string` slots reject strings that are not well-formed UTF-16 (a lone surrogate
+  has no UTF-8 encoding, and UAPI messages are UTF-8) in both directions (`type`), as do map keys (`type`, the
+  path ends with the key) and `any` slots holding a string at the top level; nested `object`/`any` content is
+  not checked for lone surrogates (sd-json refuses them).
+- **Validators**: `compileInterface(ast, {ints, lenientInts, codec})` (runs `validateInterface` first;
+  `"bigint"` needs `codec.losslessInts`) gives per method `input`/`output`, per error and per `type` a
+  `Validator` with `decode(v, {unknownFields})` (from the peer: servers `reject` unknown struct fields,
+  clients `drop` them in replies) and `encode(v)` (what we send: unknown fields are always our bug, rejected).
+  Both return a new value and never mutate; the first problem (IDL field order, then unknown keys; array/key
+  order) throws `ValidationError {path, parameter, reason}`, reason `missing | null | type | enum |
+  unknown-field | int-range | too-deep`. `parameter` joins the path with `.` (indices in decimal, map keys
+  raw, so a key containing `.` is ambiguous); it is the `InvalidParameter` parameter. Since path segments can
+  come from the peer, `parameter` (and the message) pass string segments through `toWellFormed()` and are cut
+  to 256 UTF-16 code units (on a code point boundary, then `…`), so they can always be sent back; `path` keeps
+  the raw segments. The message quotes `parameter` JSON-style with C0/DEL/C1 controls and U+2028/U+2029 as
+  `\uXXXX`, so a peer-chosen key cannot inject escapes or line breaks into logs. Messages name types, never
+  values.
+- **Per type**: `int` takes a safe-integer `number` (so `1.0`/`1e3` from JSON are 1/1000, as in sd-json; `-0`
+  → 0) or a `bigint` in −2⁶³…2⁶⁴−1. A non-integer is `type`; an unsafe `number` (e.g. `1e18`, or a rounded
+  value without `context.source`) is `int-range` in **both** modes, as is an out-of-range bigint
+  (`IntegerRangeError`). Decode outputs `number` (`"number"`; an unsafe bigint is `int-range`) or `bigint`
+  (`"bigint"`). Encode outputs a `number` as is (`-0` → 0); a bigint stays a bigint in `"bigint"` mode, while
+  in `"number"` mode a safe one becomes a `number` and an unsafe one is passed through (written exactly with
+  `JSON.rawJSON`; the codec throws without it). `lenientInts` lets decode accept `/^-?(0|[1-9][0-9]*)$/`
+  strings. `float`: finite number, or a bigint whose `Number()` is finite (→ number on decode; on encode →
+  number if exact, `BigInt(Number(v)) === v`, so it is sendable without `JSON.rawJSON`, else as given, exact
+  on the wire). `object`: a plain object (prototype `Object.prototype` or `null`), returned by reference;
+  objects from another realm (`vm`, iframes) are not plain objects and are rejected (`type`). `any`, in both
+  directions: a boolean, finite number, bigint, well-formed string, array or plain object (not
+  `JSON.rawJSON`); anything else is `type`/`null`, including functions, symbols, `Date`, `Map` and a top-level
+  `Infinity` (from `1e400` or a too long literal; it could not be sent back). Only the top level is checked.
+  Structs are plain objects; a field is present iff it is an own enumerable key (inherited `toString` etc. are
+  never read). **Absent ≡ null ≡ undefined for `?T` fields, and the output omits them**; in arrays and maps a
+  `?T` null stays `null` (array holes encode as `null`; `undefined` map values are skipped on encode, like
+  `JSON.stringify`). `?[]T`/`?[string]T`: `[]`/`{}` are values, not null. Map outputs are built with own data
+  properties (`"__proto__"` is a plain key). Named types compile lazily, so recursive types work; more than
+  `MAX_VALUE_DEPTH` (1024) struct/array/map levels is `too-deep` (also stops cyclic values on encode). A
+  non-finite number in an `int` slot is `int-range` (NaN: `type`); `JSON.rawJSON` objects are not plain
+  objects; an `undefined` map value on decode is `null`, as in arrays.
+- Validators let exceptions from user getters/Proxies propagate as-is (only locally built values can have
+  them).
 - `object`/`any` content on encode is whatever `JSON.stringify` makes of it (`Date` → string, `Map` → `{}`,
   `undefined` dropped).
-- Recognise `int-range` across duplicated module copies by `ValidationError.reason`, not `instanceof`/`localName`
-  (`localName` is `org.varlink.service.InvalidParameter` for every `ValidationError`).
+- Recognise `int-range` across duplicated module copies by `ValidationError.reason`, not
+  `instanceof`/`localName` (`localName` is `org.varlink.service.InvalidParameter` for every
+  `ValidationError`).
 - **Descriptors** (codegen output, §5.7): `MethodDescriptor<In, Out>` (phantom `"~types"`, `MethodInput`/
   `MethodOutput`), `InterfaceDescriptor {name, idl, ints, methods, errors}`, `JsonValue`. `compileDescriptor`
-  checks the descriptor against its IDL both ways (names, `more`/`upgrade`/`experimental`, error names; every IDL
-  method and error present); `JsonValue` admits readonly arrays; `assertIntsMode` checks `ints` at bind time.
+  checks the descriptor against its IDL both ways (names, `more`/`upgrade`/`experimental`, error names; every
+  IDL method and error present); `JsonValue` admits readonly arrays; `assertIntsMode` checks `ints` at bind
+  time.
 - **Errors**: `VarlinkError`/`isVarlinkError` (brand, §6), the seven `org.varlink.service` classes (IDL text:
   `ORG_VARLINK_SERVICE_IDL`, verbatim UAPI) and `InternalError` (Q2: `INTERNAL_ERROR_INTERFACE` and its IDL
-  `INTERNAL_ERROR_INTERFACE_IDL`), each with `errorName` and `is()`.
-  `ErrorRegistry.register` checks `errorName` is `interface.Name`, ignores re-registering the same class and throws
-  `TypeError` for a different class under a taken name (also within one call); it is atomic (on a throw nothing
-  is registered). `create(name, params)` builds the registered class or a
-  plain `VarlinkError`, without validating params. `createErrorRegistry()` is pre-filled with the 8 classes
-  above. `X.is(e)` and `create` match by name only and don't validate parameters, so M4 MUST validate error
-  parameters with the compiled error validators (including `org.varlink.service` errors, using a compiled
-  `org.varlink.service` IDL) before `create`, and fall back to a plain `VarlinkError` when they don't validate.
-  Outgoing errors (a handler throws a `VarlinkError`): M4 MUST check that its `error` is a valid `interface.Name`
-  and, when that interface is known to the server, encode its `parameters` with the compiled error validator; on
-  either failure it sends `InternalError` instead and reports the original error to `onError`.
-- **Local errors** (`VarlinkLocalError`, own brand, `isVarlinkLocalError`, `localName`): `ConnectionClosedError`
-  (`io.systemd.Disconnected`), `CallTimeoutError` (`io.systemd.TimedOut`), `ProtocolError` and
-  `MessageTooLargeError` (`io.systemd.Protocol`), `UpgradePendingError` (`varlink-js.UpgradePending`),
-  `OperationNotSupportedError` (`varlink-js.OperationNotSupported`), `ValidationError` and `IntegerRangeError`
-  (`org.varlink.service.InvalidParameter`).
+  `INTERNAL_ERROR_INTERFACE_IDL`), each with `errorName` and `is()`. The class `InternalError` shadows
+  SpiderMonkey's non-standard global of the same name in modules that import it; `e.name` is `"InternalError"`
+  for both, so recognise ours with `InternalError.is(e)` or `isVarlinkError`. `ErrorRegistry.register` checks
+  `errorName` is `interface.Name`, ignores re-registering the same class and throws `TypeError` for a
+  different class under a taken name (also within one call); it is atomic (on a throw nothing is registered).
+  `create(name, params)` builds the registered class or a plain `VarlinkError`, without validating params.
+  `createErrorRegistry()` is pre-filled with the 8 classes above. `X.is(e)` and `create` match by name only
+  and don't validate parameters, so M4 MUST validate error parameters with the compiled error validators
+  (including `org.varlink.service` errors, using a compiled `org.varlink.service` IDL) before `create`, and
+  fall back to a plain `VarlinkError` when they don't validate. Outgoing errors (a handler throws a
+  `VarlinkError`): M4 MUST check that its `error` is a valid `interface.Name` and, when that interface is
+  known to the server, encode its `parameters` with the compiled error validator; on either failure it sends
+  `InternalError` instead and reports the original error to `onError`.
+- **Local errors** (`VarlinkLocalError`, own brand, `isVarlinkLocalError`, `localName`):
+  `ConnectionClosedError` (`io.systemd.Disconnected`), `CallTimeoutError` (`io.systemd.TimedOut`),
+  `ProtocolError` and `MessageTooLargeError` (`io.systemd.Protocol`), `UpgradePendingError`
+  (`varlink-js.UpgradePending`), `OperationNotSupportedError` (`varlink-js.OperationNotSupported`),
+  `ValidationError` and `IntegerRangeError` (`org.varlink.service.InvalidParameter`).
 
 ---
 
@@ -753,19 +777,21 @@ connection and reports it to `onError`.
 One `.ts` file per interface:
 
 - `type` structs and error parameters → `type` aliases, not `interface` (TS interfaces are not assignable to
-  index signatures such as `JsonValue` or `VarlinkError<P extends Record<string, unknown>>`); fields `?T` → `field?: T | null`; enums → string literal unions plus
+  index signatures such as `JsonValue` or `VarlinkError<P extends Record<string, unknown>>`); fields `?T` →
+  `field?: T | null`; enums → string literal unions plus
   `const …Values = [...] as const`; `[]T` → `T[]`; `[string]T` → `Record<string, T>`; `[string]()` →
   `Record<string, Record<string, never>>` (string set); `object` → `Record<string, unknown>`;
-  `any` → `JsonValue` (non-null; includes `bigint`, §4.3); `int` → `number` or `bigint` per `--ints number|bigint`
-  (must match the runtime `ints` option; the generated descriptor records it and the client/server checks the match at bind time);
+  `any` → `JsonValue` (non-null; includes `bigint`, §4.3); `int` → `number` or `bigint` per
+  `--ints number|bigint` (must match the runtime `ints` option; the generated descriptor records it and the
+  client/server checks the match at bind time);
   anonymous inline structs/enums → inline types, named `Method_Input_field` only when needed for
   readability.
 - Doc comments → TSDoc on the generated declarations.
-- Errors → classes extending `VarlinkError` with typed `parameters` and a static `is()` guard, registered
-  so clients map error replies to them. Exception: for `org.varlink.service` and `INTERNAL_ERROR_INTERFACE`,
+- Errors → classes extending `VarlinkError` with typed `parameters` and a static `is()` guard, registered so
+  clients map error replies to them. Exception: for `org.varlink.service` and `INTERNAL_ERROR_INTERFACE`,
   codegen MUST NOT generate new classes; the generated descriptor's `errors` re-export the core classes
-  (`InterfaceNotFoundError`, `MethodNotFoundError`, …, `InternalError`), so `createErrorRegistry()` plus a bound
-  generated descriptor never conflict and `instanceof` keeps working.
+  (`InterfaceNotFoundError`, `MethodNotFoundError`, …, `InternalError`), so `createErrorRegistry()` plus a
+  bound generated descriptor never conflict and `instanceof` keeps working.
 - Methods → `MethodDescriptor`s (§4.9): `{ interface, name, method, more?, upgrade?, experimental? }` plus the
   phantom `"~types"` carrying the input/output types (`more`/`upgrade`/`experimental` come from the systemd
   annotations). Validators are not in the descriptor: they come from compiling the descriptor's `idl`

@@ -26,6 +26,25 @@ import { formatInterface, parseInterface, validateInterface } from "../../../src
 
 const SRC = join(import.meta.dirname, "../../../src");
 
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- the usual exact-equality trick
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+type Expect<T extends true> = T;
+
+/** Field names of an error's `parameters`; `never` for exactly `Record<string, never>` (no parameters). */
+type Fields<E extends VarlinkError> =
+  Equal<E["parameters"], Record<string, never>> extends true ? never : keyof E["parameters"];
+
+/** Exact field sets of the standard classes: a missing or extra field fails typecheck. */
+type FieldChecks = [
+  Expect<Equal<Fields<InterfaceNotFoundError>, "interface">>,
+  Expect<Equal<Fields<MethodNotFoundError>, "method">>,
+  Expect<Equal<Fields<MethodNotImplementedError>, "method">>,
+  Expect<Equal<Fields<InvalidParameterError>, "parameter">>,
+  Expect<Equal<Fields<PermissionDeniedError>, never>>,
+  Expect<Equal<Fields<ExpectedMoreError>, never>>,
+  Expect<Equal<Fields<ExpectedUpgradeError>, never>>,
+];
+
 /** The seven org.varlink.service error classes. */
 const STANDARD_CLASSES: readonly ErrorClass[] = [
   InterfaceNotFoundError,
@@ -207,19 +226,18 @@ describe("org.varlink.service interface", () => {
     assert.equal(iface.name, ORG_VARLINK_SERVICE);
     assert.deepEqual(validateInterface(iface), []);
 
-    // Field names typechecked against each class's `parameters` type (`[]` for the parameterless ones).
-    type Fields<E extends VarlinkError> = string extends keyof E["parameters"]
-      ? []
-      : (keyof E["parameters"] & string)[];
+    // Each class's `parameters` field names, checked exactly at the type level (see FieldChecks).
     const expected = new Map<ErrorClass, string[]>([
-      [InterfaceNotFoundError, ["interface"] satisfies Fields<InterfaceNotFoundError>],
-      [MethodNotFoundError, ["method"] satisfies Fields<MethodNotFoundError>],
-      [MethodNotImplementedError, ["method"] satisfies Fields<MethodNotImplementedError>],
-      [InvalidParameterError, ["parameter"] satisfies Fields<InvalidParameterError>],
-      [PermissionDeniedError, [] satisfies Fields<PermissionDeniedError>],
-      [ExpectedMoreError, [] satisfies Fields<ExpectedMoreError>],
-      [ExpectedUpgradeError, [] satisfies Fields<ExpectedUpgradeError>],
+      [InterfaceNotFoundError, ["interface"]],
+      [MethodNotFoundError, ["method"]],
+      [MethodNotImplementedError, ["method"]],
+      [InvalidParameterError, ["parameter"]],
+      [PermissionDeniedError, []],
+      [ExpectedMoreError, []],
+      [ExpectedUpgradeError, []],
     ]);
+    const checks: FieldChecks = [true, true, true, true, true, true, true];
+    assert.equal(checks.length, expected.size);
     const classes = new Map<string, ErrorClass>(STANDARD_CLASSES.map((cls) => [cls.errorName, cls]));
     const errors = iface.members.filter((m) => m.kind === "error");
     assert.equal(errors.length, classes.size);

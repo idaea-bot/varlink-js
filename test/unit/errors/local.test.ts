@@ -89,6 +89,22 @@ describe("ValidationError", () => {
     assert.equal(new ValidationError([], "type", "d").parameter, "");
   });
 
+  test("the message escapes control characters in the parameter; `parameter` stays raw", () => {
+    const key = "\x1b[2J\nFAKE";
+    const e = new ValidationError(["m", key], "unknown-field", "unknown field");
+    assert.equal(e.parameter, `m.${key}`);
+    assert.equal(e.message, 'invalid parameter "m.\\u001b[2J\\u000aFAKE": unknown field');
+    // `"`, `\`, DEL, C1 and U+2028/U+2029 are escaped; NBSP and other printable characters are kept.
+    const [ls = "", ps = "", nbsp = ""] = [0x2028, 0x2029, 0xa0].map((c) => String.fromCharCode(c));
+    const all = new ValidationError([`"\\\x7f\x80\x9f${ls}${ps}${nbsp}é`], "type", "d");
+    assert.equal(all.parameter.length, 9);
+    assert.equal(all.message, `invalid parameter "\\"\\\\\\u007f\\u0080\\u009f\\u2028\\u2029${nbsp}é": d`);
+    for (const c of e.message + all.message) {
+      const code = c.charCodeAt(0);
+      assert.ok(code >= 0x20 && !(code >= 0x7f && code <= 0x9f) && code !== 0x2028 && code !== 0x2029, c);
+    }
+  });
+
   test("map keys are kept raw (a dot in a key is ambiguous)", () => {
     assert.equal(new ValidationError(["m", "a.b", 0], "null", "d").parameter, "m.a.b.0");
   });

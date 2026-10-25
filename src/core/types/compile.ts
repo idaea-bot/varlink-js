@@ -62,6 +62,11 @@ export interface CompiledInterface {
 
 /** Deepest struct/array/map nesting a validator accepts. */
 export const MAX_VALUE_DEPTH: number = 1024;
+/**
+ * Longest array encode accepts: each element needs at least 2 bytes (a digit and a comma), so a longer array
+ * cannot fit in a 16 MiB message.
+ */
+export const MAX_ENCODE_ARRAY_LENGTH: number = 8 * 1024 * 1024;
 
 const INTS_MODES = new Set<unknown>(["number", "bigint"]);
 const INT_MIN = -(2n ** 63n);
@@ -176,25 +181,24 @@ class Compiler {
           if (typeof v === "number" && Number.isFinite(v)) return v;
           if (typeof v === "bigint") {
             const n = Number(v);
-            if (Number.isFinite(n)) return ctx.dir === "encode" ? v : n;
+            // On encode, an exactly convertible bigint is sent as a number (works without JSON.rawJSON); an
+            // inexact one is sent as given, exact on the wire.
+            if (Number.isFinite(n)) return ctx.dir === "encode" && BigInt(n) !== v ? v : n;
           }
           return wrongType(ctx, type, v);
         };
       case "object":
         return (v, ctx) => (isPlainObject(v) ? v : wrongType(ctx, type, v));
       case "any":
+        // Same whitelist in both directions. A top-level Infinity (1e400, or an integer literal too long for the
+        // codec) could not be sent back. Only the top level is checked; nested content is not inspected.
         return (v, ctx) => {
-          if (v === undefined) return wrongType(ctx, type, v);
-          if (ctx.dir !== "encode") {
-            // A top-level Infinity (1e400, or an integer literal too long for the codec) could not be sent back.
-            // Nested content is not inspected.
-            if (v === null || isRawJSON(v) || (typeof v === "number" && !Number.isFinite(v)))
-              return wrongType(ctx, type, v);
+          if (typeof v === "string") {
+            if (!v.isWellFormed()) fail(ctx, "type", "string is not valid Unicode (lone surrogate)");
             return v;
           }
           if (
             typeof v === "boolean" ||
-            typeof v === "string" ||
             typeof v === "bigint" ||
             (typeof v === "number" && Number.isFinite(v)) ||
             Array.isArray(v) ||
@@ -224,8 +228,10 @@ class Compiler {
         return (v, ctx, depth) => {
           if (!Array.isArray(v)) return wrongType(ctx, type, v);
           enter(ctx, depth);
-          const out: unknown[] = [];
           const length = v.length;
+          // Checked before building the copy (a sparse array may be huge); decode is bounded by the message.
+          if (length > MAX_ENCODE_ARRAY_LENGTH && ctx.dir === "encode") fail(ctx, "type", "array too long to send");
+          const out: unknown[] = [];
           for (let i = 0; i < length; i++) {
             ctx.path.push(i);
             const item: unknown = v[i];

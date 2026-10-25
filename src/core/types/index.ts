@@ -3,6 +3,7 @@ export { createJsonCodec, jsonCodec, type Codec, type JsonCodecOptions } from ".
 export {
   compileInterface,
   compileInterfaceText,
+  MAX_ENCODE_ARRAY_LENGTH,
   MAX_VALUE_DEPTH,
   type CompiledInterface,
   type CompiledMethod,

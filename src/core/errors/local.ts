@@ -98,6 +98,21 @@ function truncate(s: string): string {
   return `${s.slice(0, end)}…`;
 }
 
+/** C0 controls, DEL, C1 controls, and the line/paragraph separators U+2028/U+2029. */
+const isUnsafeInMessage = (c: number): boolean => c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029;
+
+/** `s` in double quotes, JSON-style, with `"`, `\` and every unsafe character escaped (safe to log). */
+function quote(s: string): string {
+  let out = '"';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x22 || c === 0x5c) out += `\\${s[i] ?? ""}`;
+    else if (isUnsafeInMessage(c)) out += `\\u${c.toString(16).padStart(4, "0")}`;
+    else out += s[i] ?? "";
+  }
+  return `${out}"`;
+}
+
 /**
  * A value does not match its IDL type. On a server this becomes `org.varlink.service.InvalidParameter` with
  * {@link parameter}; on a client the call is rejected with it. Reason `int-range` always uses the
@@ -109,14 +124,15 @@ export class ValidationError extends VarlinkLocalError {
   /**
    * {@link path} joined with "." ("" for the value itself). Ambiguous if a map key contains ".". Lone surrogates
    * are replaced with U+FFFD and the result is cut to {@link MAX_PARAMETER_LENGTH} code units plus "…", so a
-   * peer-controlled path can always be sent back in `InvalidParameter`.
+   * peer-controlled path can always be sent back in `InvalidParameter`. The message quotes it JSON-style, with
+   * control characters (C0, DEL, C1) and U+2028/U+2029 as `\uXXXX` escapes, so it is safe to log.
    */
   readonly parameter: string;
   readonly reason: ValidationReason;
 
   constructor(path: readonly (string | number)[], reason: ValidationReason, detail: string, options?: ErrorOptions) {
     const parameter = truncate(path.map((s) => (typeof s === "string" ? s.toWellFormed() : String(s))).join("."));
-    super("org.varlink.service.InvalidParameter", `invalid parameter "${parameter}": ${detail}`, options);
+    super("org.varlink.service.InvalidParameter", `invalid parameter ${quote(parameter)}: ${detail}`, options);
     this.path = Object.freeze([...path]);
     this.parameter = parameter;
     this.reason = reason;

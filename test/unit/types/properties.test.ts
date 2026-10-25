@@ -123,7 +123,22 @@ function put(obj: Record<string, unknown>, key: string, value: unknown): void {
   Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true });
 }
 
-const jsonLeaf = fc.oneof(fc.boolean(), fc.integer(), fc.string(), fc.bigInt({ min: 2n ** 60n, max: 2n ** 64n }));
+/** Integer-valued doubles beyond ±(2^53-1) that JSON.stringify writes as plain digits (below 1e21). */
+const unsafeIntegerDouble = fc.oneof(
+  fc.constantFrom(2 ** 53, 2 ** 60, -(2 ** 60), 1e20, -1e20),
+  fc
+    .double({ min: -1e21, max: 1e21, noNaN: true })
+    .filter((n) => Number.isInteger(n) && !Number.isSafeInteger(n) && Math.abs(n) < 1e21),
+);
+const jsonLeaf = fc.oneof(
+  fc.boolean(),
+  fc.integer(),
+  fc.string(),
+  fc.bigInt({ min: 2n ** 60n, max: 2n ** 64n }),
+  unsafeIntegerDouble,
+  fc.double({ noNaN: true, noDefaultInfinity: true }),
+  fc.constant(-0),
+);
 const anyValue = fc.oneof(
   jsonLeaf,
   fc.array(fc.oneof(jsonLeaf, fc.constant(null)), { maxLength: 3 }),
@@ -238,14 +253,59 @@ const numberCaseArb: fc.Arbitrary<Case> = interfaceArb.chain((iface) =>
   new Gen(iface, "number").value(methodInput(iface), 4).map((sample): Case => ({ iface, ints: "number", sample })),
 );
 
-/** `value` with every bigint replaced by `Number(bigint)`: what a codec without `context.source` decodes. */
-function bigintsToNumbers(value: unknown): unknown {
-  if (typeof value === "bigint") return Number(value);
-  if (Array.isArray(value)) return value.map(bigintsToNumbers);
+const HAS_RAW_JSON = typeof (JSON as { rawJSON?: unknown }).rawJSON === "function";
+
+/**
+ * Untyped JSON content (object/any) as a codec decodes it after jsonCodec-style encoding (DESIGN.md §4.3):
+ * - with `context.source`: an integer-valued unsafe number below 1e21 is written as plain digits and comes back
+ *   as the bigint of that literal (`BigInt(String(n))`, e.g. 2^60 → 1152921504606847000n);
+ * - without: every bigint comes back as `Number(bigint)`;
+ * - -0 survives only where JSON.rawJSON exists (JSON.stringify writes 0).
+ */
+function untypedRoundTrip(value: unknown, source: boolean): unknown {
+  if (typeof value === "bigint") return source ? value : Number(value);
+  if (typeof value === "number") {
+    if (Object.is(value, -0)) return HAS_RAW_JSON ? -0 : 0;
+    if (source && Number.isInteger(value) && !Number.isSafeInteger(value) && Math.abs(value) < 1e21)
+      return BigInt(String(value));
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((x) => untypedRoundTrip(x, source));
   if (typeof value !== "object" || value === null) return value;
   const copy: Record<string, unknown> = {};
-  for (const [k, x] of Object.entries(value)) put(copy, k, bigintsToNumbers(x));
+  for (const [k, x] of Object.entries(value)) put(copy, k, untypedRoundTrip(x, source));
   return copy;
+}
+
+/**
+ * The normalized value `expected` (of type `type`) after encode → codec → decode: typed slots come back as they
+ * were (int rejects unsafe numbers, float converts bigints back), untyped content per {@link untypedRoundTrip}.
+ */
+function roundTripped(gen: Gen, type: Type, expected: unknown, source: boolean): unknown {
+  const t = gen.resolve(type);
+  if (expected === null || expected === undefined) return expected;
+  switch (t.kind) {
+    case "object":
+    case "any":
+      return untypedRoundTrip(expected, source);
+    case "nullable":
+      return roundTripped(gen, t.element, expected, source);
+    case "array":
+      return (expected as unknown[]).map((x) => roundTripped(gen, t.element, x, source));
+    case "map":
+    case "struct": {
+      const fields = t.kind === "struct" ? new Map(t.fields.map((f) => [f.name, f.type])) : undefined;
+      const copy: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(expected)) {
+        const element = t.kind === "map" ? t.element : fields?.get(k);
+        assert.ok(element);
+        put(copy, k, roundTripped(gen, element, x, source));
+      }
+      return copy;
+    }
+    default:
+      return expected;
+  }
 }
 
 function inputValidator(c: Case): Validator {
@@ -418,6 +478,24 @@ describe("validator properties", () => {
     );
     assert.ok(text.includes('"kids":[{'), "recursive values");
     assert.ok(text.includes("big:"), "bigints");
+    const numbers: number[] = [];
+    const collect = (x: unknown): void => {
+      if (typeof x === "number") numbers.push(x);
+      else if (typeof x === "object" && x !== null) for (const y of Object.values(x)) collect(y);
+    };
+    for (const c of cases) collect(c.sample.input);
+    assert.ok(
+      numbers.some((n) => Number.isInteger(n) && !Number.isSafeInteger(n)),
+      "unsafe integer-valued doubles",
+    );
+    assert.ok(
+      numbers.some((n) => !Number.isInteger(n)),
+      "floats",
+    );
+    assert.ok(
+      numbers.some((n) => Object.is(n, -0)),
+      "-0 in untyped content",
+    );
     const rich = cases.filter(
       (c) => mutations(new Gen(c.iface, c.ints), methodInput(c.iface), c.sample.input, []).length > 10,
     );
@@ -441,7 +519,9 @@ describe("validator properties", () => {
       fc.property(caseArb, (c) => {
         const v = inputValidator(c);
         const text = jsonCodec.encode(v.encode(c.sample.input));
-        assert.deepEqual(v.decode(jsonCodec.decode(text)), c.sample.expected);
+        const gen = new Gen(c.iface, c.ints);
+        const expected = roundTripped(gen, methodInput(c.iface), c.sample.expected, jsonCodec.losslessInts);
+        assert.deepEqual(v.decode(jsonCodec.decode(text)), expected);
       }),
       params(RUNS),
     );
@@ -455,7 +535,8 @@ describe("validator properties", () => {
         const v = inputValidator(c);
         const text = plain.encode(v.encode(c.sample.input));
         // int fields hold safe integers; unsafe integers inside object/any come back as (rounded) numbers.
-        assert.deepEqual(v.decode(plain.decode(text)), bigintsToNumbers(c.sample.expected));
+        const expected = roundTripped(new Gen(c.iface, c.ints), methodInput(c.iface), c.sample.expected, false);
+        assert.deepEqual(v.decode(plain.decode(text)), expected);
       }),
       params(RUNS),
     );
