@@ -418,8 +418,8 @@ for (const transport of transports) {
         assert.ok(fx.reported[0]?.error instanceof MessageTooLargeError);
         // pair: 4 × the limit. Sockets add a fresh Buffer per read (garbage until the next GC) and kernel buffers,
         // so they get 16 × — still a quarter of the 64 MiB input, which is what 0.1.x buffered.
-        // Deno's RSS grows in 4 MiB steps here (seen 4.0-4.2 MiB over pair), so it gets twice the bound (M10).
-        const slack = process.versions.deno === undefined ? 1 : 2;
+        // Bun and Deno: RSS grew 4.0-4.3 MiB over pair on macOS and Linux, so they get twice the bound (M10).
+        const slack = process.versions.deno === undefined && process.versions.bun === undefined ? 1 : 2;
         const bound = (transport.name === "pair" ? 4 : 16) * slack * maxMessageSize;
         assert.ok(peak - rssBefore < bound, `RSS grew by ${String(peak - rssBefore)} bytes`);
         const conn = await ep2.connect();
