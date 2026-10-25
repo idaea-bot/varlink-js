@@ -58,6 +58,11 @@ test("every subpath points at dist/ output of an existing src/ module", () => {
   }
 });
 
+test("varlink-js/idl exports the IDL API (M1)", () => {
+  assert.equal(typeof idl.parseInterface, "function");
+  assert.equal(typeof idl.formatInterface, "function");
+});
+
 test("bin points at the compiled CLI entry", () => {
   assert.deepEqual(pkg.bin, { "varlink-js": "./dist/cli/main.js" });
   assert.ok(existsSync(resolve("src/cli/main.ts")));

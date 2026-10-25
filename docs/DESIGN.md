@@ -410,6 +410,36 @@ systemd before shipping M8.*
   `usocket` ("unix local sockets with descriptor passing"), `peercred`. Without the addon those
   capabilities are simply absent and fd-using calls fail with `OperationNotSupportedError` locally.
 
+### 4.8 IDL (M1)
+
+`src/core/idl/` (re-exported by `varlink-js/idl`): `parseInterface`, `validateInterface`, `formatInterface`,
+`formatType`, name predicates, `IdlSyntaxError` (`code`, `reason`, `position`). **AST**: an `Interface` holds
+`members` in source order (`type` = struct or enum, `method` = input/output structs plus `more`/`upgrade`,
+`error` = struct); types are `bool int float string object any`, `named`, `struct`, `enum`, `array` (`[]T`),
+`map` (`[string]T`) and `nullable` (`?T`). Interfaces, members, fields and enum values carry `doc?` (lines
+joined by `\n`) and `experimental`; parsed nodes carry optional `span`/`nameSpan` (UTF-16 offset, 1-based
+line/column) so ASTs can also be built by hand, and `validateInterface` checks those like untrusted input.
+- **Doc comments** (libvarlink): the block of full-line comments on the lines directly above an item whose
+  token is first on its line; `#` and one space are stripped. Blank lines detach; trailing comments and
+  comments elsewhere are not doc and are **dropped** (the formatter cannot keep them).
+- **systemd markers** (sd-varlink-idl.c, "part of the API"): doc lines `[Experimental]` (any item) and, on
+  methods, `[Supports|Requires 'more' flag]` / `[Supports|Requires 'upgrade' flag]` become flags and leave
+  `doc`; "requires" wins. Validation rejects doc lines that would read back as markers.
+- **Lenient** vs the UAPI grammar: zero-member interfaces (libvarlink and systemd accept them); whitespace,
+  line breaks and comments before `,` and `)` (the PEG has no `_` there); a final comment or member without
+  a trailing newline.
+- **Strict**: nothing between `?`/`[]`/`[string]` and their element (the PEG has no `_` there); every member
+  keyword must follow a line break; `?any` parses (it is grammatical); nesting is capped at 64 levels
+  (`too-deep`), so neither parser nor validator can overflow the stack.
+- **Formatter** = libvarlink `varlink format`, which is also the style of the UAPI examples: source order
+  (systemd regroups by kind), 2-space indent (systemd: tabs), `type Name (…)` / `error Name (…)` but
+  `method Name(…) -> (…)`, one blank line between members, comment lines `# text` or `#`. Before a method:
+  doc, more marker, upgrade marker, `[Experimental]` (systemd's order). A struct/enum goes multiline if it has
+  more than two fields (structs only), any commented item, a field typed directly as a struct or enum, or an
+  inline form over 40 characters; nested types are laid out one level deeper even inside a single-line
+  parent (libvarlink), and commented items get blank lines around them. Ten corpus files are already
+  canonical (list in `test/unit/idl/corpus.test.ts`).
+
 ---
 
 ## 5. Public API sketch
