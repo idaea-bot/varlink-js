@@ -41,7 +41,7 @@ const SET = { one: {}, two: {}, three: {} };
 /**
  * The MyType value of Test09 (and the parameter of Test10). The nullable fields `nullable` and
  * `nullable_array_struct` are omitted (python sends them as null; for a `?` field absent and null mean the same,
- * and our decoder drops nulls of optional fields, so the absent form is what both sides compare).
+ * so both sides drop null ones before comparing: {@link withoutNullOptionals}).
  */
 export const MYTYPE: Readonly<Params> = frozen({
   object: { method: "org.varlink.certification.Test09", parameters: { map: { foo: "Foo", bar: "Bar" } } },
@@ -94,25 +94,45 @@ export const CERTIFICATION_STEPS: readonly CertificationStep[] = frozen([
 ]);
 
 /**
- * Deep equality of JSON-like values: object key order is ignored (so maps and string sets compare
- * order-insensitively), array order is not, and an object field that is null counts as absent (nullable fields).
+ * Strict deep equality of JSON values: object key order is ignored (so maps and string sets compare
+ * order-insensitively), array order is not, only own keys count (an own `__proto__` key is a key like any other),
+ * and null is a value, not "absent". The nullable fields of MyType are normalized by {@link withoutNullOptionals}.
  */
 export function jsonEqual(a: unknown, b: unknown): boolean {
+  if (typeof a === "number" && typeof b === "number") return a === b; // -0 and 0 are the same JSON number
   if (a === b) return true;
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
   if (Array.isArray(a) || Array.isArray(b)) {
     if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    return a.every((v: unknown, i) => jsonEqual(v ?? null, (b[i] as unknown) ?? null));
+    for (let i = 0; i < a.length; i++) {
+      if (!Object.hasOwn(a, i) || !Object.hasOwn(b, i)) return false;
+      if (!jsonEqual(a[i] as unknown, b[i] as unknown)) return false;
+    }
+    return true;
   }
-  const ao = a as Params;
-  const bo = b as Params;
-  const keys = new Set([...Object.keys(ao), ...Object.keys(bo)]);
-  for (const key of keys) {
-    const av = ao[key] ?? null;
-    const bv = bo[key] ?? null;
-    if (!jsonEqual(av, bv)) return false;
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const key of ak) {
+    if (!Object.hasOwn(b, key)) return false;
+    if (!jsonEqual((a as Params)[key], (b as Params)[key])) return false;
   }
   return true;
+}
+
+/** MyType's `?` fields: absent and null mean the same (UAPI), so a null one is dropped before comparing. */
+const MYTYPE_OPTIONALS = ["nullable", "nullable_array_struct"] as const;
+
+/** A copy of a MyType value without its null optional fields; anything that is not a plain object as is. */
+export function withoutNullOptionals(mytype: unknown): unknown {
+  if (typeof mytype !== "object" || mytype === null || Array.isArray(mytype)) return mytype;
+  const optionals: readonly string[] = MYTYPE_OPTIONALS;
+  return Object.fromEntries(Object.entries(mytype).filter(([k, v]) => !(v === null && optionals.includes(k))));
+}
+
+/** Parameters or a reply with a `mytype` field normalized by {@link withoutNullOptionals}. */
+function normalized(value: Readonly<Params>): Readonly<Params> {
+  return Object.hasOwn(value, "mytype") ? { ...value, mytype: withoutNullOptionals(value["mytype"]) } : value;
 }
 
 /** Options for {@link createCertificationService}; the defaults are the reference servers'. */
@@ -229,7 +249,7 @@ export function createCertificationService(options: CertificationServiceOptions 
       fail({ method: `${CERTIFICATION_INTERFACE}.${expected.method}` });
     const wants = wanted(step, clientId);
     const shapeOk = !ctx.upgrade && ctx.more === (step.kind === "more") && ctx.oneway === (step.kind === "oneway");
-    if (!shapeOk || !jsonEqual(parameters, wants["parameters"])) fail(wants);
+    if (!shapeOk || !jsonEqual(normalized(parameters), wants["parameters"])) fail(wants);
     state.next = index + 1;
     if (state.next === CERTIFICATION_STEPS.length) clients.delete(clientId);
     return step;
@@ -307,8 +327,9 @@ export function describeError(error: unknown): string {
 
 function expectReply(method: string, got: Params, want: Readonly<Params>): void {
   // Unknown reply fields are ignored (python adds `client_id` to Test09's reply); only the declared ones count.
+  const gotN = normalized(got);
   for (const key of Object.keys(want))
-    if (!jsonEqual(got[key], want[key]))
+    if (!Object.hasOwn(gotN, key) || !jsonEqual(gotN[key], want[key]))
       throw new Error(`${method}: expected ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
 }
 

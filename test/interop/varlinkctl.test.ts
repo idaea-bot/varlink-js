@@ -12,7 +12,7 @@ import { VarlinkError } from "../../src/index.ts";
 import { connect, listen } from "../../src/node/index.ts";
 import { createServer, type Server } from "../../src/rpc/index.ts";
 import { createCertificationServer } from "../../examples/certification/certification.ts";
-import { gate, ROOT, tempDir } from "./helpers.ts";
+import { gate, REQUIRE_INTEROP, ROOT, tempDir } from "./helpers.ts";
 
 const ENABLED = process.env["VARLINK_VARLINKCTL"] === "1";
 const I = "org.example.interop";
@@ -76,6 +76,12 @@ function jsonLines(stdout: string): unknown[] {
     .filter((l) => l !== "")
     .map((l) => JSON.parse(l) as unknown);
 }
+
+test("varlinkctl suite enabled when required", (t) => {
+  // Under VARLINK_REQUIRE_INTEROP the suite must not be skipped silently for want of VARLINK_VARLINKCTL.
+  if (REQUIRE_INTEROP) assert.ok(ENABLED, "VARLINK_REQUIRE_INTEROP=1 needs VARLINK_VARLINKCTL=1 for this file");
+  else if (!ENABLED) t.skip("set VARLINK_VARLINKCTL=1 (Linux, systemd >= 255)");
+});
 
 describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linux, systemd >= 255)" }, () => {
   let missing: string | null = "not checked";
@@ -297,7 +303,10 @@ describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linu
         .code;
       const r = await varlinkctl(t, "introspect", path, "org.varlink.certification");
       if (accepted === 0) assert.equal(r.code, 0, "introspect works when systemd accepts the IDL");
-      else t.diagnostic("this systemd rejects the certification IDL ([string]()), so introspect fails as expected");
+      else {
+        assert.notEqual(r.code, 0, "introspect fails like validate-idl of the same text");
+        t.diagnostic("this systemd rejects the certification IDL ([string]()), so introspect fails as expected");
+      }
       const [started] = jsonLines(await ok(t, "--json=short", "call", path, "org.varlink.certification.Start", "{}"));
       assert.match(String((started as Record<string, unknown>)["client_id"]), /^[0-9a-f]{32}$/);
     } finally {

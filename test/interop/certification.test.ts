@@ -4,9 +4,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, describe, test } from "node:test";
-import { isVarlinkError, type Connection, type ServerErrorReason } from "../../src/index.ts";
-import type { Server } from "../../src/rpc/index.ts";
+import { isVarlinkError, type CallContext, type Connection, type ServerErrorReason } from "../../src/index.ts";
+import { createServer, type Server } from "../../src/rpc/index.ts";
 import {
+  createCertificationService,
+  jsonEqual,
+  readCertificationIdl,
+  withoutNullOptionals,
   CERTIFICATION_ERROR,
   CERTIFICATION_INTERFACE,
   CERTIFICATION_STEPS,
@@ -38,8 +42,16 @@ async function start(transport = pairTransport(), options: CertificationServiceO
     ...options,
     onError: (error, info) => reported.push({ error, reason: info.reason }),
   });
-  const endpoint = await transport.start(server);
-  const conn = await endpoint.connect({ validateReplies: "throw", timeout: 10_000 });
+  let endpoint: Endpoint | undefined;
+  let conn: Connection;
+  try {
+    endpoint = await transport.start(server);
+    conn = await endpoint.connect({ validateReplies: "throw", timeout: 10_000 });
+  } catch (e) {
+    await endpoint?.close();
+    await server.shutdown({ graceful: false });
+    throw e;
+  }
   return {
     server,
     service,
@@ -163,6 +175,22 @@ describe("certification server checks", () => {
       // A string set with a missing member.
       const id3 = await advance(f.conn, "Test09");
       await expectError(f.conn.call(m("Test09"), { client_id: id3, set: { one: {}, two: {} } }), CERTIFICATION_ERROR);
+      // An extra own `__proto__` member (JSON.parse makes it an own key; it is not Object.prototype).
+      const id4 = await advance(f.conn, "Test09");
+      const set = JSON.parse('{"one":{},"two":{},"three":{},"__proto__":{}}') as Record<string, unknown>;
+      await expectError(f.conn.call(m("Test09"), { client_id: id4, set }), CERTIFICATION_ERROR);
+      // MyType.object (untyped `object`) is compared strictly: an extra null key or own `__proto__` is wrong.
+      const base = CERTIFICATION_STEPS[9]?.parameters["mytype"] as Record<string, unknown>;
+      for (const object of [
+        { ...(base["object"] as object), extra: null },
+        JSON.parse(
+          '{"method":"org.varlink.certification.Test09","parameters":{"map":{"foo":"Foo","bar":"Bar"}},"__proto__":{}}',
+        ) as unknown,
+      ]) {
+        const id5 = await advance(f.conn, "Test10");
+        const it = f.conn.stream(m("Test10"), { client_id: id5, mytype: { ...base, object } });
+        await expectError(it.next(), CERTIFICATION_ERROR);
+      }
     } finally {
       await f.close();
     }
@@ -324,4 +352,72 @@ describe("certification CLIs", () => {
       },
     );
   });
+});
+
+describe("jsonEqual and withoutNullOptionals", () => {
+  test("strict JSON equality", () => {
+    assert.ok(jsonEqual({ a: 1, b: [1, { c: "x" }] }, { b: [1, { c: "x" }], a: 1 }), "key order ignored");
+    assert.ok(!jsonEqual([1, 2], [2, 1]), "array order counts");
+    assert.ok(!jsonEqual({ a: null }, {}), "null is not absent");
+    assert.ok(!jsonEqual({}, { a: null }));
+    assert.ok(!jsonEqual([], {}), "array vs object");
+    assert.ok(!jsonEqual({ length: 0 }, []));
+    assert.ok(!jsonEqual(JSON.parse('{"__proto__":{}}'), {}), "an own __proto__ key counts");
+    assert.ok(!jsonEqual({}, JSON.parse('{"__proto__":{}}')));
+    assert.ok(!jsonEqual({ toString: {} }, {}));
+    assert.ok(jsonEqual(0, -0), "-0 is the JSON number 0");
+    assert.ok(!jsonEqual(1, "1"));
+    assert.ok(!jsonEqual(new Array<unknown>(1), [undefined]), "holes are not values");
+  });
+
+  test("withoutNullOptionals drops only MyType's null ? fields", () => {
+    assert.deepEqual(withoutNullOptionals({ nullable: null, nullable_array_struct: null, enum: null }), {
+      enum: null,
+    });
+    assert.deepEqual(withoutNullOptionals({ nullable: "x" }), { nullable: "x" });
+    assert.equal(withoutNullOptionals(null), null);
+  });
+});
+
+describe("certification client against a broken server", () => {
+  // One wrong reply per case; runCertificationClient must notice it (the reference servers would not be needed).
+  const cases: { name: string; method: string; reply: Record<string, unknown> }[] = [
+    {
+      name: "a float that is only close to π",
+      method: "Test05",
+      reply: { bool: false, int: 2, float: 3.14159, string: "a lot of string" },
+    },
+    { name: "a map with an extra entry", method: "Test07", reply: { map: { foo: "Foo", bar: "Bar", baz: "Baz" } } },
+    {
+      name: "a string set with an extra member",
+      method: "Test08",
+      reply: { set: { one: {}, two: {}, three: {}, four: {} } },
+    },
+    { name: "End without all_ok", method: "End", reply: { all_ok: false } },
+  ];
+  for (const c of cases) {
+    test(c.name, async () => {
+      const service = createCertificationService();
+      const original = service.handlers[c.method];
+      assert.equal(typeof original, "function");
+      const server = createServer({ onError: () => undefined });
+      server.addInterface(await readCertificationIdl(), {
+        ...service.handlers,
+        // Run the real handler (state machine), then answer wrongly.
+        [c.method]: async (parameters: Record<string, unknown>, ctx: CallContext) => {
+          await (original as (p: Record<string, unknown>, x: CallContext) => unknown)(parameters, ctx);
+          return c.reply;
+        },
+      });
+      const endpoint = await pairTransport().start(server);
+      const conn = await endpoint.connect({ validateReplies: "throw", timeout: 10_000 });
+      try {
+        await assert.rejects(runCertificationClient(conn), new RegExp(`^Error: ${c.method}: expected`));
+      } finally {
+        await conn.close();
+        await endpoint.close();
+        await server.shutdown({ graceful: false });
+      }
+    });
+  }
 });

@@ -74,7 +74,7 @@ jobs:
         working-directory: rust-varlink
         run: |
           cargo --version
-          cargo build --release -p varlink-certification
+          cargo build --release --locked -p varlink-certification
       - run: npm ci
       - name: Certification (JS server/client + rust both ways, unix and tcp)
         env:
