@@ -98,19 +98,33 @@ function truncate(s: string): string {
   return `${s.slice(0, end)}…`;
 }
 
-/** C0 controls, DEL, C1 controls, and the line/paragraph separators U+2028/U+2029. */
-const isUnsafeInMessage = (c: number): boolean => c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029;
+/** Format characters (bidi overrides and isolates, zero-width, BOM, tags): they can reorder or hide log text. */
+const FORMAT_CHAR = /^\p{Cf}$/u;
+
+/** C0 controls, DEL, C1 controls, U+2028/U+2029, and format characters (`\p{Cf}`). */
+function isUnsafeInMessage(ch: string, c: number): boolean {
+  return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 || FORMAT_CHAR.test(ch);
+}
 
 /** `s` in double quotes, JSON-style, with `"`, `\` and every unsafe character escaped (safe to log). */
 function quote(s: string): string {
   let out = '"';
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c === 0x22 || c === 0x5c) out += `\\${s[i] ?? ""}`;
-    else if (isUnsafeInMessage(c)) out += `\\u${c.toString(16).padStart(4, "0")}`;
-    else out += s[i] ?? "";
+  for (const ch of s) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c === 0x22 || c === 0x5c) out += `\\${ch}`;
+    else if (isUnsafeInMessage(ch, c))
+      for (let i = 0; i < ch.length; i++) out += `\\u${ch.charCodeAt(i).toString(16).padStart(4, "0")}`;
+    else out += ch;
   }
   return `${out}"`;
+}
+
+/**
+ * A peer-controlled string made safe for an error message: lone surrogates replaced, cut to 256 code units, then
+ * quoted with control and format characters escaped. Internal: not re-exported by the package index.
+ */
+export function safeQuote(s: string): string {
+  return quote(truncate(s.toWellFormed()));
 }
 
 /**
@@ -125,7 +139,8 @@ export class ValidationError extends VarlinkLocalError {
    * {@link path} joined with "." ("" for the value itself). Ambiguous if a map key contains ".". Lone surrogates
    * are replaced with U+FFFD and the result is cut to {@link MAX_PARAMETER_LENGTH} code units plus "…", so a
    * peer-controlled path can always be sent back in `InvalidParameter`. The message quotes it JSON-style, with
-   * control characters (C0, DEL, C1) and U+2028/U+2029 as `\uXXXX` escapes, so it is safe to log.
+   * control characters (C0, DEL, C1), U+2028/U+2029 and format characters (`\p{Cf}`) as `\uXXXX`
+   * escapes, so it is safe to log.
    */
   readonly parameter: string;
   readonly reason: ValidationReason;

@@ -30,6 +30,18 @@ describe("VarlinkError", () => {
     assert.deepEqual(new VarlinkError("org.example.Failed").parameters, {});
   });
 
+  test("message is log-safe for an invalid error name from a peer; `error` stays raw", () => {
+    const bad = "\x1b[2J\nFAKE LOG LINE";
+    const e = new VarlinkError(bad, {});
+    assert.equal(e.error, bad);
+    assert.equal(e.message, '"\\u001b[2J\\u000aFAKE LOG LINE"');
+    const long = new VarlinkError("x".repeat(100_000));
+    assert.equal(long.message.length, 256 + 3); // quotes and "…"
+    assert.ok(long.message.endsWith('…"'));
+    assert.equal(new VarlinkError("org.example.Foo").message, "org.example.Foo");
+    assert.equal(new VarlinkError("noInterface").message, '"noInterface"');
+  });
+
   test("the brand is a non-enumerable own property with value true", () => {
     const e = new VarlinkError("org.example.Failed");
     assert.equal(VARLINK_ERROR_BRAND, Symbol.for("varlink-js.VarlinkError"));

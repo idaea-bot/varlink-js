@@ -105,6 +105,13 @@ describe("ValidationError", () => {
     }
   });
 
+  test("the message also escapes format characters (bidi overrides, zero-width, BOM, astral tags)", () => {
+    const key = "\u202eevil\u2066\u200b\ufeff\u{e0041}ok";
+    const e = new ValidationError([key], "unknown-field", "unknown field");
+    assert.equal(e.parameter, key);
+    assert.equal(e.message, 'invalid parameter "\\u202eevil\\u2066\\u200b\\ufeff\\udb40\\udc41ok": unknown field');
+  });
+
   test("map keys are kept raw (a dot in a key is ambiguous)", () => {
     assert.equal(new ValidationError(["m", "a.b", 0], "null", "d").parameter, "m.a.b.0");
   });

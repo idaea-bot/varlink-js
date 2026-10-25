@@ -1,6 +1,5 @@
 // Maps varlink error names to error classes, so a client can turn an error reply into the most specific
 // class (DESIGN.md §6).
-import { isInterfaceName, isMemberName } from "../idl/names.ts";
 import {
   ExpectedMoreError,
   ExpectedUpgradeError,
@@ -11,13 +10,7 @@ import {
   MethodNotImplementedError,
   PermissionDeniedError,
 } from "./standard.ts";
-import { VarlinkError, type ErrorClass } from "./varlink-error.ts";
-
-function isErrorName(name: unknown): name is string {
-  if (typeof name !== "string") return false;
-  const dot = name.lastIndexOf(".");
-  return dot > 0 && isInterfaceName(name.slice(0, dot)) && isMemberName(name.slice(dot + 1));
-}
+import { isErrorName, VarlinkError, type ErrorClass } from "./varlink-error.ts";
 
 /** A value for error messages; never throws (bigint, symbol). */
 function formatValue(value: unknown): string {

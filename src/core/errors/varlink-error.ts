@@ -1,5 +1,7 @@
 // VarlinkError: an error reply on the wire (DESIGN.md §6). Recognised by a brand rather than instanceof, so
 // it works across duplicated module copies.
+import { isInterfaceName, isMemberName } from "../idl/names.ts";
+import { safeQuote } from "./local.ts";
 
 /**
  * Instance brand of {@link VarlinkError}: set as a non-enumerable own property whose value is `true`, but read
@@ -7,14 +9,25 @@
  */
 export const VARLINK_ERROR_BRAND: unique symbol = Symbol.for("varlink-js.VarlinkError");
 
-/** A varlink error reply: a fully qualified error name plus its parameters. */
+/** Whether `name` is a fully qualified varlink error name: `interface.Name`. */
+export function isErrorName(name: unknown): name is string {
+  if (typeof name !== "string") return false;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 && isInterfaceName(name.slice(0, dot)) && isMemberName(name.slice(dot + 1));
+}
+
+/**
+ * A varlink error reply: a fully qualified error name plus its parameters. `message` is the name; when `error` is
+ * not a valid `interface.Name` (a peer can send anything) it is quoted with control/format characters escaped and
+ * cut to 256 code units, so logging the error is safe. `error` itself stays exactly as given.
+ */
 export class VarlinkError<P extends Record<string, unknown> = Record<string, unknown>> extends Error {
   /** Fully qualified varlink error name, e.g. "org.varlink.service.MethodNotFound". */
   readonly error: string;
   readonly parameters: P;
 
   constructor(error: string, parameters?: P, options?: ErrorOptions) {
-    super(error, options);
+    super(isErrorName(error) ? error : safeQuote(String(error)), options);
     this.name = new.target.name;
     this.error = error;
     this.parameters = parameters ?? ({} as P);

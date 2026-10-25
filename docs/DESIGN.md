@@ -318,7 +318,8 @@ client/server with `ints`:
   written as plain digits (`JSON.stringify` does so below 1e21; `2**60` → `1152921504606847000`), and a
   lossless peer, varlink-js included, decodes it as the `bigint` of those digits. Typed `int` slots are
   unaffected (they reject unsafe numbers), and typed `float` slots convert it back to `number`. Use `float`
-  fields for approximate large values.
+  fields for approximate large values. Conversely a safe `bigint` in untyped content is written as plain digits
+  and comes back as a `number`.
 - UAPI allows accepting decimal strings for `int`; v1 does so only with `lenientInts: true`.
 
 - `float` fields accept any finite JSON number; a `bigint` produced by the codec is converted to `number`
@@ -479,8 +480,9 @@ entry.
   escapes U+007F as `\u007f` (sd-json refuses it raw). An integer-valued unsafe `number` in untyped content
   comes back from a lossless peer as a `bigint` (§4.3). The codec, like `JSON.stringify`, is O(length) on a
   sparse array; validator encode refuses arrays longer than `MAX_ENCODE_ARRAY_LENGTH` (8 Mi: each element
-  needs at least 2 bytes, so a longer one cannot fit in a 16 MiB message) with `type` ("array too long to
-  send") before copying them. Decode is bounded by the message size.
+  needs at least 2 bytes, so such an array cannot fit in a default 16 MiB message) with `type` ("array too
+  long to send") before copying them. It is a fixed v1 limit: raising `maxMessageSize` does not lift it, so
+  such arrays can be received but not sent. Decode is bounded by the message size.
 - **sd-json string rules**: systemd refuses strings containing NUL (`\u0000`); v1 allows them (valid JSON and
   Unicode; UAPI has no rule). `string` slots reject strings that are not well-formed UTF-16 (a lone surrogate
   has no UTF-8 encoding, and UAPI messages are UTF-8) in both directions (`type`), as do map keys (`type`, the
@@ -537,7 +539,9 @@ entry.
   `ORG_VARLINK_SERVICE_IDL`, verbatim UAPI) and `InternalError` (Q2: `INTERNAL_ERROR_INTERFACE` and its IDL
   `INTERNAL_ERROR_INTERFACE_IDL`), each with `errorName` and `is()`. The class `InternalError` shadows
   SpiderMonkey's non-standard global of the same name in modules that import it; `e.name` is `"InternalError"`
-  for both, so recognise ours with `InternalError.is(e)` or `isVarlinkError`. `ErrorRegistry.register` checks
+  for both, so recognise ours with `InternalError.is(e)` or `isVarlinkError`. A `VarlinkError`'s `message` is
+  its name, but a name that is not a valid `interface.Name` (peers can send anything) is quoted with control
+  and format characters escaped and cut to 256 code units; `error` keeps the raw name. `ErrorRegistry.register` checks
   `errorName` is `interface.Name`, ignores re-registering the same class and throws `TypeError` for a
   different class under a taken name (also within one call); it is atomic (on a throw nothing is registered).
   `create(name, params)` builds the registered class or a plain `VarlinkError`, without validating params.

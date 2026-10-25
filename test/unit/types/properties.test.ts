@@ -135,6 +135,7 @@ const jsonLeaf = fc.oneof(
   fc.integer(),
   fc.string(),
   fc.bigInt({ min: 2n ** 60n, max: 2n ** 64n }),
+  fc.bigInt({ min: -(2n ** 53n), max: 2n ** 53n }),
   unsafeIntegerDouble,
   fc.double({ noNaN: true, noDefaultInfinity: true }),
   fc.constant(-0),
@@ -263,7 +264,8 @@ const HAS_RAW_JSON = typeof (JSON as { rawJSON?: unknown }).rawJSON === "functio
  * - -0 survives only where JSON.rawJSON exists (JSON.stringify writes 0).
  */
 function untypedRoundTrip(value: unknown, source: boolean): unknown {
-  if (typeof value === "bigint") return source ? value : Number(value);
+  // A safe bigint is written as plain digits and decodes as a number; only unsafe ones come back as bigint.
+  if (typeof value === "bigint") return source && !Number.isSafeInteger(Number(value)) ? value : Number(value);
   if (typeof value === "number") {
     if (Object.is(value, -0)) return HAS_RAW_JSON ? -0 : 0;
     if (source && Number.isInteger(value) && !Number.isSafeInteger(value) && Math.abs(value) < 1e21)

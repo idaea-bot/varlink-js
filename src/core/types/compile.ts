@@ -63,8 +63,8 @@ export interface CompiledInterface {
 /** Deepest struct/array/map nesting a validator accepts. */
 export const MAX_VALUE_DEPTH: number = 1024;
 /**
- * Longest array encode accepts: each element needs at least 2 bytes (a digit and a comma), so a longer array
- * cannot fit in a 16 MiB message.
+ * Longest array encode accepts: each element needs at least 2 bytes (a digit and a comma), so such an array
+ * cannot fit in a default 16 MiB message. A fixed v1 limit: raising `maxMessageSize` does not lift it.
  */
 export const MAX_ENCODE_ARRAY_LENGTH: number = 8 * 1024 * 1024;
 
