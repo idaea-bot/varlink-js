@@ -245,7 +245,7 @@ describe("bindRegistry", () => {
     assert.equal(await readlink(join(reg, "org.example.relinked")), join(dir(), "someone-else.sock"));
   });
 
-  test("a symlink spelled differently (relative) that resolves to our live socket is adopted, removed on unbind", async () => {
+  test("a symlink spelled differently (relative) that resolves to our live socket is adopted, kept at unbind", async () => {
     const reg = sub("relative");
     const sock = join(dir(), "rel-live.sock");
     const listener = await listen(`unix:${sock}`);
@@ -258,7 +258,8 @@ describe("bindRegistry", () => {
       assert.deepEqual(binding.entries, [entry]);
       assert.equal(await readlink(entry), relative(reg, sock), "adopted as it is, not replaced");
       await binding.unbind();
-      assert.deepEqual(readdirSync(reg), []);
+      // Removal needs the exact spelling (no realpath matching): it may be another binder's link to the socket.
+      assert.equal(await readlink(entry), relative(reg, sock), "a differently spelled entry is left in place");
     } finally {
       await listener.close();
     }

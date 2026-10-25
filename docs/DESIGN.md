@@ -435,7 +435,10 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
   An aborted `signal` and other resolver failures (timeouts, invalid replies) reject as they are. Invalid name:
   `TypeError`.
 - Resolver client (partial and untyped until M6 regenerates it): `resolverResolve(conn, iface)` (the reply's
-  `address` must be a string `parseAddress` accepts, else `ValidationError` for `address`) and
+  `address` must be a string `parseAddress` accepts *of a socket kind*, `unix`, `unix-abstract` or `tcp`, else
+  `ValidationError` for `address`, naming the kind: `connect()` spawns for `exec:`/`ssh-unix:`/`ssh-exec:`, so a
+  malicious or spoofed resolver must not be able to make `connect(await resolveInterface(…))` run a local binary or
+  a remote command; websocket/http are refused too, as no resolver has a reason to send them) and
   `resolverGetInfo(conn)` (reply checked against the IDL), plus `ORG_VARLINK_RESOLVER_IDL` for implementing one
   (`server.addInterface(ORG_VARLINK_RESOLVER_IDL, …)`, as the tests do).
 - Publishing: `serve(listener, {registry})` (§5.4) through `bindRegistry` below.
@@ -1467,15 +1470,18 @@ from `/proc` under socket activation); `unix:@`, tcp and nameless fds have none.
 first member that has one; one-shot (connected-fd, stdio) listeners have none. Per entry `<dir>/<iface>` (`dir` =
 `directory`, else `registryDirectory(scope ?? "system")`; names checked with `isInterfaceName` before any filesystem
 access, so no path traversal): `mkdir -p` the directory, the directories it created `chmod`ed to 0755 (a restrictive
-umask must not hide the registry from readers); target = the absolute socket path; absent → `symlink` (an `EEXIST`
+umask must not hide the registry from readers; each is `lstat`ed first and skipped unless it is a directory, not a
+symlink, owned by `process.getuid()` where that exists); target = the absolute socket path; absent → `symlink` (an `EEXIST`
 race is re-evaluated once); a symlink whose `readlink` equals the target, or whose `realpath` equals the target's
-(e.g. a relative link) → adopted (removed on unbind too, not rolled back); stale (dangling symlink, or a socket /
+(e.g. a relative link) → adopted (not rolled back; removed on unbind only if spelled exactly as the target);
+stale (dangling symlink, or a socket /
 symlink to one that refuses 3 connects ~20 ms apart with `ECONNREFUSED`/`ENOENT`) → replaced atomically (`symlink` to
 `<dir>/.<iface>.<random>.tmp`, `rename` over the entry, then `readlink` again: if another binder replaced it right
 after us, that is retried as above instead of counted as ours); anything else (a live socket of another service, a
 regular file, a directory) → an `Error` with `code: "EEXIST"` naming the entry, and the entries this call created are
-removed. `unbind()` (idempotent) unlinks each entry only while it is still a symlink leading to our target (ENOENT
-ignored), so foreign entries are left alone; the check and the `unlink` are two steps (no atomic compare-and-unlink),
+removed. `unbind()` (idempotent) unlinks each entry only while it is still a symlink whose `readlink` is exactly
+our target (ENOENT ignored; no `realpath` matching on removal), so foreign entries are left alone, and so is an
+adopted entry spelled differently (it may be another binder's spelling of the same socket); the check and the `unlink` are two steps (no atomic compare-and-unlink),
 so an entry another binder puts in place between them is removed. On macOS/BSD a live socket with a full backlog
 refuses connects like a stale one (Linux gives `EAGAIN`, counted as live), so a busy service's entry may be replaced
 there, as with `listen()`. The `user.varlink` xattr is M11 (native addon).
@@ -1578,8 +1584,10 @@ M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exit
   ourselves). fd 3 per `socket`: `"connected"` (default, what sd-varlink/varlinkctl pass and systemd services with
   `sd_varlink_invocation(ALLOW_ACCEPT)` expect): stdio `"pipe"`, which libuv creates as an AF_UNIX socketpair; the
   parent end `child.stdio[3]` is a `net.Socket` created with `allowHalfOpen: false`, so we set it to `true`
-  (verified: then the child's FIN does not end our write side); the child also gets `VARLINK_JS_ACTIVATION=connected`
-  (see `listenFromEnv` below), so a varlink-js child's default `listenFromEnv()` serves it on every system.
+  (verified: then the child's FIN does not end our write side); the child also gets
+  `VARLINK_JS_ACTIVATION=connected:$$`, set and exported by the same shell script as `LISTEN_PID` (`/bin/sh -c
+  'LISTEN_PID=$$; VARLINK_JS_ACTIVATION=connected:$$; export …; exec …'`), so it names the child's pid (see
+  `listenFromEnv` below) and a varlink-js child's default `listenFromEnv()` serves it on every system.
   `"listening"` (libvarlink/python `--activate`): a
   `mkdtemp(os.tmpdir()/varlink-exec-)` 0700 dir, a `net.Server` bound at `<dir>/socket.tmp` and renamed to
   `<dir>/socket` (so closing our copy, which makes libuv unlink the bound name, leaves the path), its `_handle.fd`
@@ -1602,11 +1610,16 @@ M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exit
   fds 3… named `name` are used; with no `LISTEN_FDNAMES` a single fd is used. Per fd, `accept: "auto"` on Linux
   reads `/proc/self/fd/N` (`socket:[ino]`) and looks the inode up in `/proc/self/net/unix` (Flags `__SO_ACCEPTCON`
   = listening; the Path column, the name at bind time, gives the address, `@…` → `unix:@…`) and `tcp`/`tcp6` (st
-  `0A`); where `/proc` says nothing (not Linux, `/proc` unreadable, an inode it does not list) the fd is connected if
-  `VARLINK_JS_ACTIVATION=connected`, else listening. That variable is a varlink-js-private hint that our
-  connected-mode `exec:` sets (macOS has no `/proc`, and without the native addon nothing else tells a connected
-  socket from a listening one); it is honoured only in `"auto"` mode and only where `/proc` is silent, and any other
-  value means nothing. A listening fd → `listen({fd}, {address})` (the new
+  `0A`). Those tables list only our network namespace: under `PrivateNetwork=yes` the sockets systemd made (an
+  `Accept=yes` connection included) are in the host's, so an inode missing there is looked up in
+  `/proc/1/net/{unix,tcp,tcp6}` (pid 1's namespace, where the service manager made it; read lazily, once per call).
+  Where `/proc` still says nothing (not Linux, `/proc` unreadable, an inode unknown in both, e.g. `hidepid` or a
+  container whose pid 1 is not the socket's owner: pass `accept: "connected"` for `Accept=yes` there) the fd is
+  connected if `VARLINK_JS_ACTIVATION` is exactly `connected:<LISTEN_PID>`, else listening. That variable is a
+  varlink-js-private hint that our connected-mode `exec:` sets (macOS has no `/proc`, and without the native addon
+  nothing else tells a connected socket from a listening one); it is honoured only in `"auto"` mode, only where
+  `/proc` is silent and only with our pid (a stale copy inherited from an ancestor names another pid), and any
+  other value means nothing. A listening fd → `listen({fd}, {address})` (the new
   `ListenOptions.address`, `{fd}` only, parsed and canonicalized; closing never unlinks); a connected one → a
   one-shot listener over `new net.Socket({fd, allowHalfOpen: true})` (`fd:<n>` or the `/proc` address) that yields
   that connection and ends (`close()` before it was taken closes it). Several fds → one merged listener.
@@ -1624,7 +1637,9 @@ M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exit
   (not a dialable varlink address); the streams are touched only when the channel is taken. Nothing else may write
   to stdout meanwhile. Node never closes fds 0/1 (destroying `process.stdout` leaves the fd open), so the channel's
   `end()`/`close()` also call `process.stdout.end()` (never throwing): on a socket stdout (libuv's `"pipe"` stdio,
-  ssh) that sends FIN; a pipe or terminal stdout cannot be closed. **A stdio-served process must exit when that
+  ssh) that sends FIN, after `close()` only if no write is still pending (`close()` destroys the stream, and a
+  destroyed stream skips the `_final` that shuts the socket down once drained); a pipe or terminal stdout cannot be
+  closed. **A stdio-served process must exit when that
   connection ends** (`exitOnIdle` plus `await server.closed; process.exit()`), which is what sd-varlink gets by
   `dup`ing 0/1 away (we cannot without the native addon).
 - **`listenAuto({…, mode})`** (sd_varlink_server_listen_auto, sd-varlink.c:3873): the `listenFromEnv()` fds plus,
@@ -1657,7 +1672,7 @@ option; the single-unnamed-fd rule is kept (sd-varlink names such an fd "unknown
 `LISTEN_PIDFDID` is ignored (Node cannot read the inode id of its own pidfd); a connected activation fd is detected
 from `/proc` on Linux, elsewhere it needs `accept: "connected"` (no `getsockopt(SO_ACCEPTCONN)` without the native
 addon, and probing with `listen()` is not an option: a failed `listen({fd})` closes the fd), except that our own
-connected-mode `exec:` passes the `VARLINK_JS_ACTIVATION=connected` hint; activation fds are not close-on-exec (our
+connected-mode `exec:` passes the `VARLINK_JS_ACTIVATION=connected:<pid>` hint; activation fds are not close-on-exec (our
 spawners cover them with `/dev/null`). Phase B: `serve(listener)` keeps M4's `void`; only the new overload
 `serve(listener, options)` returns a `Promise<void>` (resolved at once without `registry`),
 `ServerErrorReason` gains `"registry-failed"`, entries bound through a `listen({fd})` listener persist after unbind

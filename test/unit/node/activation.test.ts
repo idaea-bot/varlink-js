@@ -3,11 +3,12 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync, readdirSync, readlinkSync } from "node:fs";
-import { rename } from "node:fs/promises";
+import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { describe, test } from "node:test";
 import type { ByteChannel, Listener } from "../../../src/core/protocol/index.ts";
+import { procLookup, procSockets } from "../../../src/node/activation.ts";
 import { connect, fromNodeSocket, listen, listenStdio, mergeListeners } from "../../../src/node/index.ts";
 import { createConnection, createServer, type Connection } from "../../../src/rpc/index.ts";
 import { pair } from "../../../src/testing/index.ts";
@@ -18,6 +19,9 @@ const CHILD = resolve(import.meta.dirname, "activation-child.ts");
 const LINUX = process.platform === "linux";
 const CONNECTED = LINUX ? "auto" : "connected";
 const LISTEN_PID_SCRIPT = 'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"';
+/** What a connected-mode exec: runs: the hint names the same pid as LISTEN_PID. */
+const HINT_SCRIPT =
+  'LISTEN_PID=$$; VARLINK_JS_ACTIVATION=connected:$$; export LISTEN_PID VARLINK_JS_ACTIVATION; exec "$0" "$@"';
 
 /** The fd of a listening net.Server (private `_handle.fd`). */
 function fdOf(server: NetServer): number {
@@ -43,6 +47,8 @@ interface Activation {
   env?: Record<string, string>;
   /** "own" (default): LISTEN_PID = the child's pid; "other": "1"; "absent": not set. */
   pid?: "own" | "other" | "absent";
+  /** Set VARLINK_JS_ACTIVATION=connected:<the child's pid> as our exec: does (needs pid "own"). */
+  hint?: boolean;
   args?: string[];
 }
 
@@ -66,7 +72,10 @@ function activate(a: Activation): { child: ChildProcess; exited: Promise<number 
   const args = [CHILD, ...(a.args ?? [])];
   const child: ChildProcess =
     pid === "own"
-      ? spawn("/bin/sh", ["-c", LISTEN_PID_SCRIPT, process.execPath, ...args], { stdio, env })
+      ? spawn("/bin/sh", ["-c", a.hint === true ? HINT_SCRIPT : LISTEN_PID_SCRIPT, process.execPath, ...args], {
+          stdio,
+          env,
+        })
       : spawn(process.execPath, args, { stdio, env });
   const exited = new Promise<number | null>((r) => child.once("exit", r));
   const sockets: Socket[] = [];
@@ -154,10 +163,11 @@ describe("listenFromEnv in an activated child", () => {
     assert.equal(await exited, 0);
   });
 
-  test("VARLINK_JS_ACTIVATION=connected: a connected fd with accept: auto on every system (hint unset)", async () => {
-    const { exited, sockets } = activate({
+  test("VARLINK_JS_ACTIVATION=connected:<pid>: a connected fd with accept: auto on every system (hint unset)", async () => {
+    const { child, exited, sockets } = activate({
       fds: ["pipe"],
-      env: { LISTEN_FDS: "1", LISTEN_FDNAMES: "varlink", VARLINK_JS_ACTIVATION: "connected" },
+      env: { LISTEN_FDS: "1", LISTEN_FDNAMES: "varlink" },
+      hint: true,
       args: ["--accept=auto"],
     });
     const [socket] = sockets;
@@ -165,11 +175,43 @@ describe("listenFromEnv in an activated child", () => {
     const conn = createConnection(fromNodeSocket(socket));
     const reply = await ping(conn);
     assert.equal(reply.address, "fd:3");
-    assert.equal(reply.before.VARLINK_JS_ACTIVATION, "connected");
+    assert.equal(reply.before.VARLINK_JS_ACTIVATION, `connected:${String(child.pid)}`);
     assert.deepEqual(reply.after, {});
     await conn.close();
     assert.equal(await exited, 0);
   });
+
+  test(
+    "a stale hint (another pid, or no pid) is ignored: the fd is taken as listening",
+    { skip: LINUX ? "Linux asks /proc" : false },
+    async () => {
+      // A connected socket taken for listening: listen() on it fails (and closes it).
+      for (const hint of ["connected:1", `connected:${String(process.pid)}`, "connected", "connected:"]) {
+        const r = await report({
+          fds: ["pipe"],
+          env: { LISTEN_FDS: "1", VARLINK_JS_ACTIVATION: hint },
+          args: ["--accept=auto"],
+        });
+        assert.equal(r.result, "error", hint);
+        assert.deepEqual(r.after, {}, hint);
+      }
+    },
+  );
+
+  test(
+    "/proc wins over the hint: a listening fd with the hint and accept: auto is served as listening",
+    { skip: LINUX ? false : "needs Linux /proc" },
+    async () => {
+      const a = await unixSocket("hint-proc");
+      try {
+        const r = await report({ fds: [a.fd], env: { LISTEN_FDS: "1" }, hint: true, args: ["--accept=auto"] });
+        assert.equal(r.result, "listener");
+        assert.equal(r.address, `unix:${a.procPath}`);
+      } finally {
+        await closeServer(a.server);
+      }
+    },
+  );
 
   test(
     "without the hint a connected fd needs accept: connected off Linux",
@@ -190,11 +232,7 @@ describe("listenFromEnv in an activated child", () => {
   test("the hint never overrides an explicit accept mode", async () => {
     const a = await unixSocket("hint-l");
     try {
-      const r = await report({
-        fds: [a.fd],
-        env: { LISTEN_FDS: "1", VARLINK_JS_ACTIVATION: "connected" },
-        args: ["--accept=listening"],
-      });
+      const r = await report({ fds: [a.fd], env: { LISTEN_FDS: "1" }, hint: true, args: ["--accept=listening"] });
       assert.equal(r.result, "listener");
       assert.equal(r.address, LINUX ? `unix:${a.procPath}` : "fd:3");
     } finally {
@@ -231,6 +269,36 @@ describe("listenFromEnv in an activated child", () => {
           assert.notEqual(theirs, fds.ours[fd], `the grandchild's fd ${fd} is not the activation socket`);
           assert.ok(theirs === "/dev/null" || theirs === null, `grandchild fd ${fd}: ${String(theirs)}`);
         }
+      } finally {
+        await closeServer(a.server);
+        await closeServer(b.server);
+      }
+    },
+  );
+
+  test(
+    "the /dev/null cover also applies to an exec: grandchild with a listening socket",
+    { skip: LINUX ? false : "needs Linux /proc" },
+    async () => {
+      const a = await unixSocket("cloexec-xa");
+      const b = await unixSocket("cloexec-xb");
+      const cmd = join(dir(), "child.sh");
+      await writeFile(cmd, `#!/bin/sh\nexec "${process.execPath}" "${CHILD}" "$@"\n`);
+      await chmod(cmd, 0o755);
+      try {
+        const r = await report({
+          fds: [a.fd, b.fd],
+          env: { LISTEN_FDS: "2", LISTEN_FDNAMES: "varlink:other" },
+          args: ["--accept=listening", `--grandchild-exec=${cmd}`],
+        });
+        assert.equal(r.result, "listener");
+        const fds = r.fds;
+        assert.ok(fds !== undefined);
+        // Slot 3 is the exec: listening socket (ours, not the activation one); slot 4 must be covered.
+        assert.match(fds.theirs["3"] ?? "", /^socket:\[\d+\]$/);
+        assert.notEqual(fds.theirs["3"], fds.ours["3"]);
+        assert.match(fds.ours["4"] ?? "", /^socket:\[\d+\]$/);
+        assert.equal(fds.theirs["4"], "/dev/null");
       } finally {
         await closeServer(a.server);
         await closeServer(b.server);
@@ -343,6 +411,61 @@ describe("listenFromEnv in an activated child", () => {
     } finally {
       await closeServer(a.server);
     }
+  });
+});
+
+describe("/proc socket tables (fixture files)", () => {
+  const UNIX_HEADER = "Num       RefCount Protocol Flags    Type St Inode Path\n";
+  const TCP_HEADER =
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+  const unixRow = (flags: string, inode: number, path = ""): string =>
+    `0000000000000000: 00000002 00000000 ${flags} 0001 01 ${String(inode)}${path === "" ? "" : ` ${path}`}\n`;
+  const tcpRow = (st: string, inode: number): string =>
+    `   0: 0100007F:1F90 00000000:0000 ${st} 00000000:00000000 00:00000000 00000000  1000        0 ${String(inode)} 1 0000000000000000 100 0 0 10 0\n`;
+
+  async function tables(base: string, t: { unix?: string; tcp?: string; tcp6?: string }): Promise<void> {
+    await mkdir(join(base, "net"), { recursive: true });
+    await writeFile(join(base, "net", "unix"), UNIX_HEADER + (t.unix ?? ""));
+    await writeFile(join(base, "net", "tcp"), TCP_HEADER + (t.tcp ?? ""));
+    await writeFile(join(base, "net", "tcp6"), TCP_HEADER + (t.tcp6 ?? ""));
+  }
+
+  test("procSockets parses unix (listening flag, path, abstract) and tcp/tcp6 (state) from a base dir", async () => {
+    const base = join(dir(), "proc-parse");
+    await tables(base, {
+      unix: unixRow("00010000", 11, "/run/a.sock") + unixRow("00000000", 12) + unixRow("00010000", 13, "@abs"),
+      tcp: tcpRow("0A", 21) + tcpRow("01", 22),
+      tcp6: tcpRow("0a", 23),
+    });
+    const s = procSockets(base);
+    assert.deepEqual(s.get("11"), { listening: true, address: "unix:/run/a.sock" });
+    assert.deepEqual(s.get("12"), { listening: false });
+    assert.deepEqual(s.get("13"), { listening: true, address: "unix:@abs" });
+    assert.deepEqual(s.get("21"), { listening: true });
+    assert.deepEqual(s.get("22"), { listening: false });
+    assert.deepEqual(s.get("23"), { listening: true });
+    assert.equal(procSockets(join(dir(), "proc-missing")).size, 0, "unreadable tables: empty");
+  });
+
+  test("procLookup: our namespace first, then pid 1's, read lazily once on the first miss", async () => {
+    const self = join(dir(), "proc-self");
+    const init = join(dir(), "proc-1");
+    // Under PrivateNetwork=yes systemd's Accept=yes socket (31) is only in pid 1's namespace.
+    await tables(self, { unix: unixRow("00010000", 30, "/run/ours.sock") });
+    const lookup = procLookup([self, init]);
+    assert.deepEqual(lookup("30"), { listening: true, address: "unix:/run/ours.sock" });
+    // pid 1's tables did not exist yet: not read on a hit.
+    await tables(init, {
+      unix: unixRow("00000000", 31, "/run/accept.sock") + unixRow("00000000", 30),
+      tcp6: tcpRow("0A", 32),
+    });
+    assert.deepEqual(lookup("31"), { listening: false, address: "unix:/run/accept.sock" }, "found in pid 1's");
+    assert.deepEqual(lookup("32"), { listening: true });
+    assert.deepEqual(lookup("30"), { listening: true, address: "unix:/run/ours.sock" }, "ours wins");
+    assert.equal(lookup("99"), undefined, "unknown in both: /proc is silent");
+    // Read once: a socket that appears later is not seen by this lookup.
+    await tables(init, { unix: unixRow("00000000", 33) });
+    assert.equal(lookup("33"), undefined);
   });
 });
 

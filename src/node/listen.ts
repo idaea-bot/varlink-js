@@ -26,7 +26,8 @@ export interface ListenOptions {
   onError?: (error: unknown) => void;
   /**
    * `{fd}` only: the listener's `address` when it is known otherwise (e.g. from `/proc`, §5.8), replacing the one
-   * derived from the socket (or the `fd:<n>` placeholder). Parsed and stored in canonical form; never unlinked.
+   * derived from the socket (`tcp:…`) or the `fd:<n>` placeholder (a unix socket, path or abstract, whose name Node
+   * cannot learn from the fd). Parsed and stored in canonical form; never unlinked.
    */
   address?: string;
 }
@@ -512,7 +513,7 @@ async function listenServer(
   }
 }
 
-/** The canonical address of a listening server (`{fd}`: a unix socket's path is unknown to Node → `fd:<n>`). */
+/** The canonical address of a listening server (`{fd}`: a unix socket's name is unknown to Node → `fd:<n>`). */
 function addressOf(server: Server, fd?: number): string {
   const a = server.address();
   if (a === null || a === "") return `fd:${String(fd)}`;
@@ -540,9 +541,10 @@ function addressOf(server: Server, fd?: number): string {
  *   socket we created.
  * - `unix:@name`: Linux only (else `OperationNotSupportedError`).
  * - `tcp:host:port`: port 0 picks a free port; `address` carries the real one (`tcp:[::1]:p` for IPv6).
- * - `{fd}`: an already-listening socket fd (socket activation, §5.8). `address` comes from the socket
- *   (`tcp:…`, `unix:@…`); Node cannot name a unix path socket inherited this way, so it is `fd:<n>` there unless
- *   `options.address` names it. Closing never unlinks anything.
+ * - `{fd}`: an already-listening socket fd (socket activation, §5.8). A tcp socket's `address` (`tcp:…`) comes
+ *   from the socket; Node cannot name a unix socket inherited this way (path or abstract), so a unix one has its
+ *   address only from `options.address` (which `listenFromEnv` fills from `/proc`), else `fd:<n>`. Closing never
+ *   unlinks anything.
  *
  * `listen()` rejects on `EADDRINUSE` and every other listen error (F8). Later server errors (accept failures such
  * as `EMFILE`) go to `options.onError` (default: ignored) and the listener keeps accepting. The iterator ends only

@@ -26,10 +26,12 @@ export interface ActivationOptions {
   unsetEnvironment?: boolean;
   /**
    * Whether an fd is a listening socket or an already-accepted connection (systemd `Accept=yes`, or a connected
-   * `exec:` socketpair). `"auto"` (default) asks `/proc` on Linux; where `/proc` says nothing about an fd (other
-   * systems, or a socket it does not know) the fd is taken as connected if `VARLINK_JS_ACTIVATION=connected` is set
-   * (see {@link listenFromEnv}), else as listening: on other systems a connected fd passed by anyone but a
-   * varlink-js `exec:` needs `"connected"`.
+   * `exec:` socketpair). `"auto"` (default) asks `/proc` on Linux: our network namespace's socket tables, then pid
+   * 1's (where the service manager made the sockets of a `PrivateNetwork=yes` service). Where `/proc` says nothing
+   * about an fd (other systems, or an inode unknown in both, e.g. `/proc` mounted with `hidepid` or a container whose
+   * pid 1 does not own the socket's namespace) the fd is taken as connected if our own `exec:`'s hint is set (see
+   * {@link listenFromEnv}), else as listening: there, a connected fd passed by anyone but a varlink-js `exec:` (an
+   * `Accept=yes` socket, say) needs `"connected"`.
    */
   accept?: "auto" | "listening" | "connected";
 }
@@ -62,6 +64,9 @@ const SO_ACCEPTCON = 0x10000;
 /** TCP_LISTEN in the st column of /proc/net/tcp{,6}. */
 const TCP_LISTEN = "0A";
 
+/** Where listenFromEnv looks up a socket: our network namespace, then pid 1's (the service manager's). */
+const PROC_BASES = ["/proc/self", "/proc/1"];
+
 function readProc(path: string): string | undefined {
   try {
     return readFileSync(path, "utf8");
@@ -82,12 +87,15 @@ function unixAddress(path: string): string | undefined {
   }
 }
 
-/** Sockets by inode, from /proc/self/net/{unix,tcp,tcp6} (Linux; empty where unreadable). */
-function procSockets(): Map<string, ProcSocket> {
+/**
+ * Sockets by inode, from `<base>/net/{unix,tcp,tcp6}` (`base` e.g. `/proc/self`; Linux; empty where unreadable).
+ * Only the sockets of that process's network namespace are listed (internal; exported for tests).
+ */
+export function procSockets(base: string): Map<string, ProcSocket> {
   const sockets = new Map<string, ProcSocket>();
   // Num RefCount Protocol Flags Type St Inode [Path]
   const unixLine = /^\S+:\s+\S+\s+\S+\s+([0-9A-Fa-f]+)\s+\S+\s+\S+\s+(\d+)(?: (.*))?$/;
-  for (const line of (readProc("/proc/self/net/unix") ?? "").split("\n").slice(1)) {
+  for (const line of (readProc(`${base}/net/unix`) ?? "").split("\n").slice(1)) {
     const m = unixLine.exec(line);
     if (m === null) continue;
     const [, flags = "0", inode = "", path] = m;
@@ -98,7 +106,7 @@ function procSockets(): Map<string, ProcSocket> {
     });
   }
   // sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode …
-  for (const table of ["/proc/self/net/tcp", "/proc/self/net/tcp6"])
+  for (const table of [`${base}/net/tcp`, `${base}/net/tcp6`])
     for (const line of (readProc(table) ?? "").split("\n").slice(1)) {
       const fields = line.trim().split(/\s+/);
       const st = fields[3];
@@ -107,6 +115,24 @@ function procSockets(): Map<string, ProcSocket> {
       sockets.set(inode, { listening: st.toUpperCase() === TCP_LISTEN });
     }
   return sockets;
+}
+
+/**
+ * What `/proc` says about socket inodes: our network namespace's tables, then (read once, on the first miss) pid 1's,
+ * where the service manager made the sockets of a `PrivateNetwork=yes` service (internal; exported for tests).
+ */
+export function procLookup(bases: readonly string[]): (inode: string) => ProcSocket | undefined {
+  const tables: Map<string, ProcSocket>[] = [];
+  return (inode) => {
+    for (let i = 0; i < bases.length; i++) {
+      const base = bases[i];
+      if (base === undefined) break;
+      tables[i] ??= procSockets(base);
+      const info = tables[i]?.get(inode);
+      if (info !== undefined) return info;
+    }
+    return undefined;
+  };
 }
 
 /** The socket inode of an fd (`socket:[ino]`), or undefined. */
@@ -350,10 +376,12 @@ export function mergeListeners(listeners: readonly Listener[]): Listener {
  * variables (and `VARLINK_JS_ACTIVATION`, below) are unset unless `unsetEnvironment` is false, also when this throws
  * (invalid options included) or returns `null`.
  *
- * `VARLINK_JS_ACTIVATION=connected` is a varlink-js-private hint that a connected-mode `exec:` of varlink-js sets:
- * with `accept: "auto"`, an fd `/proc` says nothing about (any system but Linux, or a socket `/proc` does not list)
- * is then taken as connected instead of listening. Any other value, or the variable absent, changes nothing; it is
- * never consulted in the other `accept` modes or where `/proc` knows the socket.
+ * `VARLINK_JS_ACTIVATION=connected:<pid>` is a varlink-js-private hint that a connected-mode `exec:` of varlink-js
+ * sets (the shell sets it with `LISTEN_PID`, same pid): with `accept: "auto"`, an fd `/proc` says nothing about (any
+ * system but Linux, or a socket unknown in our and pid 1's network namespace) is then taken as connected instead of
+ * listening. It counts only if it is exactly `connected:<LISTEN_PID>`: any other value (a stale copy naming another
+ * pid included), or the variable absent, changes nothing; it is never consulted in the other `accept` modes or where
+ * `/proc` knows the socket.
  *
  * The activation fds are not close-on-exec (systemd's `sd_listen_fds` sets `FD_CLOEXEC`; Node cannot without the
  * native addon, M11), so a child process inherits fds 3 … 3 + `LISTEN_FDS` − 1, listening sockets included. Every
@@ -390,14 +418,17 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
   for (let i = 0; i < n; i++)
     if (fdNames === undefined ? n === 1 : fdNames[i] === name) selected.push(LISTEN_FDS_START + i);
   if (selected.length === 0) return null;
-  const proc = process.platform === "linux" ? procSockets() : new Map<string, ProcSocket>();
+  const linux = process.platform === "linux";
+  const lookup = procLookup(PROC_BASES);
+  // Our exec:'s hint, honoured only if set for this very process (a stale copy names another pid).
+  const hinted = hint === `connected:${pid}`;
   const listeners: Listener[] = [];
   try {
     for (const fd of selected) {
-      const inode = proc.size === 0 ? undefined : socketInode(fd);
-      const info = inode === undefined ? undefined : proc.get(inode);
-      // /proc silent (not Linux, or an unknown inode): only our own exec:'s hint can say "connected".
-      const connected = info === undefined ? hint === "connected" : !info.listening;
+      const inode = linux ? socketInode(fd) : undefined;
+      const info = inode === undefined ? undefined : lookup(inode);
+      // /proc silent (not Linux, or an inode unknown in both namespaces): only our own exec:'s hint says "connected".
+      const connected = info === undefined ? hinted : !info.listening;
       const mode = accept === "auto" ? (connected ? "connected" : "listening") : accept;
       if (mode === "connected") listeners.push(connectedListener(fd, info?.address));
       else listeners.push(await listen({ fd }, info?.address === undefined ? {} : { address: info.address }));
@@ -421,7 +452,10 @@ function endStdout(): void {
 
 /**
  * The stdio channel: Node never closes fds 0 and 1 (destroying `process.stdout` leaves the fd open), so `end()` and
- * `close()` also end `process.stdout`, which on a socket (libuv's `"pipe"` stdio, ssh) sends FIN.
+ * `close()` also end `process.stdout`, which on a socket (libuv's `"pipe"` stdio, ssh) sends FIN. After `close()`
+ * the FIN goes out only if no write is still pending: `close()` destroys the stream, and a destroyed stream skips
+ * the `_final` that would shut the socket down once the writes drained. The must-exit rule ({@link listenStdio})
+ * covers that case: the peer sees EOF when the process exits.
  */
 function stdioChannel(): ByteChannel {
   const inner = fromNodeStreams(process.stdin, process.stdout);
@@ -449,8 +483,9 @@ function stdioChannel(): ByteChannel {
  *
  * **A stdio-served process must exit when this connection ends.** Node cannot close fds 0 and 1 (sd-varlink
  * `dup`s them away; that needs the native addon): closing the channel ends `process.stdout`, which sends FIN on a
- * socket stdout (what our spawners and ssh give a child) but cannot close a pipe or a terminal, so the peer may see
- * EOF only when the process exits. Serve with `exitOnIdle` and `await server.closed; process.exit()`.
+ * socket stdout (what our spawners and ssh give a child) — after `close()` only if no write is still pending (the
+ * destroyed stream skips its `_final`) — but cannot close a pipe or a terminal, so the peer may see EOF only when
+ * the process exits. Serve with `exitOnIdle` and `await server.closed; process.exit()`.
  */
 export function listenStdio(): Listener {
   return new OneShotListener("stdio:", stdioChannel, () => undefined);

@@ -89,6 +89,12 @@ const STRIPPED_ENV = [
 /** Sets LISTEN_PID to the shell's pid, then execs the command in its place (Node cannot set env after fork). */
 const LISTEN_PID_SCRIPT = 'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"';
 
+/**
+ * The connected mode's script: also the hint that fd 3 is connected (activation.ts), tied to the same pid as
+ * LISTEN_PID so that a grandchild inheriting a stale copy ignores it.
+ */
+const CONNECTED_SCRIPT = `LISTEN_PID=$$; ${ACTIVATION_HINT_ENV}=connected:$$; export LISTEN_PID ${ACTIVATION_HINT_ENV}; exec "$0" "$@"`;
+
 const DEFAULT_KILL_TIMEOUT = 2000;
 
 interface CheckedProcessOptions {
@@ -457,12 +463,12 @@ async function openExec(command: string, o: CheckedProcessOptions, phase: AbortS
   await access(command, fsConstants.X_OK);
   phase.throwIfAborted();
   const argv = o.argv ?? [command];
-  const args = ["-c", LISTEN_PID_SCRIPT, command, ...argv.slice(1)];
   const env = { ...o.env, LISTEN_FDS: "1", LISTEN_FDNAMES: "varlink" };
-  if (o.socket === "listening") return openExecListening(args, { ...o, env }, phase);
-  // Tells a varlink-js child that fd 3 is connected where it cannot ask /proc (activation.ts).
-  const connected = { ...env, [ACTIVATION_HINT_ENV]: "connected" };
-  const handle = spawnChild("/bin/sh", args, { ...o, env: connected }, stdioFor("exec", o.stderr, "pipe"));
+  if (o.socket === "listening")
+    return openExecListening(["-c", LISTEN_PID_SCRIPT, command, ...argv.slice(1)], { ...o, env }, phase);
+  // The script tells a varlink-js child that fd 3 is connected where it cannot ask /proc (activation.ts).
+  const args = ["-c", CONNECTED_SCRIPT, command, ...argv.slice(1)];
+  const handle = spawnChild("/bin/sh", args, { ...o, env }, stdioFor("exec", o.stderr, "pipe"));
   try {
     await handle.spawned();
     phase.throwIfAborted();
@@ -657,7 +663,8 @@ export function connectSpawned(
  * `ENOENT`/`EACCES` error). The child runs through `/bin/sh -c 'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"'`
  * (Node cannot set the environment after fork), so the argv[0] it sees is `command`; it gets `LISTEN_FDS=1`,
  * `LISTEN_FDNAMES=varlink`, fd 3 per `options.socket` (default a connected unix socket, plus
- * `VARLINK_JS_ACTIVATION=connected`; `"listening"` sets `VARLINK_ADDRESS` instead), stdin from `/dev/null`, stdout
+ * `VARLINK_JS_ACTIVATION=connected:<pid>`, set by the shell like `LISTEN_PID`; `"listening"` sets `VARLINK_ADDRESS`
+ * instead), stdin from `/dev/null`, stdout
  * on our stderr, stderr per `options.stderr`, `/dev/null` on any other activation fd number we inherited, and the
  * environment of {@link SpawnProcessOptions.env} without the activation variables meant for us.
  *

@@ -3,9 +3,10 @@
 // registry.ts → connect.ts → spawn.ts would be an import cycle.
 
 /**
- * varlink-js-private hint a connected-mode `exec:` sets for its child: fd 3 is a connected socketpair end.
- * `listenFromEnv` reads it only in `accept: "auto"` mode and only where `/proc` says nothing about the fd (without
- * the native addon nothing else can tell a connected socket from a listening one), and unsets it with `LISTEN_*`.
+ * varlink-js-private hint a connected-mode `exec:` sets for its child: fd 3 is a connected socketpair end. The value
+ * is `connected:<pid>`, the same pid as `LISTEN_PID`. `listenFromEnv` reads it only in `accept: "auto"` mode, only
+ * where `/proc` says nothing about the fd (without the native addon nothing else can tell a connected socket from a
+ * listening one) and only if its pid is `LISTEN_PID`, and unsets it with `LISTEN_*`.
  */
 export const ACTIVATION_HINT_ENV = "VARLINK_JS_ACTIVATION";
 

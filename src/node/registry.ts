@@ -173,19 +173,32 @@ function checkString(value: unknown, path: string): string {
   return value;
 }
 
+/** The address kinds a resolver may answer with: sockets only (§4.6). */
+const RESOLVABLE_KINDS: ReadonlySet<string> = new Set(["unix", "unix-abstract", "tcp"]);
+
 /**
- * `org.varlink.resolver.Resolve`: the address a resolver registered for `iface` (checked: a string `parseAddress`
- * accepts, else a {@link ValidationError} for `address`). Error replies reject as usual (the resolver's
+ * `org.varlink.resolver.Resolve`: the address a resolver registered for `iface`, checked: a string `parseAddress`
+ * accepts, of a socket kind (`unix:`, abstract `unix:@`, `tcp:`), else a {@link ValidationError} for `address`.
+ * Anything that `connect()` would spawn or reach otherwise (`exec:`, `ssh-unix:`, `ssh-exec:`, websocket, http) is
+ * rejected, the kind named: a resolver (or whoever answers in its place) must not make `connect(await
+ * resolveInterface(…))` run a local binary or a remote command. Error replies reject as usual (the resolver's
  * `org.varlink.resolver.InterfaceNotFound` as a VarlinkError of that name).
  */
 export async function resolverResolve(conn: Connection, iface: string, options?: CallOptions): Promise<string> {
   const reply = await conn.call("org.varlink.resolver.Resolve", { interface: iface }, options);
   const address = checkString(reply.address, "address");
+  let kind: string;
   try {
-    parseAddress(address);
+    kind = parseAddress(address).kind;
   } catch (e) {
     throw new ValidationError(["address"], "type", `not a varlink address: ${safeQuote(address)}`, { cause: e });
   }
+  if (!RESOLVABLE_KINDS.has(kind))
+    throw new ValidationError(
+      ["address"],
+      "type",
+      `a resolver may only answer with a socket address (unix, unix-abstract, tcp), not kind ${kind}`,
+    );
   return address;
 }
 
@@ -211,7 +224,8 @@ export async function resolverGetInfo(conn: Connection, options?: CallOptions): 
  * Finds a service implementing `name` (DESIGN.md §4.6) and returns its address: the registry entry
  * `<dir>/<name>` (a socket or a symlink to one → `unix:<entry path>`) in `directory`, or by `scope` (`"auto"`: the
  * system registry, then the user's if `XDG_RUNTIME_DIR` is set; `unix:<target>` instead if the entry path is too
- * long for a unix socket address and the socket's is not); then `org.varlink.resolver` at `resolver`.
+ * long for a unix socket address and the socket's is not); then `org.varlink.resolver` at `resolver`, whose answer
+ * must be a socket address (`unix:`, `tcp:`; see {@link resolverResolve}: never one that `connect()` would spawn).
  * Nothing found rejects with {@link InterfaceNotFoundError} (`cause`: the resolver's error, or why it could not be
  * reached). Abort and resolver errors other than "not found" (timeouts, invalid replies) reject as they are.
  *
@@ -368,10 +382,13 @@ async function readlinkOf(entry: string): Promise<string | undefined> {
   }
 }
 
-/** Removes `entry` if it is still a symlink to `target` (as spelled, or resolving to it). */
+/**
+ * Removes `entry` if it is still a symlink spelled exactly `target`. No realpath matching: a differently spelled
+ * symlink (adopted because it resolved to our socket) may be someone else's, and stays.
+ */
 async function removeIfOurs(entry: string, target: string): Promise<void> {
-  // Gone, no longer a symlink, or leading elsewhere: not ours any more.
-  if (!(await linksTo(entry, target))) return;
+  // Gone, no longer a symlink, or spelled otherwise: not ours (any more).
+  if ((await readlinkOf(entry)) !== target) return;
   try {
     await unlink(entry);
   } catch (e) {
@@ -379,7 +396,10 @@ async function removeIfOurs(entry: string, target: string): Promise<void> {
   }
 }
 
-/** `mkdir -p dir`, the directories it created `chmod`ed to 0755 (whatever the umask: readers must get in). */
+/**
+ * `mkdir -p dir`, the directories it created `chmod`ed to 0755 (whatever the umask: readers must get in). Each is
+ * `lstat`ed first and left alone unless it is still a directory (not a symlink someone swapped in) that we own.
+ */
 async function makeDirectory(dir: string): Promise<void> {
   const first = await mkdir(dir, { recursive: true, mode: 0o755 });
   if (first === undefined) return;
@@ -388,7 +408,12 @@ async function makeDirectory(dir: string): Promise<void> {
     created.unshift(d);
     if (d === first || dirname(d) === d) break;
   }
-  for (const d of created) await chmod(d, 0o755);
+  const uid = process.getuid?.();
+  for (const d of created) {
+    const st = await lstat(d).catch(() => undefined);
+    if (st?.isDirectory() !== true || (uid !== undefined && st.uid !== uid)) continue;
+    await chmod(d, 0o755);
+  }
 }
 
 /**
@@ -399,7 +424,9 @@ async function makeDirectory(dir: string): Promise<void> {
  * the same file) is adopted; a stale one (dangling, or a socket refusing connects) is replaced atomically (symlink +
  * rename); anything else (a live socket of another service, a file, …) fails with an `EEXIST` error naming the
  * entry, and the entries this call created are removed again (all or nothing). `unbind()` (idempotent) removes
- * every entry that is still a symlink to the socket, leaving anything else alone. `server.serve(listener,
+ * every entry that is still a symlink whose `readlink` is exactly the absolute socket path, leaving anything else
+ * alone: an entry adopted because it resolved to the socket but is spelled differently (a relative symlink, say) is
+ * left in place. `server.serve(listener,
  * {registry})` calls this through the listener (a `listen({fd})` listener's binding keeps its entries at unbind);
  * use it directly for listeners of your own.
  *

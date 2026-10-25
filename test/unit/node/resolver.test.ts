@@ -120,6 +120,46 @@ describe("org.varlink.resolver", () => {
         await bad.server.shutdown({ graceful: false });
       }
     });
+
+    test("only socket addresses: exec:, ssh-*, websocket and http answers are ValidationErrors naming the kind", async () => {
+      const rejected = {
+        "org.example.exec": ["exec:/bin/sh", "exec"],
+        "org.example.sshunix": ["ssh-unix:host:/run/x.sock", "ssh-unix"],
+        "org.example.sshexec": ["ssh-exec:host:rm -rf /", "ssh-exec"],
+        "org.example.ws": ["ws://host/x", "websocket"],
+        "org.example.wss": ["wss://host/x", "websocket"],
+        "org.example.http": ["http://host/x", "http"],
+        "org.example.https": ["https://host/x", "http"],
+      } as const;
+      const accepted = {
+        "org.example.abs": "unix:@abs",
+        "org.example.unix": "unix:/run/x.sock",
+        "org.example.tcp": "tcp:h:1",
+      };
+      const table: Record<string, string> = { ...accepted };
+      for (const [name, [address]] of Object.entries(rejected)) table[name] = address;
+      const spoof = await startResolver(join(dir(), "spoof-resolver"), table);
+      const conn = await connect(spoof.address);
+      try {
+        for (const [name, address] of Object.entries(accepted))
+          assert.equal(await resolverResolve(conn, name), address, name);
+        for (const [name, [, kind]] of Object.entries(rejected))
+          await assert.rejects(resolverResolve(conn, name), (e: unknown) => {
+            assert.ok(e instanceof ValidationError, name);
+            assert.equal(e.parameter, "address");
+            assert.ok(e.message.includes(`kind ${kind}`), e.message);
+            return true;
+          });
+        // resolveInterface passes it on: nothing to connect() to that would spawn.
+        await assert.rejects(
+          resolveInterface("org.example.exec", { directory: join(dir(), "none"), resolver: spoof.address }),
+          ValidationError,
+        );
+      } finally {
+        await conn.close();
+        await spoof.server.shutdown({ graceful: false });
+      }
+    });
   });
 
   describe("resolveInterface", () => {

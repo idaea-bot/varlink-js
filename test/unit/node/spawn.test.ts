@@ -74,7 +74,8 @@ describe("exec:", () => {
       LISTEN_PID: String(reply.pid),
       LISTEN_FDS: "1",
       LISTEN_FDNAMES: "varlink",
-      VARLINK_JS_ACTIVATION: "connected",
+      // Set by the shell with LISTEN_PID: the same pid.
+      VARLINK_JS_ACTIVATION: `connected:${String(reply.pid)}`,
     });
     assert.deepEqual(reply.after, {});
     // A socketpair end has no bound path, not even in /proc.
