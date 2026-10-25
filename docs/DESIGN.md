@@ -59,8 +59,9 @@ Facts from those sources that shape this design:
 - python-varlink certification: `python -m varlink.tests.test_certification --varlink=ADDR` (server) and
   `--client --varlink=ADDR` (client); Test10 exercises `more`, Test11 `oneway`.
 - Node 26.12.1 (this Mac): `JSON.parse` reviver receives `context.source`, and `JSON.rawJSON` exists
-  (verified by running). That gives exact 64-bit integers without a custom JSON parser. Node 22's V8
-  (12.4) should have both too; **verify in the M0 CI matrix**.
+  (verified by running). That gives exact 64-bit integers without a custom JSON parser. Node 22.12.0, the
+  `engines` floor, has both too (M0: `test/unit/runtime-features.test.ts`, compiled, run on v22.12.0; the CI
+  `floor` job repeats it on every push).
 
 ---
 
@@ -212,7 +213,7 @@ What to keep: the transport abstraction idea, typed method descriptors, async-fi
         └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-Rule: `src/core/**` and `src/rpc/**` must not import `node:*` or read `process`/`Deno`/`Bun` globals (lint rule `no-restricted-imports` + `no-restricted-globals`). That is what keeps
+Rule: `src/core/**` and `src/rpc/**` must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
 the browser/Deno/Bun story honest.
 
 ### 4.1 ByteChannel (the transport interface)
@@ -788,8 +789,10 @@ nightly (optional).
   decision (Q1). Nothing is published by the bot.
 - ESM only, `"type": "module"`, `"engines": {"node": ">=22.12"}` (first 22.x with unflagged `require(esm)`,
   so CJS consumers still work), `"sideEffects": false`, zero runtime dependencies for the core and Node adapter.
-  Development needs unflagged type stripping (Node ≥ 22.18 per the release notes; M0 confirms), and CI
-  pins the latest 22.x/24.x/26.x.
+  Development needs unflagged type stripping: Node ≥ 22.18 (confirmed in M0: the v22.18.0 release notes,
+  "Type stripping is enabled by default", nodejs/node#56350; on 23.x/24.x it has been unflagged since 23.6).
+  CI uses the latest 22.x/24.x/26.x (`check-latest`). ESLint 10 itself needs Node ≥ 22.13, so lint never
+  runs on the 22.12 floor; the floor job runs compiled JS only.
 - `exports`:
   ```json
   {
@@ -803,8 +806,8 @@ nightly (optional).
     "./package.json": "./package.json"
   }
   ```
-  `"bin": { "varlink-js": "./dist/cli/main.js" }`, `"files": ["dist", "src", "README.md", "LICENSE"]`
-  (src for source maps).
+  `"bin": { "varlink-js": "./dist/cli/main.js" }`, `"files": ["dist", "src", "!src/**/*.test.ts", "README.md", "LICENSE"]`
+  (src for source maps), `"devEngines": {"runtime": {"name": "node", "version": ">=22.18"}}` (contributors need type stripping).
 - Build: plain `tsc` (`module`/`moduleResolution: nodenext`, `declaration`, `declarationMap`,
   `sourceMap`, `rewriteRelativeImportExtensions`, `erasableSyntaxOnly`, `verbatimModuleSyntax`,
   `isolatedDeclarations`). No bundler, so one module graph and no duplicated classes (F11).
@@ -817,8 +820,17 @@ nightly (optional).
   ```
   Cards that run in parallel own disjoint files. Where a later milestone has to touch an earlier one's
   files (M6 regenerating built-ins, M9), the dependency graph in §10 serialises them.
-- Lint/format: eslint 9 flat config + typescript-eslint (strict-type-checked), prettier pinned exact,
-  `package-lock.json` committed (F12). `no-restricted-imports` of `node:*` under `src/core/**`.
+- Lint/format: ESLint 10 flat config + typescript-eslint (strict-type-checked), prettier pinned exact,
+  `package-lock.json` committed (F12). Layer rule for `src/core/**` and `src/rpc/**` (§4), enforced in M0:
+  a local rule (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve inside
+  `src/core` (core) or `src/core`+`src/rpc` (rpc), so `node:*`, bare built-ins, npm packages, the package's own
+  name and adapter paths are all rejected, including `export … from`, `import()` and `import("x").T`;
+  `no-restricted-globals` (`process`, `Buffer`, `Bun`, `Deno`, `require`, `window`, `document`, …), the same
+  names via `globalThis.*`, no `import.meta`, no aliasing `globalThis`. `tsconfig.core.json` typechecks both
+  layers with `lib: es2024 + dom` and **no `@types/node`**, so `NodeJS.Timeout`, `Buffer` or `.unref()` fail
+  to compile there. `test/tooling/lint-boundaries.test.ts` proves the rules fire. (M0 deviation: the design
+  said ESLint 9, but 9.x is end-of-life and deprecated on npm since ESLint 10; TypeScript is pinned to 6.0.x
+  because typescript-eslint 8 supports `typescript <6.1`, so TS 7 waits for typescript-eslint.)
 - CI (GitHub Actions on the fork): lint + typecheck + tests on Node 22/24/26; Bun and Deno jobs (M10);
   python certification job (M5); systemd interop job (M5); `npm pack` and consumer-fixture import test
   (ESM + `tsc nodenext`). Release workflow on tag, with npm provenance, gated by a manual approval
@@ -852,7 +864,7 @@ M ≈ 1, L ≈ 2–3).
 
 | M | Scope | Owns | Depends | Done when | Size |
 |---|---|---|---|---|---|
-| **M0** | Scaffold: remove old `src/` (history keeps it), tsconfig nodenext, eslint 9, pinned prettier, lockfile, `node --test`, CI Node 22/24/26, `exports` skeleton, consumer-fixture test (ESM import, `require(esm)`, `tsc nodenext`), plus a dist-only smoke job on Node 22.12.0 (compiled tests + fixture; checks `context.source` and `JSON.rawJSON` on the engines floor) | root config, `.github/workflows/ci.yml`, `test/fixtures/consumer/` | — | CI green on an empty skeleton; fixture imports every subpath | S |
+| **M0** | Scaffold: remove old `src/` (history keeps it), tsconfig nodenext, ESLint 10 (§8), pinned prettier, lockfile, `node --test`, CI Node 22/24/26, `exports` skeleton, consumer-fixture test (ESM import, `require(esm)`, `tsc nodenext`), plus a dist-only smoke job on Node 22.12.0 (compiled tests + fixture; checks `context.source` and `JSON.rawJSON` on the engines floor) | root config, `.github/workflows/ci.yml`, `test/fixtures/consumer/` | — | CI green on an empty skeleton; fixture imports every subpath | S |
 | **M1** | IDL: lexer, parser (positions, doc and field comments, systemd annotations), AST, semantic validation, canonical formatter, corpus + golden + property tests | `src/core/idl/`, `test/unit/idl/`, `test/corpus/` | M0 | Whole corpus round-trips; fuzz finds no non-`IdlSyntaxError` throws | M |
 | **M2** | Types: AST → compiled validators with dotted error paths, `ints` policy, JSON codec, method/interface descriptor types (what codegen will emit), error classes and registry | `src/core/types/`, `src/core/errors/` | M1 | Validator and codec tables pass; property tests pass | M |
 | **M3** | Protocol: framer, message encode/decode (UAPI header rules), ClientSession/ServerSession (sans-IO), dispatch table §5.4, streaming handler contract, in-memory `pair()` + `faulty()` | `src/core/protocol/`, `src/testing/` | M2 | Session-level tests (scripted messages, no I/O) for F2, F5, F6, F7, F15, F17; the same regressions run end-to-end over `pair()` and real sockets in M4 | L |

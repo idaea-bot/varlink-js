@@ -1,0 +1,11 @@
+{
+  "//": "Typechecks src/core and src/rpc against portable types only: ES2024 + Web APIs, no @types/node (DESIGN.md \u00a74). Node's typings would let NodeJS.Timeout, Buffer or .unref() slip in.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["es2024", "dom"],
+    "types": [],
+    "noEmit": true
+  },
+  "include": ["src/core", "src/rpc"],
+  "exclude": []
+}

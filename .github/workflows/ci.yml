@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          check-latest: true
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+          cache: npm
+      - run: node --version && npm --version
+      - run: npm ci
+      - run: npm test
+      # `npm pack` runs `prepack` (the dist build); the fixture installs the tarball outside the repo.
+      - run: mkdir -p pkg && npm pack --pack-destination pkg
+      - run: node test/fixtures/consumer/run.js --tarball pkg/varlink-js-*.tgz
+      - name: Compile tests for the Node 22.12.0 floor job
+        if: matrix.node == 24
+        run: npm run build:test
+      - if: matrix.node == 24
+        uses: actions/upload-artifact@v7
+        with:
+          name: floor-inputs
+          path: |
+            pkg/*.tgz
+            build/
+          if-no-files-found: error
+          retention-days: 7
+
+  floor:
+    name: Dist-only smoke (Node 22.12.0, engines floor)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+      - run: test "$(node --version)" = v22.12.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: floor-inputs
+      # No npm ci and no TypeScript here: compiled tests and the packed tarball only.
+      - name: Compiled unit tests (JSON.parse context.source, JSON.rawJSON, exports)
+        # Explicit paths, not a glob: a glob that matches nothing would pass with zero tests.
+        run: node --test build/test/unit/runtime-features.test.js build/test/unit/exports.test.js
+      - name: Consumer fixture (ESM import + require(esm) of every subpath, bin)
+        run: node test/fixtures/consumer/run.js --tarball pkg/varlink-js-*.tgz --no-tsc

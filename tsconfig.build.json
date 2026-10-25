@@ -1,0 +1,11 @@
+{
+  "//": "Published build: src/ -> dist/ (ESM, .d.ts, declaration and source maps).",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "noEmit": false
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
