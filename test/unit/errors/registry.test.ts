@@ -86,6 +86,18 @@ describe("ErrorRegistry", () => {
       assert.throws(() => registry.register(errorClass(name)), TypeError, name);
     }
     assert.throws(() => registry.register(errorClass(42 as unknown as string)), TypeError);
+    // Formatting the message must not throw a different error for a bigint or symbol name.
+    class BigName extends VarlinkError {
+      static readonly errorName = 5n as unknown as string;
+    }
+    assert.throws(() => registry.register(BigName as unknown as ErrorClass), {
+      name: "TypeError",
+      message: "invalid varlink error name: 5",
+    });
+    assert.throws(() => registry.register(errorClass(Symbol("s") as unknown as string)), {
+      name: "TypeError",
+      message: "invalid varlink error name: Symbol(s)",
+    });
     assert.equal(registry.has(""), false);
   });
 

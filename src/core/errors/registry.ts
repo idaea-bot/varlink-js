@@ -19,6 +19,12 @@ function isErrorName(name: unknown): name is string {
   return dot > 0 && isInterfaceName(name.slice(0, dot)) && isMemberName(name.slice(dot + 1));
 }
 
+/** A value for error messages; never throws (bigint, symbol). */
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  return typeof value === "symbol" ? value.toString() : String(value);
+}
+
 /** Error classes by fully qualified varlink error name. */
 export class ErrorRegistry {
   readonly #classes = new Map<string, ErrorClass>();
@@ -32,7 +38,7 @@ export class ErrorRegistry {
   register(...classes: ErrorClass[]): this {
     for (const cls of classes) {
       const name = cls.errorName;
-      if (!isErrorName(name)) throw new TypeError(`invalid varlink error name: ${JSON.stringify(name)}`);
+      if (!isErrorName(name)) throw new TypeError(`invalid varlink error name: ${formatValue(name)}`);
       const existing = this.#classes.get(name);
       if (existing === cls) continue;
       if (existing !== undefined) throw new TypeError(`error ${name} is already registered to another class`);

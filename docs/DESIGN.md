@@ -297,7 +297,8 @@ export interface Codec {
 The default codec is `JSON.parse` / `JSON.stringify` with two small additions:
 
 - **Decode is lossless and type-agnostic.** The reviver checks `context.source` (verified on Node 26): an
-  integer literal (`/^-?\d+$/`) that is not a safe integer becomes a `bigint`. Everything else, including
+  integer literal (`/^-?\d+$/`) that is not a safe integer becomes a `bigint` (integer literals of at most 1024
+  characters; longer ones become `Infinity`, §4.9). Everything else, including
   floats like `1e300` and `1.5`, stays a `number`.
 - **Encode** uses a replacer that throws on non-finite numbers (plain `JSON.stringify` would silently write
   `null`) and emits `bigint` with `JSON.rawJSON`.
@@ -323,7 +324,8 @@ recover the digits or tell `1e300` from a 301-digit integer. Rules there: an `in
 that is not a safe integer is rejected (as in `"number"` mode); `float` fields are unaffected; values
 inside `object`/`any` and untyped calls are plain (possibly rounded) `number`s, and this is documented.
 `"bigint"` mode refuses to start with a clear error (it requires a codec whose `losslessInts` is true:
-`context.source` plus `JSON.rawJSON`). With `context.source` (Node, verified), nothing is ever rounded.
+`context.source` plus `JSON.rawJSON`). With `context.source` (Node, verified), nothing is ever rounded
+(integer literals of at most 1024 characters; longer ones become `Infinity`, §4.9).
 
 The codec is pluggable, so a faster or streaming JSON parser can be swapped in. Nothing else in core
 parses or serializes messages (error messages may use `JSON.stringify` to quote names).
@@ -456,10 +458,18 @@ line/column) so ASTs can also be built by hand, and `validateInterface` checks t
 `src/core/types/` (codec, validators, descriptor types) and `src/core/errors/`, both re-exported by the root entry.
 - **Codec**: `createJsonCodec({sourceText?})` / `jsonCodec` as in §4.3. Features are detected when the codec is
   created; `losslessInts` = `context.source` && `JSON.rawJSON`; `sourceText: false` forces plain `JSON.parse`. Any
-  `JSON.parse` failure is a `ProtocolError` with `cause`; encode throws `TypeError` (also for too deep values).
-  Limits: integer literals of at most 1024 characters become bigint (longer ones stay `Infinity`, an `int-range`
-  in `int` slots), and more than 2048 `[`/`{` levels (sd-json `DEPTH_MAX`) is a `ProtocolError` in both modes.
-  bigints are written from the holder, so a `BigInt.prototype.toJSON` polyfill is ignored; a float `-0` stays `-0`.
+  `JSON.parse` failure is a `ProtocolError` with `cause`, and a non-string argument a `TypeError` (caller
+  bug); encode throws `TypeError` (also for too deep values; an engine `RangeError` becomes a `TypeError` with
+  `cause`). Limits: integer literals of at most 1024 characters become bigint (longer ones stay `Infinity`, an
+  `int-range` in `int` slots), and more than 2048 `[`/`{` levels (sd-json `DEPTH_MAX`) is a `ProtocolError` on
+  decode in both modes and a `TypeError` on encode (peers refuse it). bigints are written from the holder (read
+  via its own data property, so a getter runs once), so a `BigInt.prototype.toJSON` polyfill is ignored; a float
+  `-0` stays `-0`. Encode escapes U+007F as `\u007f` (sd-json refuses it raw). Encoding a huge sparse array is
+  O(length), like `JSON.stringify`.
+- **sd-json string rules**: systemd refuses strings containing NUL (`\u0000`); v1 allows them (valid JSON and
+  Unicode; UAPI has no rule). `string` slots reject strings that are not well-formed UTF-16 (a lone surrogate has
+  no UTF-8 encoding, and UAPI messages are UTF-8) in both directions (`type`); `object`/`any` content is not
+  checked for lone surrogates (sd-json refuses them).
 - **Validators**: `compileInterface(ast, {ints, lenientInts, codec})` (runs `validateInterface` first; `"bigint"`
   needs `codec.losslessInts`) gives per method `input`/`output`, per error and per `type` a `Validator` with
   `decode(v, {unknownFields})` (from the peer: servers `reject` unknown struct fields, clients `drop` them in
@@ -471,11 +481,15 @@ line/column) so ASTs can also be built by hand, and `validateInterface` checks t
 - **Per type**: `int` takes a safe-integer `number` (so `1.0`/`1e3` from JSON are 1/1000, as in sd-json; `-0` →
   0) or a `bigint` in −2⁶³…2⁶⁴−1. A non-integer is `type`; an unsafe `number` (e.g. `1e18`, or a rounded value
   without `context.source`) is `int-range` in **both** modes, as is an out-of-range bigint (`IntegerRangeError`).
-  Decode outputs `number` (`"number"`; an unsafe bigint is `int-range`) or `bigint` (`"bigint"`); encode returns
-  the value as given. `lenientInts` lets decode accept `/^-?(0|[1-9][0-9]*)$/` strings. `float`: finite
-  number, or bigint (→ number on decode). `object`: a plain object (prototype `Object.prototype` or `null`),
-  returned by reference. `any`: anything but `null`/`undefined` on decode; on encode a boolean, finite number,
-  bigint, string, array or plain object. Structs are plain objects; a field is present iff it is an own
+  Decode outputs `number` (`"number"`; an unsafe bigint is `int-range`) or `bigint` (`"bigint"`). Encode outputs a
+  `number` as is (`-0` → 0); a bigint stays a bigint in `"bigint"` mode, while in `"number"` mode a safe one
+  becomes a `number` and an unsafe one is passed through (written exactly with `JSON.rawJSON`; the codec throws
+  without it). `lenientInts` lets decode accept `/^-?(0|[1-9][0-9]*)$/` strings. `float`: finite number, or a
+  bigint whose `Number()` is finite (→ number on decode, as given on encode). `object`: a plain object (prototype
+  `Object.prototype` or `null`), returned by reference; objects from another realm (`vm`, iframes) are not plain
+  objects and are rejected (`type`). `any`: anything but `null`/`undefined`/a non-finite number on decode (a
+  top-level `Infinity` from `1e400` or a too long literal could not be sent back; nested content is not
+  inspected); on encode a boolean, finite number, bigint, string, array or plain object. Structs are plain objects; a field is present iff it is an own
   enumerable key (inherited `toString` etc. are never read). **Absent ≡ null ≡ undefined for `?T` fields, and the
   output omits them**; in arrays and maps a `?T` null stays `null` (array holes encode as `null`; `undefined` map
   values are skipped on encode, like `JSON.stringify`). `?[]T`/`?[string]T`: `[]`/`{}` are values, not null. Map
@@ -497,8 +511,10 @@ line/column) so ASTs can also be built by hand, and `validateInterface` checks t
   `errorName` and `is()`.
   `ErrorRegistry.register` checks `errorName` is `interface.Name`, ignores re-registering the same class and throws
   `TypeError` for a different class under a taken name; `create(name, params)` builds the registered class or a
-  plain `VarlinkError`, without validating params (M4 validates error parameters with the compiled error
-  validators first). `createErrorRegistry()` is pre-filled with the 8 classes above.
+  plain `VarlinkError`, without validating params. `createErrorRegistry()` is pre-filled with the 8 classes
+  above. `X.is(e)` and `create` match by name only and don't validate parameters, so M4 MUST validate error
+  parameters with the compiled error validators (including `org.varlink.service` errors, using a compiled
+  `org.varlink.service` IDL) before `create`, and fall back to a plain `VarlinkError` when they don't validate.
 - **Local errors** (`VarlinkLocalError`, own brand, `isVarlinkLocalError`, `localName`): `ConnectionClosedError`
   (`io.systemd.Disconnected`), `CallTimeoutError` (`io.systemd.TimedOut`), `ProtocolError` and
   `MessageTooLargeError` (`io.systemd.Protocol`), `UpgradePendingError` (`varlink-js.UpgradePending`),
@@ -727,7 +743,8 @@ connection and reports it to `onError`.
 `varlink-js codegen io.systemd.Hostname.varlink -o src/gen/` (also a programmatic `generate()` API).
 One `.ts` file per interface:
 
-- `type` structs → `interface`; fields `?T` → `field?: T | null`; enums → string literal unions plus
+- `type` structs and error parameters → `type` aliases, not `interface` (TS interfaces are not assignable to
+  index signatures such as `JsonValue` or `VarlinkError<P extends Record<string, unknown>>`); fields `?T` → `field?: T | null`; enums → string literal unions plus
   `const …Values = [...] as const`; `[]T` → `T[]`; `[string]T` → `Record<string, T>`; `[string]()` →
   `Record<string, Record<string, never>>` (string set); `object` → `Record<string, unknown>`;
   `any` → `JsonValue` (non-null; includes `bigint`, §4.3); `int` → `number` or `bigint` per `--ints number|bigint`

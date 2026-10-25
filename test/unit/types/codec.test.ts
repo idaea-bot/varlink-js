@@ -79,6 +79,15 @@ describe("decode errors are ProtocolError", () => {
       }
     });
 
+    test(`a non-string argument is a TypeError (losslessInts ${String(codec.losslessInts)})`, () => {
+      for (const arg of [123, undefined, new Uint8Array([0x31])]) {
+        assert.throws(() => codec.decode(arg as unknown as string), {
+          name: "TypeError",
+          message: "decode expects a string",
+        });
+      }
+    });
+
     test(`deep nesting (losslessInts ${String(codec.losslessInts)})`, () => {
       const isProtocol = (e: unknown): boolean => e instanceof ProtocolError && e.constructor === ProtocolError;
       assert.throws(() => codec.decode("[".repeat(1_000_000)), isProtocol);
@@ -232,8 +241,53 @@ describe("encode", () => {
     for (let i = 0; i < 1_000_000; i++) deep = [deep];
     assert.throws(
       () => jsonCodec.encode(deep),
-      (e: unknown) => e instanceof TypeError && e.cause instanceof RangeError && /too deeply/.test(e.message),
+      (e: unknown) =>
+        e instanceof TypeError &&
+        e.cause instanceof RangeError &&
+        e.message === `cannot encode value: ${e.cause.message}`,
     );
+  });
+
+  test(`at most ${String(MAX_JSON_DEPTH)} levels encode; one more is a TypeError (peers refuse it)`, () => {
+    const nest = (n: number, wrap: (v: unknown) => unknown): unknown => {
+      let v: unknown = 1;
+      for (let i = 0; i < n; i++) v = wrap(v);
+      return v;
+    };
+    const message = `value nested deeper than ${String(MAX_JSON_DEPTH)} levels cannot be sent (peers refuse it)`;
+    for (const wrap of [(v: unknown) => ({ a: v }), (v: unknown) => [v]]) {
+      for (const codec of [withSource, noSource]) {
+        const text = codec.encode(nest(MAX_JSON_DEPTH, wrap));
+        assert.equal(text, codec.encode(codec.decode(text)));
+        assert.throws(() => codec.encode(nest(MAX_JSON_DEPTH + 1, wrap)), { name: "TypeError", message });
+      }
+    }
+    // Brackets inside strings do not count.
+    assert.ok(jsonCodec.encode({ s: "[{".repeat(5 * MAX_JSON_DEPTH) }));
+  });
+
+  test("U+007F is escaped (sd-json refuses it raw); the value round-trips", () => {
+    for (const codec of [withSource, noSource]) {
+      const value = { s: "a\x7fb", "k\x7f": ["\x7f"] };
+      const text = codec.encode(value);
+      assert.equal(text.includes("\x7f"), false);
+      assert.equal(text, '{"s":"a\\u007fb","k\\u007f":["\\u007f"]}');
+      assert.deepEqual(codec.decode(text), value);
+    }
+  });
+
+  test("a getter runs once per encode; a getter returning a bigint encodes exactly", () => {
+    let calls = 0;
+    const value = {
+      get n() {
+        calls++;
+        return 2n ** 64n - 1n;
+      },
+    };
+    assert.equal(jsonCodec.encode(value), '{"n":18446744073709551615}');
+    assert.equal(calls, 1);
+    assert.equal(jsonCodec.encode([value, value]), '[{"n":18446744073709551615},{"n":18446744073709551615}]');
+    assert.equal(calls, 3);
   });
 
   test("NaN and ±Infinity throw TypeError, also nested", () => {

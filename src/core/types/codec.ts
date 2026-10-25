@@ -5,9 +5,12 @@ import { OperationNotSupportedError, ProtocolError } from "../errors/local.ts";
 
 /** Converts between message text and JS values. */
 export interface Codec {
-  /** @throws {ProtocolError} on invalid JSON or nesting deeper than the codec allows. */
+  /**
+   * @throws {ProtocolError} on invalid JSON or nesting deeper than the codec allows.
+   * @throws {TypeError} if `text` is not a string.
+   */
   decode(text: string): unknown;
-  /** @throws {TypeError} on NaN/±Infinity, a bigint it cannot write exactly, cycles, too deep nesting, or a non-JSON top level. */
+  /** @throws {TypeError} on NaN/±Infinity, a bigint it cannot write exactly, cycles, nesting deeper than MAX_JSON_DEPTH, or a non-JSON top level. */
   encode(value: unknown): string;
   /** True when decode never rounds integers and encode can write bigint. Required by `ints: "bigint"`. */
   readonly losslessInts: boolean;
@@ -80,7 +83,7 @@ const CLOSE_BRACKET = 0x5d;
 const OPEN_BRACE = 0x7b;
 const CLOSE_BRACE = 0x7d;
 
-/** Deepest `[`/`{` nesting outside strings. Runs before JSON.parse, so the text may not be valid JSON. */
+/** Deepest `[`/`{` nesting outside strings. Decode runs it before JSON.parse, so the text may not be valid JSON. */
 function nestingDepth(text: string): number {
   let depth = 0;
   let max = 0;
@@ -113,7 +116,9 @@ export function createJsonCodec(options?: JsonCodecOptions): Codec {
   const replacer: Replacer = function (key, value) {
     // Read the holder: toJSON runs before the replacer, and a BigInt.prototype.toJSON polyfill must not turn
     // bigints into strings or rounded numbers.
-    const raw = (this as Record<string, unknown>)[key];
+    // Use the descriptor so a getter is not invoked a second time; for accessors `value` is its result.
+    const desc = Object.getOwnPropertyDescriptor(this, key);
+    const raw: unknown = desc !== undefined && "value" in desc ? desc.value : value;
     const big = typeof raw === "bigint" ? raw : typeof value === "bigint" ? value : undefined;
     if (big !== undefined) {
       if (rawJSON === undefined) throw new TypeError("bigint cannot be encoded: this runtime lacks JSON.rawJSON");
@@ -129,6 +134,8 @@ export function createJsonCodec(options?: JsonCodecOptions): Codec {
   return {
     losslessInts: useSource && rawJSON !== undefined,
     decode(text: string): unknown {
+      // Untyped callers may pass anything; a non-string is a caller bug, not the peer's.
+      if (typeof text !== "string") throw new TypeError("decode expects a string");
       // A text of at most 2 * MAX_JSON_DEPTH characters cannot nest deeper than that.
       if (text.length > 2 * MAX_JSON_DEPTH && nestingDepth(text) > MAX_JSON_DEPTH)
         throw new ProtocolError(`JSON nested deeper than ${String(MAX_JSON_DEPTH)} levels`);
@@ -143,12 +150,18 @@ export function createJsonCodec(options?: JsonCodecOptions): Codec {
       try {
         text = json.stringify(value, replacer);
       } catch (e) {
-        if (e instanceof RangeError)
-          throw new TypeError("value too deeply nested or too large to encode", { cause: e });
+        if (e instanceof RangeError) throw new TypeError(`cannot encode value: ${e.message}`, { cause: e });
         throw e;
       }
       if (text === undefined) throw new TypeError(`a top-level ${typeof value} cannot be encoded as JSON`);
-      return text;
+      // Same bound as decode: peers (sd-json DEPTH_MAX) refuse deeper messages.
+      if (text.length > 2 * MAX_JSON_DEPTH && nestingDepth(text) > MAX_JSON_DEPTH)
+        throw new TypeError(
+          `value nested deeper than ${String(MAX_JSON_DEPTH)} levels cannot be sent (peers refuse it)`,
+        );
+      // sd-json refuses a raw U+007F in strings and JSON.stringify leaves it unescaped. It can only occur inside
+      // strings, so escaping it is lossless.
+      return text.replaceAll("\x7f", "\\u007f");
     },
   };
 }

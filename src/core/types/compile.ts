@@ -95,6 +95,12 @@ function describe(value: unknown): string {
   return typeof value;
 }
 
+/** An option value for error messages; never throws (bigint, symbol). */
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  return typeof value === "symbol" ? value.toString() : String(value);
+}
+
 // JSON.isRawJSON is newer than lib es2024.
 const isRawJSONFn: unknown = (JSON as { isRawJSON?: unknown }).isRawJSON;
 const isRawJSON: (value: unknown) => boolean =
@@ -157,16 +163,20 @@ class Compiler {
       case "bool":
         return (v, ctx) => (typeof v === "boolean" ? v : wrongType(ctx, type, v));
       case "string":
-        return (v, ctx) => (typeof v === "string" ? v : wrongType(ctx, type, v));
+        return (v, ctx) => {
+          if (typeof v !== "string") return wrongType(ctx, type, v);
+          // UAPI messages are UTF-8, which cannot encode a lone surrogate (sd-json refuses them).
+          if (!v.isWellFormed()) fail(ctx, "type", "string is not valid Unicode (lone surrogate)");
+          return v;
+        };
       case "int":
         return this.intCheck(type);
       case "float":
         return (v, ctx) => {
           if (typeof v === "number" && Number.isFinite(v)) return v;
           if (typeof v === "bigint") {
-            if (ctx.dir === "encode") return v;
             const n = Number(v);
-            if (Number.isFinite(n)) return n;
+            if (Number.isFinite(n)) return ctx.dir === "encode" ? v : n;
           }
           return wrongType(ctx, type, v);
         };
@@ -175,7 +185,13 @@ class Compiler {
       case "any":
         return (v, ctx) => {
           if (v === undefined) return wrongType(ctx, type, v);
-          if (ctx.dir !== "encode") return v === null || isRawJSON(v) ? wrongType(ctx, type, v) : v;
+          if (ctx.dir !== "encode") {
+            // A top-level Infinity (1e400, or an integer literal too long for the codec) could not be sent back.
+            // Nested content is not inspected.
+            if (v === null || isRawJSON(v) || (typeof v === "number" && !Number.isFinite(v)))
+              return wrongType(ctx, type, v);
+            return v;
+          }
           if (
             typeof v === "boolean" ||
             typeof v === "string" ||
@@ -297,8 +313,10 @@ class Compiler {
       }
       if (typeof value === "bigint") {
         if (value < INT_MIN || value > INT_MAX) fail(ctx, "int-range", "integer out of the range -2^63…2^64-1");
-        if (bigintMode || ctx.dir === "encode") return value;
+        if (bigintMode) return value;
         const n = Number(value);
+        // An unsafe bigint is still sent as given: the codec writes it exactly (or throws without JSON.rawJSON).
+        if (ctx.dir === "encode") return Number.isSafeInteger(n) ? n : value;
         if (!Number.isSafeInteger(n))
           fail(ctx, "int-range", 'integer beyond ±(2^53-1) (use ints: "bigint" for the full range)');
         return n;
@@ -331,7 +349,7 @@ export function compileInterface(iface: Interface, options?: CompileOptions): Co
   if (first) throw first;
   const ints = options?.ints ?? "number";
   // Untyped callers may pass anything.
-  if (!INTS_MODES.has(ints)) throw new TypeError(`invalid ints mode: ${JSON.stringify(ints)}`);
+  if (!INTS_MODES.has(ints)) throw new TypeError(`invalid ints mode: ${formatValue(ints)}`);
   if (ints === "bigint" && !(options?.codec ?? jsonCodec).losslessInts)
     throw new OperationNotSupportedError("bigint mode needs JSON.parse context.source and JSON.rawJSON");
 

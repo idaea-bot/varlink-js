@@ -124,10 +124,21 @@ describe("primitives", () => {
     checkRows([
       { type: "string", input: "", expect: ok("") },
       { type: "string", input: "x\u0000y", expect: ok("x\u0000y") },
+      { type: "string", input: "\u{1F600}", expect: ok("\u{1F600}") },
+      // Lone surrogates have no UTF-8 encoding: refused in both directions.
+      ...["\uD800", "a\uDFFFb", "\uDE00\uD83D", "x\uD83D"].map((input): Row => ({
+        type: "string",
+        input,
+        expect: err("type"),
+      })),
       { type: "string", input: 1, expect: err("type") },
       { type: "string", input: ["a"], expect: err("type") },
       { type: "string", input: null, expect: err("null") },
     ]);
+    for (const dir of DIRS) {
+      const e = validationError(() => run(wrapper("[]string"), dir, { v: ["ok", "\uD800"] }));
+      assert.equal(e.message, 'invalid parameter "v.1": string is not valid Unicode (lone surrogate)');
+    }
   });
 
   test("int, number mode", () => {
@@ -145,8 +156,11 @@ describe("primitives", () => {
       { type: "int", input: -Infinity, expect: err("int-range") },
       { type: "int", ints: "bigint", input: Infinity, expect: err("int-range") },
       { type: "int", input: 5n, dirs: DECODE, expect: ok(5) },
-      { type: "int", input: 5n, dirs: ENCODE, expect: ok(5n) },
+      // Encode: a safe bigint becomes a number, an unsafe one is passed through (the codec writes it exactly).
+      { type: "int", input: 5n, dirs: ENCODE, expect: ok(5) },
+      { type: "int", input: -(2n ** 53n - 1n), dirs: ENCODE, expect: ok(-(2 ** 53 - 1)) },
       { type: "int", input: 2n ** 53n, dirs: DECODE, expect: err("int-range") },
+      { type: "int", input: 2n ** 53n, dirs: ENCODE, expect: ok(2n ** 53n) },
       { type: "int", input: 2n ** 64n - 1n, dirs: ENCODE, expect: ok(2n ** 64n - 1n) },
       { type: "int", input: 2n ** 64n, expect: err("int-range") },
       { type: "int", input: -(2n ** 63n) - 1n, expect: err("int-range") },
@@ -161,6 +175,7 @@ describe("primitives", () => {
       { type: "int", ints: "bigint", input: 1, dirs: DECODE, expect: ok(1n) },
       { type: "int", ints: "bigint", input: 1, dirs: ENCODE, expect: ok(1) },
       { type: "int", ints: "bigint", input: -0, dirs: DECODE, expect: ok(0n) },
+      { type: "int", ints: "bigint", input: 5n, expect: ok(5n) },
       { type: "int", ints: "bigint", input: 2n ** 64n - 1n, expect: ok(2n ** 64n - 1n) },
       { type: "int", ints: "bigint", input: -(2n ** 63n), expect: ok(-(2n ** 63n)) },
       { type: "int", ints: "bigint", input: 2n ** 64n, expect: err("int-range") },
@@ -197,7 +212,10 @@ describe("primitives", () => {
       { type: "float", input: 1e300, expect: ok(1e300) },
       { type: "float", input: 2n ** 64n, dirs: DECODE, expect: ok(2 ** 64) },
       { type: "float", input: 2n ** 64n, dirs: ENCODE, expect: ok(2n ** 64n) },
-      { type: "float", input: 10n ** 400n, dirs: DECODE, expect: err("type") },
+      // Number() of it is Infinity: refused both ways (encode could not write it as a float either).
+      { type: "float", input: 10n ** 400n, expect: err("type") },
+      { type: "float", input: -(10n ** 400n), expect: err("type") },
+      { type: "float", input: 10n ** 300n, dirs: ENCODE, expect: ok(10n ** 300n) },
       { type: "float", input: Infinity, expect: err("type") },
       { type: "float", input: -Infinity, expect: err("type") },
       { type: "float", input: NaN, expect: err("type") },
@@ -257,8 +275,11 @@ describe("primitives", () => {
         expect: ok(input),
       })),
       { type: "any", input: null, expect: err("null") },
-      { type: "any", input: NaN, dirs: ENCODE, expect: err("type") },
-      { type: "any", input: Infinity, dirs: ENCODE, expect: err("type") },
+      { type: "any", input: NaN, expect: err("type") },
+      // A top-level Infinity (1e400, a too long literal) could not be sent back; nested content is not inspected.
+      { type: "any", input: Infinity, expect: err("type") },
+      { type: "any", input: -Infinity, expect: err("type") },
+      { type: "any", input: [Infinity], dirs: DECODE, expect: ok([Infinity]) },
       { type: "any", input: () => 0, dirs: ENCODE, expect: err("type") },
       { type: "any", input: Symbol("s"), dirs: ENCODE, expect: err("type") },
       { type: "any", input: new Date(0), dirs: ENCODE, expect: err("type") },
@@ -588,7 +609,19 @@ describe("compileInterface", () => {
       OperationNotSupportedError,
     );
     assert.equal(compileInterfaceText(DEFS, { codec: createJsonCodec({ sourceText: false }) }).ints, "number");
-    assert.throws(() => compileInterfaceText(DEFS, { ints: "float" as IntsMode }), TypeError);
+    assert.throws(() => compileInterfaceText(DEFS, { ints: "float" as IntsMode }), {
+      name: "TypeError",
+      message: 'invalid ints mode: "float"',
+    });
+    // Formatting the message must not throw a different error for a bigint or symbol.
+    assert.throws(() => compileInterfaceText(DEFS, { ints: 1n as unknown as IntsMode }), {
+      name: "TypeError",
+      message: "invalid ints mode: 1",
+    });
+    assert.throws(() => compileInterfaceText(DEFS, { ints: Symbol() as unknown as IntsMode }), {
+      name: "TypeError",
+      message: "invalid ints mode: Symbol()",
+    });
   });
 });
 
