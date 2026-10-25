@@ -213,7 +213,7 @@ What to keep: the transport abstraction idea, typed method descriptors, async-fi
         └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-Rule: `src/core/**` and `src/rpc/**` (and the browser-facing `src/index.ts`, `src/idl`, `src/websocket`, `src/http`) must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
+Rule: `src/core/**` and `src/rpc/**` (and the browser-facing `src/index.ts`, `src/idl`, `src/websocket`, `src/http`, plus the generated `src/interfaces`, which rpc may import for its built-in `org.varlink.service`) must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
 the browser/Deno/Bun story honest.
 
 ### 4.1 ByteChannel (the transport interface)
@@ -823,7 +823,7 @@ nightly (optional).
 - Lint/format: ESLint 10 flat config + typescript-eslint (strict-type-checked), prettier pinned exact,
   `package-lock.json` committed (F12). Layer rule (§4), enforced in M0 for `src/core`, `src/rpc` and the
   browser-facing subpaths (`src/index.ts`, `src/idl`, `src/websocket`, `src/http`, plus M6's generated
-  `src/interfaces`): a local rule (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve
+  `src/interfaces`, which is not a subpath): a local rule (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve
   inside the layer's allowed directories (core → core; rpc, the root entry and interfaces → core+rpc+interfaces;
   idl → core+idl; websocket/http → core+rpc+self),
   so `node:*`, bare built-ins, npm packages, the package's own name and adapter paths are all rejected,
