@@ -11,14 +11,19 @@ import { formatInterface, parseInterface } from "../../src/idl/index.ts";
 import { VarlinkError } from "../../src/index.ts";
 import { connect, listen } from "../../src/node/index.ts";
 import { createServer, type Server } from "../../src/rpc/index.ts";
+import { createCertificationServer } from "../../examples/certification/certification.ts";
 import { gate, ROOT, tempDir } from "./helpers.ts";
 
 const ENABLED = process.env["VARLINK_VARLINKCTL"] === "1";
 const I = "org.example.interop";
 const IDL_URL = new URL("org.example.interop.varlink", import.meta.url);
 const MULTIPLEXER = "/run/systemd/userdb/io.systemd.Multiplexer";
+const REQUIRE_MULTIPLEXER = process.env["VARLINK_REQUIRE_MULTIPLEXER"] === "1";
 const GET_USER_RECORD = "io.systemd.UserDatabase.GetUserRecord";
-/** systemd 255 rejects these (`[string]()`), ours and the originals alike: test/corpus/VARLINKCTL.md. */
+/**
+ * systemd 255 rejects these (`[string]()`), ours and the originals alike (test/corpus/VARLINKCTL.md); a newer
+ * systemd may accept them, and then the re-prints are compared like the rest.
+ */
 const SYSTEMD_255_REJECTS = new Set([
   "python-varlink/org.varlink.certification.varlink",
   "rust-varlink/varlink-certification__org.varlink.certification.varlink",
@@ -242,7 +247,12 @@ describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linu
     if (gate(t, missing) !== null) return;
     const r = await varlinkctl(t, "call", socketPath, `${I}.Nope`, "{}");
     assert.notEqual(r.code, 0);
-    assert.match(r.stdout + r.stderr, /org\.varlink\.service\.MethodNotFound/);
+    // systemd 255 prints the error name; newer varlinkctl (259 on ubuntu-latest) maps the well-known
+    // org.varlink.service errors to an errno (MethodNotFound → ENXIO) and prints the parameters on stdout.
+    if (!/org\.varlink\.service\.MethodNotFound/.test(r.stdout + r.stderr)) {
+      assert.match(r.stderr, /No such device or address/);
+      assert.deepEqual(jsonLines(r.stdout), [{ method: `${I}.Nope` }]);
+    }
   });
 
   describe("validate-idl: systemd's re-print of the original equals that of formatInterface(parseInterface(x))", () => {
@@ -251,24 +261,49 @@ describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linu
       (await readdir(corpus, { recursive: true }))
         .filter((f) => f.endsWith(".varlink"))
         .map((f) => join(corpus, f))
-        .filter((f) => !SYSTEMD_255_REJECTS.has(relative(corpus, f)))
         .toSorted();
 
     test("corpus and the interop interface", async (t) => {
       if (gate(t, missing) !== null) return;
       const all = [...(await files()), new URL(IDL_URL).pathname];
-      assert.ok(all.length >= 24, `expected the corpus, found ${String(all.length)} files`);
+      assert.ok(all.length >= 27, `expected the corpus, found ${String(all.length)} files`);
       for (const file of all) {
         await t.test(relative(ROOT, file), async (st) => {
           const text = await readFile(file, "utf8");
           const original = await varlinkctl(st, "validate-idl", file);
-          assert.equal(original.code, 0, "systemd accepts the original");
           const ours = await reprint(st, formatInterface(parseInterface(text)), "formatted.varlink");
+          if (original.code !== 0) {
+            // Only the files systemd 255 rejects (`[string]()`) may be rejected, and then ours must be too.
+            assert.ok(SYSTEMD_255_REJECTS.has(relative(corpus, file)), "systemd accepts the original");
+            assert.notEqual(ours.code, 0, "systemd rejects our formatting like the original");
+            st.diagnostic("rejected by this systemd, original and ours alike (test/corpus/VARLINKCTL.md)");
+            return;
+          }
           assert.equal(ours.code, 0, "systemd accepts our formatting");
           assert.equal(ours.stdout, original.stdout);
         });
       }
     });
+  });
+
+  test("introspect and call our certification server", async (t) => {
+    if (gate(t, missing) !== null) return;
+    const { server: cert } = await createCertificationServer({ onError: () => undefined });
+    const tmp = await tempDir();
+    try {
+      const path = join(tmp.dir, "cert.sock");
+      cert.serve(await listen(`unix:${path}`));
+      const accepted = (await varlinkctl(t, "validate-idl", join(ROOT, "interfaces/org.varlink.certification.varlink")))
+        .code;
+      const r = await varlinkctl(t, "introspect", path, "org.varlink.certification");
+      if (accepted === 0) assert.equal(r.code, 0, "introspect works when systemd accepts the IDL");
+      else t.diagnostic("this systemd rejects the certification IDL ([string]()), so introspect fails as expected");
+      const [started] = jsonLines(await ok(t, "--json=short", "call", path, "org.varlink.certification.Start", "{}"));
+      assert.match(String((started as Record<string, unknown>)["client_id"]), /^[0-9a-f]{32}$/);
+    } finally {
+      await cert.shutdown({ graceful: false });
+      await tmp.remove();
+    }
   });
 
   describe("userdb Multiplexer", () => {
@@ -284,6 +319,8 @@ describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linu
     test("GetUserRecord with more: all records, root among them", async (t) => {
       if (gate(t, missing) !== null) return;
       if (socketMissing !== null) {
+        // The CI job starts systemd-userdbd and sets VARLINK_REQUIRE_MULTIPLEXER: a missing socket fails there.
+        assert.ok(!REQUIRE_MULTIPLEXER, socketMissing);
         t.skip(socketMissing);
         return;
       }
@@ -318,6 +355,8 @@ describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linu
     test("GetUserRecord root without more", async (t) => {
       if (gate(t, missing) !== null) return;
       if (socketMissing !== null) {
+        // The CI job starts systemd-userdbd and sets VARLINK_REQUIRE_MULTIPLEXER: a missing socket fails there.
+        assert.ok(!REQUIRE_MULTIPLEXER, socketMissing);
         t.skip(socketMissing);
         return;
       }
