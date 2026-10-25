@@ -2,6 +2,7 @@
 // is enforced by eslint.config.js. This checks the rule really fires (and does not fire elsewhere).
 // Dev-only: needs ESLint, so it is not part of the compiled Node 22.12 floor run.
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import { test } from "node:test";
 import { ESLint } from "eslint";
 
@@ -89,6 +90,10 @@ const cases: [string, string | null, string | null][] = [
     null,
   ],
   // core/rpc do no I/O of their own (DESIGN.md §4.1).
+  ["declare enum Deno {}\nexport const x: unknown = Deno;\n", S, S],
+  ["export const x: unknown = status;\n", G, G],
+  ['export const x: unknown = new WebTransport("https://x");\n', G, G],
+  ['import { x } from "../interfaces/org.varlink.service.ts";\nexport const y: unknown = x;\n', L, null],
   ['export const x: unknown = fetch("http://x");\n', G, G],
   ['export const x: unknown = new WebSocket("ws://x");\n', G, G],
   ["export const x: unknown = globalThis.fetch;\n", P, P],
@@ -108,7 +113,13 @@ for (const [index, dir] of ["src/core", "src/rpc"].entries()) {
 }
 
 // Browser-facing subpaths (DESIGN.md §4, §8): runtime-agnostic too, but the transports may do I/O.
-for (const file of ["src/index.ts", "src/idl/lint-probe.ts", "src/websocket/lint-probe.ts", "src/http/lint-probe.ts"]) {
+for (const file of [
+  "src/index.ts",
+  "src/idl/lint-probe.ts",
+  "src/websocket/lint-probe.ts",
+  "src/http/lint-probe.ts",
+  "src/interfaces/lint-probe.ts",
+]) {
   const transport = file.startsWith("src/websocket/") || file.startsWith("src/http/");
   const webCases: [string, string | null][] = [
     ['import { readFile } from "node:fs";\nexport const x: unknown = readFile;\n', L],
@@ -144,4 +155,13 @@ test("adapters (src/node) may use Node built-ins and globals", async () => {
     'import { readFile } from "node:fs";\nexport const x: unknown = [readFile, process.env, import.meta.url];\n',
   );
   assert.deepEqual(rules, []);
+});
+
+// Tests live under test/ (DESIGN.md §8): `npm test` only globs test/**, and a colocated test would import
+// node:test from a runtime-agnostic layer. Fail loudly instead of silently skipping one.
+test("no colocated *.test.ts under src/", () => {
+  const colocated = readdirSync("src", { recursive: true, encoding: "utf8" }).filter((f) =>
+    /\.test\.[cm]?tsx?$/.test(f),
+  );
+  assert.deepEqual(colocated, []);
 });

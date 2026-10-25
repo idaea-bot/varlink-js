@@ -11,8 +11,10 @@ import { layerBoundaries } from "./eslint-rules/layer-boundaries.js";
  */
 const LAYERS = {
   "src/core": ["src/core"],
-  "src/rpc": ["src/core", "src/rpc"],
-  "src/index.ts": ["src/core", "src/rpc"],
+  "src/rpc": ["src/core", "src/rpc", "src/interfaces"],
+  "src/index.ts": ["src/core", "src/rpc", "src/interfaces"],
+  // Generated built-in interfaces (M6, DESIGN.md §10); rpc's org.varlink.service switches to them.
+  "src/interfaces": ["src/core", "src/rpc", "src/interfaces"],
   "src/idl": ["src/core", "src/idl"],
   "src/websocket": ["src/core", "src/rpc", "src/websocket"],
   "src/http": ["src/core", "src/rpc", "src/http"],
@@ -48,6 +50,17 @@ const runtimeGlobals = [
   "parent",
   "frames",
   "name",
+  // More browser-only window properties that lib "dom" declares as globals (a stray `status` would compile).
+  "event",
+  "status",
+  "length",
+  "origin",
+  "close",
+  "open",
+  "closed",
+  "opener",
+  "history",
+  "screen",
 ];
 // core does no I/O and rpc does I/O only through ByteChannel (DESIGN.md §4.1); the transports
 // (websocket, http) are the only agnostic layers that may open connections.
@@ -62,6 +75,9 @@ const ioGlobals = [
   "BroadcastChannel",
   "indexedDB",
   "caches",
+  "WebTransport",
+  "RTCPeerConnection",
+  "importScripts",
 ];
 
 /** @param {{ name: string, message: string }[]} banned */
@@ -130,8 +146,10 @@ export default defineConfig(
         {
           // `declare const Deno: …` makes a local binding that both the global ban and the typecheck accept;
           // `declare global` / `declare module "node:fs"` smuggle runtime types or modules in the same way.
+          // Deliberately covers every namespace/module declaration (type-only namespaces and relative
+          // augmentations too): none are needed in these layers and the rule stays simple.
           selector:
-            "VariableDeclaration[declare=true], TSDeclareFunction[declare=true], ClassDeclaration[declare=true], TSModuleDeclaration",
+            ":matches(VariableDeclaration, TSDeclareFunction, ClassDeclaration, TSEnumDeclaration)[declare=true], TSModuleDeclaration",
           message: "No ambient declarations in runtime-agnostic layers (DESIGN.md §4): they bypass the global rules.",
         },
       ],

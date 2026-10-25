@@ -822,14 +822,16 @@ nightly (optional).
   files (M6 regenerating built-ins, M9), the dependency graph in §10 serialises them.
 - Lint/format: ESLint 10 flat config + typescript-eslint (strict-type-checked), prettier pinned exact,
   `package-lock.json` committed (F12). Layer rule (§4), enforced in M0 for `src/core`, `src/rpc` and the
-  browser-facing subpaths (`src/index.ts`, `src/idl`, `src/websocket`, `src/http`): a local rule
-  (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve inside the layer's allowed
-  directories (core → core; rpc and the root entry → core+rpc; idl → core+idl; websocket/http → core+rpc+self),
+  browser-facing subpaths (`src/index.ts`, `src/idl`, `src/websocket`, `src/http`, plus M6's generated
+  `src/interfaces`): a local rule (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve
+  inside the layer's allowed directories (core → core; rpc, the root entry and interfaces → core+rpc+interfaces;
+  idl → core+idl; websocket/http → core+rpc+self),
   so `node:*`, bare built-ins, npm packages, the package's own name and adapter paths are all rejected,
   including `export … from`, `import()`, `import("x").T` and `declare module "x"`;
   `no-restricted-globals` (`process`, `Buffer`, `Bun`, `Deno`, `require`, `window`, `document`, …), the same
   names via `globalThis.*` (and `globalThis.globalThis`), no `import.meta`, no aliasing `globalThis`, no ambient
-  declarations (`declare const Deno`, `declare global`). Only the transports (websocket, http) may use
+  declarations (`declare const/enum Deno`, `declare global`, any namespace). Tests live under `test/` only
+  (a tooling test fails on a colocated `src/**/*.test.ts`). Only the transports (websocket, http) may use
   `fetch`/`WebSocket`/`EventSource`/workers; everything else does I/O through ByteChannel (§4.1).
   `tsconfig.core.json` typechecks all of these with `lib: es2024 + dom` and **no `@types/node`**, so
   `NodeJS.Timeout`, `Buffer` or `.unref()` fail to compile there. `test/tooling/lint-boundaries.test.ts` proves the rules fire. (M0 deviation: the design
