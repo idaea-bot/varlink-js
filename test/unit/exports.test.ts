@@ -63,6 +63,14 @@ test("varlink-js/idl exports the IDL API (M1)", () => {
   assert.equal(typeof idl.formatInterface, "function");
 });
 
+test("varlink-js exports the types and errors API (M2)", () => {
+  assert.equal(typeof root.compileInterface, "function");
+  assert.equal(typeof root.jsonCodec.decode, "function");
+  assert.equal(typeof root.VarlinkError, "function");
+  assert.equal(typeof root.createErrorRegistry, "function");
+  assert.equal("parseInterface" in root, false); // the IDL API lives in varlink-js/idl
+});
+
 test("bin points at the compiled CLI entry", () => {
   assert.deepEqual(pkg.bin, { "varlink-js": "./dist/cli/main.js" });
   assert.ok(existsSync(resolve("src/cli/main.ts")));
