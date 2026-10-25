@@ -112,11 +112,14 @@ export interface ServeListener extends AsyncIterable<ByteChannel> {
 export interface ShutdownOptions {
   /** Default true: active calls may finish (their signal aborts); false: close everything at once. */
   graceful?: boolean;
-  /** ms until the rest is closed hard; default 5000; 0 = no deadline. */
+  /** ms until the rest is closed hard; default 5000; 0 = no deadline (waits for every active handler). */
   timeout?: number;
 }
 
 const DEFAULT_MAX_CONNECTIONS = 4096;
+
+/** Graceful close: how long input is discarded after our FIN before the connection is closed hard (ms). */
+const GRACEFUL_LINGER_MS = 2000;
 
 function defaultOnError(_error: unknown, info: { method?: string; reason: ServerErrorReason }): void {
   const where = info.method === undefined ? "" : ` in ${safeQuote(info.method)}`;
@@ -178,6 +181,8 @@ class ServerConnection {
   #closing = false;
   /** Graceful close in progress: the channel is being ended; the reader discards input until EOF. */
   #finishing: Promise<void> | undefined;
+  /** Graceful close: closes the connection GRACEFUL_LINGER_MS after the channel was ended. */
+  #linger: ReturnType<typeof setTimeout> | undefined;
 
   constructor(channel: ByteChannel, session: ServerSession, host: ConnectionHost) {
     this.#channel = channel;
@@ -232,7 +237,12 @@ class ServerConnection {
         this.#dispatcherWake.notify();
       }
     } catch (e) {
-      if (this.#closing || this.#finishing !== undefined) return;
+      if (this.#closing) return;
+      // A graceful finish was in progress: the peer is gone, nothing left to protect (no report).
+      if (this.#finishing !== undefined) {
+        this.#close();
+        return;
+      }
       this.#host.report(e, "transport-error");
       this.#gone(e);
     }
@@ -241,7 +251,7 @@ class ServerConnection {
   /**
    * Graceful close, second half: once the channel is ended (our FIN after the last reply), read and drop input
    * until EOF or an error, then close. Unread input at close makes a TCP stack send RST, which can destroy the
-   * reply still in flight. The shutdown deadline (force()) still closes at once.
+   * reply still in flight. Bounded by the linger (see #finish); the shutdown deadline (force()) still closes at once.
    */
   async #discard(ended: Promise<void>): Promise<void> {
     await ended;
@@ -317,18 +327,29 @@ class ServerConnection {
 
   /**
    * Graceful close (shutdown drain): no more calls; end the channel after the replies written so far, then the
-   * reader discards input until EOF and closes (see #discard).
+   * reader discards input until EOF and closes (see #discard). Once ended, the discarding lasts at most
+   * {@link GRACEFUL_LINGER_MS}: a peer that never closes (or never sends anything, leaving the reader in read())
+   * must not hold the shutdown; the shutdown deadline still applies if it comes sooner.
    */
   #finish(): void {
     if (this.#closing || this.#finishing !== undefined) return;
     this.#session.close();
-    this.#finishing = Promise.resolve()
+    const finishing = Promise.resolve()
       .then(() => this.#channel.end())
       .catch(() => undefined);
+    this.#finishing = finishing;
+    void finishing.then(() => {
+      if (!this.#closing)
+        this.#linger = setTimeout(() => {
+          this.#close();
+        }, GRACEFUL_LINGER_MS);
+    });
     this.#readerWake.notify();
   }
 
   #close(): void {
+    if (this.#linger !== undefined) clearTimeout(this.#linger);
+    this.#linger = undefined;
     this.#closing = true;
     this.#session.close();
     this.#channel.close();
@@ -487,8 +508,11 @@ export class Server {
    * Accepts channels from `listener` in the background (returns at once) and serves each with {@link handle}. An
    * error from the iteration is reported as `accept-failed`, ends that loop and closes the listener (its errors
    * swallowed). Several listeners may be served; {@link shutdown} closes them.
+   *
+   * @throws {TypeError} if `listener` is already being served (it is left alone).
    */
   serve(listener: ServeListener): void {
+    if (this.#listeners.has(listener)) throw new TypeError("this listener is already being served");
     if (this.#shutdown !== undefined) {
       void this.#closeListener(listener);
       return;
@@ -517,9 +541,10 @@ export class Server {
   /**
    * Stops the server (idempotent): closes the served listeners, then — graceful (default) — aborts every active
    * call's signal (replies are still written), drops buffered calls and, once its active call finished, ends each
-   * connection (FIN after the last reply) and discards its input until the peer closes; at the `timeout` deadline
-   * (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves when every
-   * connection is closed.
+   * connection (FIN after the last reply) and discards its input until the peer closes, for at most 2000 ms; at the
+   * `timeout` deadline (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves
+   * when every connection is closed. With `timeout: 0` it waits for every active handler to finish: a handler that
+   * ignores its signal holds it forever.
    *
    * @throws {RangeError|TypeError} for invalid options (synchronously; nothing is stopped then).
    */

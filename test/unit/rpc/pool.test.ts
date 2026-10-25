@@ -257,6 +257,32 @@ describe("Pool", () => {
     await f.server.shutdown();
   });
 
+  test("a lease timeout while the connection is being opened aborts the factory and frees its slot", async () => {
+    const f = fixture();
+    const seen: AbortSignal[] = [];
+    let hang = true;
+    // Hangs until its signal aborts (a dial to a blackholed host without a timeout of its own).
+    const factory = (signal: AbortSignal): Promise<Connection> => {
+      if (!hang) return f.factory(signal);
+      seen.push(signal);
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          reject(signal.reason as Error);
+        });
+      });
+    };
+    const pool = createPool(factory, { max: 2, idleTimeout: 0, timeout: 10 });
+    const waitTimeout = (e: unknown): boolean => e instanceof CallTimeoutError;
+    await assert.rejects(pool.call("org.example.p.Echo", { text: "a" }), waitTimeout);
+    await assert.rejects(pool.call("org.example.p.Echo", { text: "b" }), waitTimeout);
+    assert.equal(seen.length, 2);
+    for (const s of seen) assert.ok(s.aborted && s.reason instanceof CallTimeoutError);
+    hang = false;
+    assert.deepEqual(await pool.call("org.example.p.Echo", { text: "c" }), { text: "c" });
+    await pool.close();
+    await f.server.shutdown();
+  });
+
   test("a stream whose lease failed: next() rejects once, then is done", async () => {
     const pool = createPool(() => Promise.reject(new Error("no route")));
     const st = pool.stream("org.example.p.Count", { n: 2 });

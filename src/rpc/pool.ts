@@ -36,6 +36,8 @@ interface Waiter {
   readonly signal: AbortSignal | undefined;
   onAbort: (() => void) | undefined;
   timer: ReturnType<typeof setTimeout> | undefined;
+  /** The open (#open) of this waiter's connection, while in progress. */
+  opening: AbortController | undefined;
   /** Settled (served, aborted or rejected). */
   done: boolean;
 }
@@ -199,12 +201,23 @@ export class Pool {
     return new Promise((resolve, reject) => {
       // A RangeError here rejects the operation.
       const timeout = checkTimeout(options?.timeout, "timeout", this.#timeout);
-      const w: Waiter = { resolve, reject, signal, onAbort: undefined, timer: undefined, done: false };
+      const w: Waiter = {
+        resolve,
+        reject,
+        signal,
+        onAbort: undefined,
+        timer: undefined,
+        opening: undefined,
+        done: false,
+      };
       if (timeout > 0)
         w.timer = setTimeout(() => {
           const i = this.#waiters.indexOf(w);
           if (i >= 0) this.#waiters.splice(i, 1);
-          this.#settleWaiter(w, undefined, new CallTimeoutError("timed out waiting for a pool connection"));
+          const error = new CallTimeoutError("timed out waiting for a pool connection");
+          // Its connection is being opened: stop wanting it, so a factory that would hang frees the slot.
+          w.opening?.abort(error);
+          this.#settleWaiter(w, undefined, error);
         }, timeout);
       if (signal !== undefined) {
         w.onAbort = () => {
@@ -256,6 +269,7 @@ export class Pool {
   #open(w: Waiter): void {
     const ac = new AbortController();
     this.#opening.add(ac);
+    w.opening = ac;
     // The waiter gave up while the connection was being opened: stop wanting it (it goes idle if it arrives).
     const onWaiterAbort = (): void => {
       ac.abort(w.signal?.reason);
@@ -265,6 +279,7 @@ export class Pool {
     opened.then(
       (conn) => {
         this.#opening.delete(ac);
+        w.opening = undefined;
         w.signal?.removeEventListener("abort", onWaiterAbort);
         if (this.#closed) {
           void conn.close();
@@ -283,6 +298,7 @@ export class Pool {
       },
       (error: unknown) => {
         this.#opening.delete(ac);
+        w.opening = undefined;
         w.signal?.removeEventListener("abort", onWaiterAbort);
         this.#settleWaiter(w, undefined, error);
         this.#serve();

@@ -635,6 +635,63 @@ describe("Server: serve and shutdown", () => {
     finish();
   });
 
+  test("graceful with timeout 0: a peer that never reads or closes is closed after the linger (2000 ms)", async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const { server } = makeServer();
+      const [a, b] = pair();
+      const handled = server.handle(b);
+      // A call answered, then the peer goes silent: it never reads our FIN nor closes its side.
+      await a.write(msg({ method: "org.varlink.service.GetInfo" }));
+      await new MessageReader(a).next();
+      const stopped = server.shutdown({ timeout: 0 });
+      await settle();
+      mock.timers.tick(1999);
+      await settle();
+      assert.equal(await isPending(stopped), true);
+      mock.timers.tick(1);
+      await settle();
+      assert.equal(await isPending(stopped), false);
+      await handled;
+      a.close();
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  test("a read rejecting during a graceful finish closes the connection", async () => {
+    const { server } = makeServer();
+    const [a, b] = pair();
+    // read() rejects without `closed` settling (no socket close event would rescue us).
+    const side = controllable(b);
+    const handled = server.handle(side);
+    await a.write(msg({ method: "org.varlink.service.GetInfo" }));
+    await new MessageReader(a).next();
+    const stopped = server.shutdown({ timeout: 0 });
+    await settle();
+    side.failRead(new Error("ECONNRESET"));
+    await settle();
+    assert.equal(await isPending(handled), false);
+    await stopped;
+    a.close();
+  });
+
+  test("serve() with a listener already being served is a TypeError; the listener stays open", async () => {
+    const { server } = makeServer();
+    server.addInterface(IDL, { Echo: (p) => p });
+    const l = new MemoryListener();
+    server.serve(l);
+    assert.throws(() => {
+      server.serve(l);
+    }, TypeError);
+    await settle();
+    assert.equal(l.closeCalls, 0);
+    const c = createConnection(l.dial());
+    assert.deepEqual(await c.call("org.example.s.Echo", { text: "still" }), { text: "still" });
+    await server.shutdown();
+    assert.equal(l.closeCalls, 1);
+  });
+
   test("non-graceful: everything is closed at once", async () => {
     const { server } = makeServer();
     let ctxSignal: AbortSignal | undefined;

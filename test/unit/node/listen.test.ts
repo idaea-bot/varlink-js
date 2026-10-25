@@ -9,6 +9,7 @@ import { describe, test } from "node:test";
 import { OperationNotSupportedError } from "../../../src/core/errors/index.ts";
 import type { ByteChannel } from "../../../src/core/protocol/index.ts";
 import { listen } from "../../../src/node/index.ts";
+import { listenUnixWithHooks } from "../../../src/node/listen.ts";
 import { closeServer, listening, tempDir, turns } from "./helpers.ts";
 
 const dir = tempDir();
@@ -107,6 +108,149 @@ describe("listen unix", () => {
       assert.deepEqual(readdirSync(sub), ["s"]);
     } finally {
       await winner.close();
+    }
+    assert.deepEqual(readdirSync(sub), []);
+  });
+
+  test("concurrent listen() calls over a stale socket: exactly one wins, the winner serves", async () => {
+    const sub = join(dir(), "stale-race");
+    await mkdir(sub);
+    const path = join(sub, "s");
+    // Several rounds of 8 (2 rarely interleave inside the probe → replace window on an idle machine).
+    for (let round = 0; round < 3; round++) {
+      await staleSocket(path);
+      const results = await Promise.allSettled(Array.from({ length: 8 }, () => listen(`unix:${path}`)));
+      const won = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
+      const lost = results.filter((r) => r.status === "rejected").map((r) => r.reason as unknown);
+      try {
+        assert.equal(won.length, 1);
+        assert.equal(lost.length, 7);
+        for (const e of lost) assert.ok(inUse(e), String(e));
+        const winner = won[0];
+        assert.ok(winner !== undefined);
+        const accepted = (async () => {
+          for await (const ch of winner) return ch;
+          return undefined;
+        })();
+        const s = await dial(path);
+        const ch = await accepted;
+        assert.ok(ch !== undefined);
+        ch.close();
+        s.destroy();
+        assert.deepEqual(readdirSync(sub), ["s"]);
+      } finally {
+        await Promise.all(won.map((l) => l.close()));
+      }
+      assert.deepEqual(readdirSync(sub), []);
+    }
+  });
+
+  test("a live socket published between the stale probe and the replace is put back, EADDRINUSE", async () => {
+    const sub = join(dir(), "replace-race");
+    await mkdir(sub);
+    const path = join(sub, "s");
+    await staleSocket(path);
+    // Another process's listener takes the path (atomically, over the stale socket) after our probe.
+    const other = createNetServer();
+    const err = await listenUnixWithHooks(
+      path,
+      {},
+      {
+        beforeReplace: async () => {
+          await listening(other, { path: join(sub, "other") });
+          await rename(join(sub, "other"), path);
+        },
+      },
+    ).then(
+      async (l) => {
+        await l.close();
+        return new Error("listen() resolved");
+      },
+      (e: unknown) => e,
+    );
+    try {
+      assert.ok(inUse(err), String(err));
+      assert.deepEqual(readdirSync(sub), ["s"]);
+      const accepted = new Promise((resolve) => other.once("connection", resolve));
+      const s = await dial(path);
+      await accepted;
+      s.destroy();
+    } finally {
+      await closeServer(other);
+    }
+  });
+
+  test("mode applies before publication: only a 0700 private directory ever holds the socket", async () => {
+    const sub = join(dir(), "private");
+    await mkdir(sub);
+    const path = join(sub, "s");
+    // With umask 0 a freshly bound socket is 0777: any exposure would be world-connectable.
+    const umask = process.umask(0);
+    const seen: string[] = [];
+    const watcher = { on: true };
+    const watch = (async () => {
+      while (watcher.on) {
+        for (const name of readdirSync(sub)) {
+          const full = join(sub, name);
+          let st;
+          try {
+            st = lstatSync(full);
+          } catch {
+            continue;
+          }
+          if (name === "s") seen.push(`s ${(st.mode & 0o777).toString(8)}`);
+          else if (st.isDirectory() && name.startsWith(".vjs-")) seen.push(`dir ${(st.mode & 0o777).toString(8)}`);
+          else seen.push(`unexpected ${name}`);
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    let l;
+    try {
+      l = await listen(`unix:${path}`, { mode: 0o600 });
+      assert.equal(lstatSync(path).mode & 0o777, 0o600);
+    } finally {
+      process.umask(umask);
+      watcher.on = false;
+      await watch;
+    }
+    await l.close();
+    assert.ok(seen.length > 0);
+    for (const entry of seen) assert.ok(entry === "s 600" || entry === "dir 700", entry);
+  });
+
+  test("fallback: a private socket path too long for sun_path binds directly at the path", async (t) => {
+    const limit = process.platform === "linux" ? 107 : 103;
+    // dirname + "/s" fits, dirname + "/.vjs-XXXXXX/s" does not.
+    const want = limit - 8;
+    const base = dir();
+    if (base.length + 2 > want) {
+      t.skip(`temp dir too long (${String(base.length)})`);
+      return;
+    }
+    const sub = join(base, "d".repeat(want - base.length - 1));
+    assert.equal(sub.length, want);
+    await mkdir(sub);
+    const path = join(sub, "s");
+    await staleSocket(path);
+    const l = await listen(`unix:${path}`, { mode: 0o600 });
+    try {
+      // Bound at the path itself (not in a private directory).
+      assert.equal(l.server.address(), path);
+      assert.equal(lstatSync(path).mode & 0o777, 0o600);
+      await assert.rejects(listen(`unix:${path}`), inUse);
+      const accepted = (async () => {
+        for await (const ch of l) return ch;
+        return undefined;
+      })();
+      const s = await dial(path);
+      const ch = await accepted;
+      assert.ok(ch !== undefined);
+      ch.close();
+      s.destroy();
+      assert.deepEqual(readdirSync(sub), ["s"]);
+    } finally {
+      await l.close();
     }
     assert.deepEqual(readdirSync(sub), []);
   });

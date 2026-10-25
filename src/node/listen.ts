@@ -1,8 +1,7 @@
 // listen(): a Listener over a Node net.Server (DESIGN.md §4.1, §4.7, §4.11, §5.4, §5.8).
-import { randomBytes } from "node:crypto";
-import { chmod, link, lstat, unlink } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { connect as netConnect, createServer, type ListenOptions as NetListenOptions, type Server } from "node:net";
-import { basename, dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { formatAddress, parseAddress, type AddressSpec } from "../core/address/parse.ts";
 import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
@@ -10,7 +9,11 @@ import { fromNodeSocket } from "./socket.ts";
 
 /** Options for {@link listen}. */
 export interface ListenOptions {
-  /** unix paths: `chmod` the socket to this mode before it appears at its path; default: the umask result. */
+  /**
+   * unix paths: `chmod` the socket to this mode while it is still in a private 0700 directory, before it is
+   * published at its path (so nobody can connect with weaker permissions); default: the umask result. In the
+   * fallback without hard links it is applied right after `bind` (a short window with the umask mode).
+   */
   mode?: number;
   /** `listen(2)` backlog; default Node's (511). */
   backlog?: number;
@@ -218,64 +221,202 @@ async function inspect(path: string): Promise<{ kind: "gone" } | { kind: "stale"
   return { kind: "stale", inode: { dev: st.dev, ino: st.ino } };
 }
 
-/**
- * Makes the socket bound at `temp` appear at `path` too, never overwriting: `link` fails with EEXIST (so of two
- * concurrent listen() calls only one wins). A stale socket there is unlinked (if it is still the probed inode) and
- * the link retried once; a second EEXIST is `EADDRINUSE`.
- */
-async function publish(temp: string, path: string): Promise<void> {
-  let removedStale = false;
-  let vanished = 0;
-  for (;;) {
-    try {
-      await link(temp, path);
-      return;
-    } catch (e) {
-      if (codeOf(e) !== "EEXIST") throw e;
-    }
-    if (removedStale) throw addressInUse(path, "another listener took it");
-    const found = await inspect(path);
-    if (found.kind === "gone") {
-      vanished++;
-      if (vanished > PROBE_ATTEMPTS) throw addressInUse(path, "it keeps changing");
-      continue;
-    }
-    try {
-      const st = await lstat(path);
-      if (st.dev !== found.inode.dev || st.ino !== found.inode.ino)
-        throw addressInUse(path, "it was replaced while probing");
-      await unlink(path);
-    } catch (e) {
-      if (codeOf(e) !== "ENOENT") throw e;
-    }
-    removedStale = true;
+const sameInode = (a: Inode, b: Inode): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/** Test hooks (internal): `beforeReplace` runs between probing a stale socket and moving it away. */
+export interface PublishHooks {
+  beforeReplace?: () => Promise<void>;
+}
+
+/** `link` (or `mkdtemp`) failing like this means the filesystem cannot do the private-directory publish. */
+const NO_LINK_SUPPORT = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENAMETOOLONG"]);
+
+/** Longest unix socket path `bind` takes: sun_path is 108 bytes on Linux, 104 elsewhere (less the NUL). */
+const SUN_PATH_MAX = process.platform === "linux" ? 107 : 103;
+
+/** Setup of `listen()` on one absolute path, serialized in this process (released when the setup settles). */
+const setupLocks = new Map<string, Promise<void>>();
+
+async function withPathLock<T>(key: string, setup: () => Promise<T>): Promise<T> {
+  const previous = setupLocks.get(key) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => mine);
+  setupLocks.set(key, tail);
+  await previous;
+  try {
+    return await setup();
+  } finally {
+    release();
+    if (setupLocks.get(key) === tail) setupLocks.delete(key);
   }
 }
 
-async function listenUnix(path: string, options: ListenOptions): Promise<NodeListener> {
-  // Bind on a temporary name next to the target (recognizable if a crash leaves it behind), chmod it, then publish
-  // it with link() + unlink(temp): `mode` applies before the socket is reachable, an existing path is never
-  // overwritten (publish()), and libuv's unlink-on-close hits the temporary name (which no longer exists), so
-  // close() can remove the path only while it is still our inode.
-  const temp = join(dirname(path), `.${basename(path)}.vjs-${randomBytes(3).toString("hex")}`);
+/**
+ * Makes the socket bound at `socket` (inside our private directory `dir`) appear at `path`, never overwriting:
+ * `link` fails with EEXIST. A stale socket there is moved into `dir` with `rename` (atomic, whatever is at `path`
+ * now); if what moved is the probed inode it is unlinked and the link retried once (a second EEXIST is
+ * `EADDRINUSE`); if not, someone published a live socket meanwhile: it is moved back and we reject `EADDRINUSE`.
+ * Returns `"unsupported"` if the first `link` fails for lack of hard-link support.
+ */
+async function publish(
+  socket: string,
+  path: string,
+  dir: string,
+  hooks: PublishHooks | undefined,
+): Promise<"published" | "unsupported"> {
+  let replacedStale = false;
+  let vanished = 0;
+  let first = true;
+  for (;;) {
+    try {
+      await link(socket, path);
+      return "published";
+    } catch (e) {
+      if (first && NO_LINK_SUPPORT.has(codeOf(e) as string)) return "unsupported";
+      if (codeOf(e) !== "EEXIST") throw e;
+    }
+    first = false;
+    if (replacedStale) throw addressInUse(path, "another listener took it");
+    const found = await inspect(path);
+    if (found.kind === "stale") {
+      await hooks?.beforeReplace?.();
+      const tomb = join(dir, "old");
+      try {
+        await rename(path, tomb);
+      } catch (e) {
+        if (codeOf(e) !== "ENOENT") throw e;
+      }
+      let st;
+      try {
+        st = await lstat(tomb);
+      } catch (e) {
+        if (codeOf(e) !== "ENOENT") throw e;
+      }
+      if (st !== undefined) {
+        if (!sameInode(st, found.inode))
+          throw addressInUse(path, `it was replaced while probing${await restore(tomb, path)}`);
+        await unlink(tomb);
+        replacedStale = true;
+        continue;
+      }
+    }
+    // Gone (before or during the replace): link again, a bounded number of times.
+    vanished++;
+    if (vanished > PROBE_ATTEMPTS) throw addressInUse(path, "it keeps changing");
+  }
+}
+
+/** Puts back an entry `publish` moved away by mistake; describes a failure (for the rejection message). */
+async function restore(tomb: string, path: string): Promise<string> {
+  try {
+    await rename(tomb, path);
+    return "";
+  } catch (e) {
+    try {
+      await link(tomb, path);
+      return `; it was moved away, could not be renamed back (${String(e)}) and was linked back`;
+    } catch (e2) {
+      return `; it was moved away and could not be put back (${String(e)}; ${String(e2)})`;
+    }
+  }
+}
+
+async function listenUnix(path: string, options: ListenOptions, hooks?: PublishHooks): Promise<NodeListener> {
+  return withPathLock(resolve(path), async () => {
+    // The private socket path must fit in sun_path; else (or without hard links) bind at `path` directly.
+    const placeholder = join(dirname(path), ".vjs-XXXXXX", "s");
+    if (Buffer.byteLength(placeholder) > SUN_PATH_MAX) return listenUnixDirect(path, options);
+    let dir: string;
+    try {
+      dir = await mkdtemp(join(dirname(path), ".vjs-"));
+    } catch (e) {
+      if (NO_LINK_SUPPORT.has(codeOf(e) as string)) return listenUnixDirect(path, options);
+      throw e;
+    }
+    const listener = await listenPrivate(path, dir, options, hooks);
+    return listener ?? listenUnixDirect(path, options);
+  });
+}
+
+/**
+ * Binds in the private 0700 directory `dir` (nobody else can connect there), `chmod`s, publishes at `path` with
+ * `link`, then removes the private name and `dir`. libuv's unlink-on-close hits the private name (gone by then),
+ * so close() can remove `path` only while it is still our inode. `undefined`: no hard links here (cleaned up).
+ */
+async function listenPrivate(
+  path: string,
+  dir: string,
+  options: ListenOptions,
+  hooks: PublishHooks | undefined,
+): Promise<NodeListener | undefined> {
+  const socket = join(dir, "s");
   const server = createServer({ allowHalfOpen: true, pauseOnConnect: true });
-  await bind(server, { path: temp, ...(options.backlog === undefined ? {} : { backlog: options.backlog }) });
+  try {
+    await bind(server, { path: socket, ...(options.backlog === undefined ? {} : { backlog: options.backlog }) });
+  } catch (e) {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw e;
+  }
   // Listeners before any other await: errors and connections during the setup are handled.
   const unix: UnixOwnership = { path, inode: undefined };
   const listener = new NodeListenerImpl(server, formatAddress({ kind: "unix", path }), options.onError, unix);
   try {
-    if (options.mode !== undefined) await chmod(temp, options.mode);
-    const st = await lstat(temp);
-    await publish(temp, path);
+    if (options.mode !== undefined) await chmod(socket, options.mode);
+    const st = await lstat(socket);
+    if ((await publish(socket, path, dir, hooks)) === "unsupported") {
+      await listener.close();
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      return undefined;
+    }
     unix.inode = { dev: st.dev, ino: st.ino };
-    await unlink(temp);
+    await unlink(socket);
+    await rmdir(dir);
     return listener;
   } catch (e) {
-    // close() leaves `path` alone unless it is ours (inode set): only a failed unlink(temp) gets here then.
+    // close() leaves `path` alone unless it is ours (inode set): only a failed cleanup gets here then.
     await listener.close();
-    await unlink(temp).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     throw e;
   }
+}
+
+/**
+ * Fallback without hard links (or a private path too long for sun_path): a stale socket at `path` is unlinked
+ * (check-then-act: another process may race us) and the socket bound at `path`, then `chmod`ed (so it briefly has
+ * the umask mode). libuv unlinks `path` on close, even if it was replaced meanwhile.
+ */
+async function listenUnixDirect(path: string, options: ListenOptions): Promise<NodeListener> {
+  const found = await inspect(path);
+  if (found.kind === "stale") {
+    try {
+      const st = await lstat(path);
+      if (!sameInode(st, found.inode)) throw addressInUse(path, "it was replaced while probing");
+      await unlink(path);
+    } catch (e) {
+      if (codeOf(e) !== "ENOENT") throw e;
+    }
+  }
+  const server = createServer({ allowHalfOpen: true, pauseOnConnect: true });
+  await bind(server, { path, ...(options.backlog === undefined ? {} : { backlog: options.backlog }) });
+  const unix: UnixOwnership = { path, inode: undefined };
+  const listener = new NodeListenerImpl(server, formatAddress({ kind: "unix", path }), options.onError, unix);
+  try {
+    if (options.mode !== undefined) await chmod(path, options.mode);
+    const st = await lstat(path);
+    unix.inode = { dev: st.dev, ino: st.ino };
+    return listener;
+  } catch (e) {
+    await listener.close();
+    throw e;
+  }
+}
+
+/** Test entry (internal): {@link listen} on a unix path with {@link PublishHooks}. */
+export function listenUnixWithHooks(path: string, options: ListenOptions, hooks: PublishHooks): Promise<NodeListener> {
+  return listenUnix(path, options, hooks);
 }
 
 async function listenServer(
@@ -308,11 +449,14 @@ function addressOf(server: Server, fd?: number): string {
  * Listens on a varlink address (DESIGN.md §5.4) and returns a {@link NodeListener}: an async iterable of accepted
  * connections (as {@link ByteChannel}s, for `server.serve()`), its canonical `address` and `close()`.
  *
- * - `unix:/path` (and bare paths): the socket is bound on a temporary name in the same directory
- *   (`.<basename>.vjs-<hex>`), `chmod`ed to `mode` and hard-linked to the path, which is never overwritten: an
- *   existing stale socket (it refused 3 connects ~20 ms apart) is unlinked first; a live socket, a non-socket, or a
- *   concurrent listen() that got there first rejects with `EADDRINUSE` and is left alone. `close()` unlinks the
- *   path only if it is still the socket we created.
+ * - `unix:/path` (and bare paths): the socket is bound in a private 0700 directory next to the path (`.vjs-<hex>`,
+ *   removed afterwards), `chmod`ed to `mode` and hard-linked to the path, which is never overwritten: an existing
+ *   stale socket (it refused 3 connects ~20 ms apart) is moved away atomically and removed; a live socket, a
+ *   non-socket, or a concurrent listen() that got there first rejects with `EADDRINUSE` and is left alone. Setups
+ *   on one path are serialized within the process. Without hard-link support (or if the private path would not
+ *   fit in sun_path) the socket is bound at the path directly after the stale check: `mode` is then applied after
+ *   bind, and another process may race the stale replace. `close()` unlinks the path only if it is still the
+ *   socket we created.
  * - `unix:@name`: Linux only (else `OperationNotSupportedError`).
  * - `tcp:host:port`: port 0 picks a free port; `address` carries the real one (`tcp:[::1]:p` for IPv6).
  * - `{fd}`: an already-listening socket fd (socket activation, §5.8). `address` comes from the socket

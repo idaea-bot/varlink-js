@@ -413,7 +413,7 @@ systemd before shipping M8.*
 
 - **Node** (`varlink-js/node`): `node:net` (unix, tcp, abstract), `node:child_process` (exec/ssh/bridge),
   `server.listen({fd})` for socket activation. Found in M4 (§4.11): libuv unlinks a unix socket's bound path on
-  `server.close()` even after it was replaced (hence bind-on-temp-name + rename), and `server.address()` is `null`
+  `server.close()` even after it was replaced (hence bind in a private directory + `link`), and `server.address()` is `null`
   for a unix socket listened via `{fd}` (hence the `fd:<n>` placeholder address).
 - **Bun, Deno 2**: start by running the Node adapter through their `node:` compat; M10 adds CI jobs. Native
   adapters (`Bun.connect`, `Deno.connect`) only if CI shows gaps. Unknowns to test: abstract sockets,
@@ -771,8 +771,9 @@ over `pair()`, unix and tcp sockets.
   frees its slot; the factory's signal aborts when its waiter gives up or the pool closes (a connection that still
   arrives goes idle). Waiting for a lease is bounded by the operation's `signal` and `timeout` (else the pool's
   `timeout`, default 45 000 like a connection's, 0 = none): expiry removes the waiter and rejects with
-  `CallTimeoutError("timed out waiting for a pool connection")`; the operation's `timeout` then applies again to the
-  call itself. A `stream()` whose lease failed rejects its first `next()`, then is done. Connections are dropped
+  `CallTimeoutError("timed out waiting for a pool connection")` (if the waiter's connection is being opened, the
+  factory's signal aborts with that error, so a factory that would hang frees its slot); the operation's `timeout`
+  then applies again to the call itself. A `stream()` whose lease failed rejects its first `next()`, then is done. Connections are dropped
   when their `closed` settles. `close()` rejects waiters, closes all connections, later operations reject. `size`
   counts open connections (not those being opened).
 - **Server** (`createServer(options)`, `service.ts` for the built-ins behind `builtinInterfaces()`): registration
@@ -789,15 +790,19 @@ over `pair()`, unix and tcp sockets.
   channel; `channel.closed` settling does the same without a report. An unclaimed upgrade closes the connection.
   `handle()` resolves once the channel is closed and the reader ended (a handler that ignores its signal is not
   awaited) and never rejects; at `maxConnections` (or after shutdown) the channel is closed at once. `serve()` runs
-  `for await` over the listener in the background; an iteration error is reported as `accept-failed`, ends that
-  loop and calls `listener.close()` (its errors swallowed), so the address is released and shutdown has nothing
-  dangling. `shutdown({graceful, timeout})` checks its options synchronously (`RangeError`/`TypeError`, nothing
+  `for await` over the listener in the background (a listener already being served is a synchronous `TypeError`,
+  and is left alone); an iteration error is reported as `accept-failed`, ends that loop and calls
+  `listener.close()` (its errors swallowed), so the address is released and shutdown has nothing dangling. `shutdown({graceful, timeout})` checks its options synchronously (`RangeError`/`TypeError`, nothing
   memoized, the server keeps running), closes the listeners, then aborts active calls' signals and closes each
   connection gracefully when its call finished (buffered calls dropped; idle connections at once): `session.close()`,
   `await channel.end()` (FIN after the last reply), then read and discard input until `read()` gives `null` or
   rejects, then `channel.close()` — closing a TCP socket with unread input sends RST, which can destroy the reply
-  still in flight. At the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false` everything
-  is closed hard; so a peer that never closes its side holds a graceful shutdown until the deadline. Protocol
+  still in flight. The discarding lasts at most `GRACEFUL_LINGER_MS` (2000) after `end()` resolved (or until the
+  deadline, if sooner), then the connection is closed hard, so a peer that never closes its side (or never sends
+  anything more, leaving the reader inside `read()`) cannot hold the shutdown; a `read()` rejection during the
+  finish closes at once. At the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false`
+  everything is closed hard. With `timeout: 0` the shutdown still waits for every active handler: one that ignores
+  its signal holds it forever. Protocol
   errors, unclaimed upgrades, transport errors and the clean-EOF close stay hard closes. No timers on server
   connections other than the shutdown deadline (F1).
 - **Node channel** (`fromNodeSocket(socket)`): the socket is paused and read on demand: `read()` returns the next
@@ -821,22 +826,29 @@ over `pair()`, unix and tcp sockets.
   and every other listen error (F8). Server `error`s after listening are accept failures (`EMFILE`, `ENFILE`,
   `ECONNABORTED`): they go to `onError` (default: ignored; its exceptions swallowed) and the listener keeps accepting
   (the `net.Server` stays bound and listening, and libuv's EMFILE trick drops the pending connection so the loop does
-  not spin). The iterator ends only on `close()` or the server's `close` event. Unix paths: the socket is bound on a
-  temporary name in the same directory (`.<basename>.vjs-<6 hex>`, recognizable if a crash leaves it behind; note it
-  is 12 bytes longer than the target, against sun_path's ~104), the listener's `error`/`connection` handlers are
-  attached before any further await (so nothing in the setup window is unhandled or leaked), it is `chmod`ed to
-  `mode`, then published with `link(temp, path)` + `unlink(temp)`. `link` never overwrites: on `EEXIST` the existing
-  path is inspected — a socket that refuses 3 connects ~20 ms apart (`ECONNREFUSED` each time; `ENOENT` = it
-  vanished: retry the link) is stale, so it is unlinked (only if it is still the inode that was probed) and the link
-  retried once (a second `EEXIST` → `EADDRINUSE`); a live socket (connect succeeds, or `EAGAIN`), or a non-socket →
-  `EADDRINUSE`, never touched. So of two concurrent `listen()`s on one path exactly one wins. Every error path
-  closes the server and removes the temporary name. libuv unlinks a pipe's bound name on close, which hits the
-  (already removed) temporary name, so `close()` unlinks the path only if it is still our inode (dev+ino). This also
-  closes the "socket briefly has the umask mode" window. Left: the stale probe → unlink step is still a
-  check-then-act race against another process replacing the stale socket at that moment, and on macOS/BSD a live
-  server whose listen backlog is full also refuses connects (`ECONNREFUSED`), so a server that stays saturated for
-  all 3 probes is taken for stale and replaced. Consequence: `listener.server.address()` names the temporary path
-  (use `listener.address`). `unix:@name` Linux only. tcp:
+  not spin). The iterator ends only on `close()` or the server's `close` event. Unix paths: setups of `listen()` on
+  one resolved absolute path are serialized in the process (an async mutex, released when the setup settles). The
+  socket is bound inside a private directory `mkdtemp(<dirname>/.vjs-)` (mode 0700) as `<dir>/s`, the listener's
+  `error`/`connection` handlers are attached before any further await (so nothing in the setup window is unhandled
+  or leaked), it is `chmod`ed to `mode` there, then published with `link(<dir>/s, path)`, and `<dir>/s` and `<dir>`
+  are removed. Nobody else can connect before the socket is published with its final mode (the directory is 0700).
+  `link` never overwrites: on `EEXIST` the existing path is inspected — a socket that refuses 3 connects ~20 ms
+  apart (`ECONNREFUSED` each time; `ENOENT` = it vanished: retry the link) is stale and is replaced atomically:
+  `rename(path, <dir>/old)` moves whatever is there now; if that is the probed inode it is unlinked and the link
+  retried once (a second `EEXIST` → `EADDRINUSE`); if not (someone published a live socket meanwhile), it is renamed
+  back (failing that, linked back; the rejection message says so) and `listen()` rejects `EADDRINUSE`. A live socket
+  (connect succeeds, or `EAGAIN`) or a non-socket → `EADDRINUSE`, never touched. So of concurrent `listen()`s on one
+  path exactly one wins, in one process (mutex) and across processes (link + rename). Every error path closes the
+  server and removes the private directory with its contents. libuv unlinks a pipe's bound name on close, which hits
+  the (already removed) private name, so `close()` unlinks the path only if it is still our inode (dev+ino).
+  Fallback: if `<dir>/s` would exceed sun_path (107 bytes on Linux, 103 elsewhere), or `mkdtemp`/the first `link`
+  fail with `EPERM`/`ENOTSUP`/`EOPNOTSUPP`/`EXDEV`/`ENAMETOOLONG` (no hard links, e.g. some FUSE/virtiofs mounts),
+  the socket is bound at `path` directly after the same stale check: `mode` is then applied after bind (a short
+  umask-mode window), the stale probe → unlink is a check-then-act race against other processes, and libuv's
+  unlink-on-close removes `path` even if it was replaced. Left in both modes: on macOS/BSD a live server whose listen
+  backlog is full also refuses connects (`ECONNREFUSED`), so a server that stays saturated for all 3 probes is taken
+  for stale and replaced. Consequence: `listener.server.address()` names the (removed) private path, except in the
+  fallback (use `listener.address`). `unix:@name` Linux only. tcp:
   `address` from `server.address()` (port 0 → the real port, `tcp:[::1]:p` for IPv6). `{fd}` (socket activation,
   §5.8; `listenFromEnv` in M8 builds on it): `server.listen({fd})`; `address` from `server.address()` (object →
   `tcp:…`, string with leading NUL → `unix:@…`, other string → `unix:…`), but Node returns `null` for a unix socket
@@ -866,9 +878,11 @@ over `pair()`, unix and tcp sockets.
   peer with nothing unread, which the server reads as a clean EOF (a unix socket closed with unread data does give
   its peer `ECONNRESET` on Linux, but that is not what the harness does), so F1's "reset aborts `ctx.signal`" is
   tested for pair and tcp only (`Transport.abruptReset`); over unix the test checks that the server survives and
-  keeps serving. A reset is noticed by reading: with more than `maxQueuedCalls` calls buffered behind a long
-  handler (and Node's own read buffer full), the reader stays parked, so the handler's signal aborts only when its
-  write fails, it finishes, or the socket's `close` arrives. F15's memory bound is 4 × `maxMessageSize` over
+  keeps serving. A reset is noticed by reading: while parked on a full queue, the reader reads again (and notices
+  the reset) only if exactly `maxQueuedCalls` complete calls were buffered, because taking the first one makes room;
+  with more complete calls buffered (e.g. 66 small calls in one chunk), the reader stays parked until the queue
+  drains below the limit, however empty Node's read buffer is, so the handler's signal aborts only when its write
+  fails, it finishes, or the socket's `close` arrives. F15's memory bound is 4 × `maxMessageSize` over
   pair and 16 × over sockets (a fresh Buffer per read, garbage until the next GC, plus kernel buffers), still a
   quarter of the 64 MiB input.
 
