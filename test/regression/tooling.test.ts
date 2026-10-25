@@ -58,7 +58,9 @@ describe("F10 package.json exports every subpath, ESM only", () => {
 });
 
 describe("F11 isVarlinkError works across separate module instances", () => {
-  test("an error from one copy is recognised by another", async () => {
+  // Bun keys its module cache by path and ignores the query, so `?copy=N` gives the same instance (M10).
+  const skip = process.versions.bun === undefined ? false : "Bun ignores the query in its module cache";
+  test("an error from one copy is recognised by another", { skip }, async () => {
     type Mod = typeof import("../../src/core/errors/varlink-error.ts");
     const url = pathToFileURL(resolve("src/core/errors/varlink-error.ts")).href;
     const a = (await import(`${url}?copy=1`)) as Mod;

@@ -473,6 +473,8 @@ function addressOf(server: Server, fd?: number): string {
     return a.startsWith("\0")
       ? formatAddress({ kind: "unix-abstract", name: a.slice(1) })
       : formatAddress({ kind: "unix", path: a });
+  // Bun (1.4) reports an object without `address`/`port` for a unix socket inherited via {fd} (M10).
+  if (typeof a.address !== "string" || a.address === "" || typeof a.port !== "number") return `fd:${String(fd)}`;
   return formatAddress({ kind: "tcp", host: a.address, port: a.port });
 }
 
