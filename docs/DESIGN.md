@@ -152,8 +152,8 @@ Cells for C/sd/python/rust come from reading their sources (paths in §0), not f
 | Connection pool | — | — | — | — | ◐ (dead conns, F4) | ✅ M4 |
 | **Codegen** `.varlink` → types | ❌ | — (C macros) | — (dynamic) | ✅ `varlink_generator` | ❌ (hand-written) | ✅ M6 |
 | Dynamic client from introspection | ✅ (`call` any method) | ✅ | ✅ | ✅ | ◐ (`VarlinkDynamicMethod`) | ✅ M6 |
-| **CLI** info / introspect / call / format / validate | ✅ | ✅ | ◐ (no format) | ✅ | ❌ | ✅ M7 |
-| CLI `--more`/`--collect`/`--oneway`/`--upgrade`/`--timeout`/`--graceful` | ◐ | ✅ | ◐ | ◐ | ❌ | ✅ M7 (`--upgrade` M9) |
+| **CLI** info / introspect / call / format / validate | ✅ | ✅ | ◐ (no format) | ✅ | ❌ | ✅ M7 (implemented, §4.14) |
+| CLI `--more`/`--collect`/`--oneway`/`--upgrade`/`--timeout`/`--graceful` | ◐ | ✅ | ◐ | ◐ | ❌ | ✅ M7 (implemented, §4.14; `--upgrade` M9) |
 | Certification server + client | ✅ | — | ✅ (reference) | ✅ | ◐ (claimed, not in CI, F14) | ✅ M5 in CI both ways |
 | Runtimes | — | — | — | — | Node, Bun (CI only) | Node 22/24/26 (CI), Bun, Deno 2 (M10), browser via WebSocket (M10) |
 | Module format | — | — | — | — | CJS+ESM, no `exports` (F10, F11) | ESM only, `exports` map (M0) |
@@ -1200,6 +1200,70 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   `stripInternal` keeps a peer-`@internal` type, pool per-entry failures ask the leased connection, `| undefined`
   only for the `Object.prototype` names).
 
+### 4.14 CLI (M7)
+
+`src/cli/`: `main.ts` (the bin: `process.exitCode = await run(argv, nodeIo())`, nothing else), `node-io.ts` (the
+process side), `run.ts` (`run(argv, io): Promise<number>`, `USAGE`), `args.ts`, `io.ts`, `json.ts`, `target.ts`,
+`context.ts`, one file per command group (`introspect.ts`, `call.ts`, `idl.ts`, `bridge.ts`, `certify.ts`),
+`version.ts` (package.json via `createRequire`, same relative path from `src/cli/` and `dist/cli/`), and M5's
+`certification.ts` (moved from `examples/certification/`, which re-exports it) with the IDL embedded in
+`certification-idl.ts` (`interfaces/` is not in the npm package; a test compares it byte for byte with the file).
+`run` sees only a `CliIo` (`stdin` async iterable + `isTTY`; `stdout`/`stderr` `write()` → promise resolved once the
+OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests run it in-process on Node, Bun, Deno.
+
+| Command | Does |
+|---|---|
+| `info`, `list-interfaces ADDRESS` | GetInfo: varlinkctl's vertical table (labels right-aligned, interfaces sorted, continuation lines aligned) / sorted names; JSON: the reply / its `interfaces` |
+| `list-methods`, `introspect ADDRESS [IFACE…]` | none = all of GetInfo's (sorted, unique); names checked before connecting; `list-methods` sorted unique `iface.Method`, ` (experimental)` only on a TTY; `introspect` text = `formatInterface` per interface, blank line between, unparsable → warning + raw text; JSON: the reply objects, JSON-SEQ when more than one |
+| `call ADDRESS METHOD [PARAMS]` | PARAMS or stdin (absent or `-`; blank = `{}`; the TTY notice unless `-q`); `--more` (JSON-SEQ, one awaited write per reply), `-E`, `--collect` (one array), `--oneway` (exit once written), `--graceful=ERROR`, `-q`; the three modes are mutually exclusive |
+| `validate-idl [FILE]`, `format [FILE…]` | stdin when absent or `-`; errors `FILE:LINE:COL: reason` (`<stdin>`); `format --check` (names the non-canonical files on stderr), `-i` |
+| `codegen FILE…`, `codegen --address ADDR IFACE…` | `generate()` / `generateFromService`; `-o DIR` writes `<DIR>/<iface>.ts` (paths on stderr unless `-q`), else one input to stdout; `--ints`, `--import-path` |
+| `bridge ADDRESS` | raw bytes stdin ↔ socket (`openSocket` of `src/node/connect.ts`), unix/abstract/tcp only; stdin EOF half-closes, peer EOF ends it (0) |
+| `certify server\|client ADDRESS` | `Listening on <address>` (real port for `:0`), graceful stop on SIGINT/SIGTERM (0) / every step, `Certification passed` |
+
+- **Options**: `node:util` `parseArgs`, one table per command plus the global ones (`-h`, `-V`, `--json=`, `-j`,
+  `-q`); options anywhere (a lenient pass over the union of the tables finds the command, then a strict pass with
+  its table; `--j`/`--E` rejected). Order counts like varlinkctl (`-E --timeout=5` has a timeout, `--timeout=5 -E`
+  none). `--timeout`: seconds, decimals, units `us ms s sec min h`, `infinity`/empty = none, 0 is an error; default
+  45 s; it bounds the connect and the whole call, `--more` included (sd-varlink's semantics: the CLI runs its own
+  deadline and sets the library's timeouts to 0, §5.1's stream timeout does not apply); beyond 2³¹−1 ms it means none.
+- **Output**: `pretty` = sd-json's (TAB, `"key" : value`, `{}`/`[]`, final LF), `short` = minimal + LF, `-j` =
+  pretty on a TTY. `call` defaults to `-j` (varlinkctl.c ~900), also for `--json=off`; the others print text unless
+  asked. Strings as `JSON.stringify`, numbers as JS prints them, bigints as integer literals.
+- **Target** (`target.ts`): `parseAddress`; `websocket` → `varlink-js/websocket` `connect`, `http` →
+  `createHttpClient` (oneway → its `OperationNotSupportedError`; introspection goes to the named interface's service,
+  or with none to the bridge's only service — several → a clear error), anything else → `varlink-js/node` `connect`
+  (exec:/ssh-* print its error today and work once M8 lands). Connections: `ints: "bigint"`, `validateReplies:
+  "off"`, `timeout: 0`; every path closes them.
+- **Integers**: parameters go through `jsonCodec.decode` (lossless), replies are raw (unsafe ints are bigints), and
+  the printer writes bigints as digits: 2⁶³−1, −2⁶³, 2⁶⁴−1 round-trip through `call`, `--more`, `--collect`.
+- **Exit codes and messages**: 0, else 1 for every failure (usage errors print one line + `See 'varlink-js
+  --help'.`). Error reply: parameters on stdout (current format, SEQ under `--more`) unless `-q`, `Method call M()
+  failed: NAME` (ExpectedMore: varlinkctl's text); local failures `Failed to connect to ADDRESS: …` / `Method call
+  M() failed: <message>`; internal errors one line (`varlink-js: internal error: …`, the stack only with
+  `VARLINK_JS_DEBUG`). Stderr and text output escape C0/DEL/C1 as `\xNN` (IDL text keeps LF and TAB).
+- **Signals, EPIPE**: main.ts turns the first SIGINT/SIGTERM into `io.signal` (reason = the signal name; a second
+  one exits at once); `run` closes the connection and returns 130/143 (stdin reads, connects, calls, `bridge` all
+  watch it; `certify server` shuts down and returns 0). A stdout write failing with EPIPE (`| head -1`) is a
+  `BrokenPipeError`: the command stops, closes, exits 0, prints nothing. `node-io.ts` opens stdin only when read and
+  destroys it at the end, so the process always exits by itself.
+- **Differences from varlinkctl**: no colours, no pager, no `--no-ask-password`/polkit, no `sd_notify`
+  (`READY=1`/`VARLINKERROR=`), no experimental-method notice (an extra round trip); the error *name* instead of
+  systemd 259's errno text; `--more` messages name the method (varlinkctl's reply callback says `Method call failed:
+  NAME` / `… returned expected error: NAME`); exit 130/143 instead of dying from the signal; validate-idl's messages
+  are ours (`FILE:L:C: reason`), `-` is stdin there; a path ADDRESS is always a socket (varlinkctl execs an
+  executable); `--json` takes no `help`; maps print integer-like keys first (JS object order, sd-json keeps the
+  wire order); reals print as JS does (`1e+300`; not checked against sd-json's formatter, whose source was not at
+  hand; `/`, DEL, C1 and non-ASCII are left raw as by `JSON.stringify`); `format`, `codegen`, `bridge`, `certify`
+  and the HTTP/WebSocket targets are ours; `--upgrade` (M9), `--exec`, `--push-fd` (M11), `serve`,
+  `list-registry`, `list-sockets`, `--user`/`--system`, `monitor` options are not in M7.
+- **Tests**: `test/unit/cli/` (in-process `run()` with a fake `CliIo` against a service on a unix socket and
+  `tcp:127.0.0.1:0`, a raw socket peer for hostile bytes, and the M10 bridge fixture for one WebSocket and one HTTP
+  call; Node, Bun, Deno): every command and option, usage errors, goldens of both JSON styles, SEQ framing, int
+  precision, timeouts, `--graceful`, signals, EPIPE, escaping. `test/e2e/cli/` spawns `node src/cli/main.ts`
+  (`--version`, info, call, SEQ bytes, oneway, piped stdin, exit codes, EPIPE after closing its stdout, SIGINT →
+  130, SIGTERM → 143, bridge as a byte pipe, `certify client` ↔ `certify server` as two children).
+
 ---
 
 ## 5. Public API sketch
@@ -1696,7 +1760,7 @@ M ≈ 1, L ≈ 2–3).
 | **M4** | RPC + Node runtime: `Connection`, `Pool`, `Server` (`implement` on descriptors, `addInterface(idlText)`), built-in `org.varlink.service`, introspection `proxy()`, timeouts, AbortSignal, backpressure, limits; Node `connect`/`listen` (unix, `unix:@`, tcp); address parser | `src/rpc/`, `src/node/` (base files), `src/core/address/`, `src/index.ts` | M3 | All regressions F1–F17 pass end-to-end over `pair()` and real sockets; fuzz/soak smoke | L |
 | **M5** | Certification: `org.varlink.certification` server + client via `addInterface(idlText)` (no codegen needed), python-varlink both directions in CI (unix + tcp), systemd `varlinkctl` CI job, rust cert if cheap | `interfaces/org.varlink.certification.varlink`, `examples/certification/`, `test/interop/`, `.github/workflows/interop.yml` | M4 | Python certification green both ways in CI | M |
 | **M6** | Codegen (`generate()`, types, descriptors, error classes, `client()` factory, `Handlers` type), regenerate built-in interfaces into `src/interfaces/` and switch M4's built-ins to them | `src/codegen/`, `src/interfaces/`, `test/unit/codegen/` | M4 | Generated code for the corpus typechecks; typed e2e tests over `pair()` | M |
-| **M7** | CLI `varlink-js`: `info`, `list-interfaces`, `list-methods`, `introspect`, `call` (`--more`, `-E`, `--collect`, `--oneway`, `--timeout`, `--graceful`, `-j`/`--json`, `-q`), `format`, `validate-idl`, `codegen`, `bridge` (stdio ↔ address), `certify` | `src/cli/` | M5, M6 | CLI e2e tests; output matches varlinkctl conventions (JSON-SEQ for `--more`) | M |
+| **M7** | CLI `varlink-js`: `info`, `list-interfaces`, `list-methods`, `introspect`, `call` (`--more`, `-E`, `--collect`, `--oneway`, `--timeout`, `--graceful`, `-j`/`--json`, `-q`), `format`, `validate-idl`, `codegen`, `bridge` (stdio ↔ address), `certify` | `src/cli/` | M5, M6 | CLI e2e tests; output matches varlinkctl conventions (JSON-SEQ for `--more`). **Implemented** (§4.14) | M |
 | **M8** | Addresses II and activation: `exec:`, `ssh-unix:`, `ssh-exec:`, bridge argv, `listenAuto()`/`listenFromEnv()`, stdio serving, exit-on-idle, registry lookup and server-side registry binding (`server.serve(listener, {registry: true})` symlinks the entrypoint into `/run/varlink/registry/<iface>` for every registered interface except `org.varlink.service`, or `registry: ["…"]` for an explicit list; removed on shutdown), resolver client | `src/node/spawn*`, `src/node/activation*`, `src/node/registry*` | M4 | Tests on macOS + VM (`systemd-socket-activate`, ssh to localhost) | M |
 | **M9** | `upgrade`: client + server + CLI `--upgrade`; resolve Q4 | touches `src/core/protocol/`, `src/rpc/`, `src/cli/` | M7, M8 | Interop with `varlinkctl call --upgrade` / `serve` in VM (systemd ≥ 261) | S |
 | **M10** | WebSocket + HTTP client transports; Bun and Deno CI; browser smoke test (Playwright optional) | `src/websocket/`, `src/http/`, `.github/workflows/runtimes.yml` | M4 | Tests against a local WebSocket bridge fixture; Bun/Deno green | M |
