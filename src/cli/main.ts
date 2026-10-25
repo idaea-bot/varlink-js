@@ -1,14 +1,11 @@
 #!/usr/bin/env node
-// `varlink-js` CLI. Placeholder until M7 (DESIGN.md §10): only `--version` works.
-import { createRequire } from "node:module";
+// The `varlink-js` bin (DESIGN.md §4.14). It only wires the process; everything else is run() in run.ts.
+import { nodeIo } from "./node-io.ts";
+import { run } from "./run.ts";
 
-const require = createRequire(import.meta.url);
-const { version } = require("../../package.json") as { version: string };
-
-const args = process.argv.slice(2);
-if (args.length === 1 && (args[0] === "--version" || args[0] === "-V")) {
-  console.log(version);
-} else {
-  console.error("varlink-js: the CLI is not implemented yet (rewrite milestone M7).");
-  process.exitCode = 2;
+const io = nodeIo();
+try {
+  process.exitCode = await run(process.argv.slice(2), io);
+} finally {
+  io.dispose();
 }
