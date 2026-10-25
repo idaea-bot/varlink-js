@@ -95,10 +95,16 @@ function describe(value: unknown): string {
   return typeof value;
 }
 
+// JSON.isRawJSON is newer than lib es2024.
+const isRawJSONFn: unknown = (JSON as { isRawJSON?: unknown }).isRawJSON;
+const isRawJSON: (value: unknown) => boolean =
+  typeof isRawJSONFn === "function" ? (isRawJSONFn as (value: unknown) => boolean) : () => false;
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const proto: unknown = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+  // JSON.rawJSON() objects have a null prototype but are not JSON objects.
+  return (proto === Object.prototype || proto === null) && !isRawJSON(value);
 }
 
 const hasOwnEnumerable = (o: object, key: string): boolean => Object.prototype.propertyIsEnumerable.call(o, key);
@@ -169,7 +175,7 @@ class Compiler {
       case "any":
         return (v, ctx) => {
           if (v === undefined) return wrongType(ctx, type, v);
-          if (ctx.dir !== "encode") return v === null ? wrongType(ctx, type, v) : v;
+          if (ctx.dir !== "encode") return v === null || isRawJSON(v) ? wrongType(ctx, type, v) : v;
           if (
             typeof v === "boolean" ||
             typeof v === "string" ||
@@ -222,7 +228,8 @@ class Compiler {
             const item = v[key];
             if (item === undefined && ctx.dir === "encode") continue;
             ctx.path.push(key);
-            entries.push([key, element(item, ctx, depth + 1)]);
+            // On decode (hand-made input: JSON has no undefined) undefined is null, as for array elements.
+            entries.push([key, element(item === undefined ? null : item, ctx, depth + 1)]);
             ctx.path.pop();
           }
           // fromEntries creates own data properties: a "__proto__" key never touches the prototype.
@@ -278,6 +285,10 @@ class Compiler {
         value = BigInt(value);
       }
       if (typeof value === "number") {
+        if (Number.isNaN(value)) return wrongType(ctx, type, value);
+        // ±Infinity comes from 1e400 or an integer literal too long to decode (>309 digits, or longer than the
+        // codec's bigint limit): out of range, on every runtime.
+        if (!Number.isFinite(value)) fail(ctx, "int-range", "integer out of the range -2^63…2^64-1");
         if (!Number.isInteger(value)) return wrongType(ctx, type, value);
         if (!Number.isSafeInteger(value))
           fail(ctx, "int-range", "integer beyond ±(2^53-1) as a JS number (it may have been rounded)");

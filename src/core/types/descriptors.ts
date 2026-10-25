@@ -8,7 +8,14 @@ import { compileInterface, type CompiledInterface, type CompileOptions, type Int
 export type { ErrorClass } from "../errors/varlink-error.ts";
 
 /** A JSON value as validators and the codec produce it (`any` is a non-null JsonValue, §5.7). */
-export type JsonValue = boolean | number | bigint | string | (JsonValue | null)[] | { [key: string]: JsonValue | null };
+export type JsonValue =
+  | boolean
+  | number
+  | bigint
+  | string
+  | (JsonValue | null)[]
+  | readonly (JsonValue | null)[]
+  | { [key: string]: JsonValue | null };
 
 /** A method of a generated interface. `"~types"` is a phantom carrying the TS types; never set at runtime. */
 export interface MethodDescriptor<
@@ -51,7 +58,8 @@ function mismatch(desc: InterfaceDescriptor, what: string): never {
 
 /**
  * Parses and compiles `desc.idl` with `desc.ints`, after checking that the descriptor matches it: interface
- * name, method names, `interface`/`method` strings and flags, and error class names.
+ * name, method names, `interface`/`method` strings and flags, error class names, and that every IDL method and
+ * error is in the descriptor.
  *
  * @throws {TypeError} on a mismatch.
  * @throws {IdlSyntaxError} if the IDL is invalid.
@@ -81,6 +89,10 @@ export function compileDescriptor(
     if (cls.errorName !== `${desc.name}.${key}` || !errors.has(key))
       mismatch(desc, `errors.${key} has errorName ${cls.errorName}, not an error of the IDL`);
   }
+  for (const name of methods.keys())
+    if (!Object.hasOwn(desc.methods, name)) mismatch(desc, `IDL method ${name} is missing from methods`);
+  for (const name of errors)
+    if (!Object.hasOwn(desc.errors, name)) mismatch(desc, `IDL error ${name} is missing from errors`);
   return compileInterface(iface, { ...options, ints: desc.ints });
 }
 

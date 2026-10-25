@@ -140,7 +140,10 @@ describe("primitives", () => {
       { type: "int", input: 1e18, expect: err("int-range") },
       { type: "int", input: 1.5, expect: err("type") },
       { type: "int", input: NaN, expect: err("type") },
-      { type: "int", input: Infinity, expect: err("type") },
+      // Non-finite: a literal too long to decode (or 1e400); int-range on every runtime.
+      { type: "int", input: Infinity, expect: err("int-range") },
+      { type: "int", input: -Infinity, expect: err("int-range") },
+      { type: "int", ints: "bigint", input: Infinity, expect: err("int-range") },
       { type: "int", input: 5n, dirs: DECODE, expect: ok(5) },
       { type: "int", input: 5n, dirs: ENCODE, expect: ok(5n) },
       { type: "int", input: 2n ** 53n, dirs: DECODE, expect: err("int-range") },
@@ -203,6 +206,15 @@ describe("primitives", () => {
     ]);
   });
 
+  test("float -0 round-trips through the codec; int -0 becomes 0", () => {
+    const f = wrapper("float");
+    const text = jsonCodec.encode(f.encode({ v: -0 }));
+    assert.equal(text, '{"v":-0}');
+    const out = f.decode(jsonCodec.decode(text)) as { v: number };
+    assert.ok(Object.is(out.v, -0));
+    assert.equal(jsonCodec.encode(wrapper("int").encode({ v: -0 })), '{"v":0}');
+  });
+
   test("object", () => {
     const plain = { a: [1, { b: 2n }] };
     const bare = Object.create(null) as object;
@@ -228,6 +240,14 @@ describe("primitives", () => {
     assert.equal(out.v, plain);
   });
 
+  test("JSON.rawJSON objects are not plain objects", () => {
+    const raw = (JSON as unknown as { rawJSON(text: string): unknown }).rawJSON("1");
+    assert.equal(Object.getPrototypeOf(raw), null);
+    for (const type of ["object", "any", "()", "(a: ?int)", "[string]int"])
+      checkRows([{ type, input: raw, expect: err("type") }]);
+    checkRows([{ type: "[]any", input: [1, raw], expect: err("type", "v.1") }]);
+  });
+
   test("any", () => {
     const arr = [1, null, "x"];
     checkRows([
@@ -247,8 +267,9 @@ describe("primitives", () => {
     ]);
     const out = wrapper("any").decode({ v: arr }) as { v: unknown };
     assert.equal(out.v, arr);
-    // undefined: a type error wherever it is not "no value".
-    assert.equal(validationError(() => wrapper("[string]any").decode({ v: { k: undefined } })).reason, "type");
+    // undefined at the top level is a type error; in a decoded map it is null, as in arrays.
+    assert.equal(validationError(() => wrapper("any").decode(undefined)).reason, "type");
+    assert.equal(validationError(() => wrapper("[string]any").decode({ v: { k: undefined } })).reason, "null");
   });
 });
 
@@ -318,8 +339,20 @@ describe("structs", () => {
       constructor: "c",
       valueOf: 1,
     });
-    assert.equal(validationError(() => fields.decode({})).parameter, "valueOf");
+    const missing = validationError(() => fields.decode({}));
+    assert.equal(missing.parameter, "valueOf");
+    assert.equal(missing.reason, "missing");
     assert.equal(validationError(() => fields.decode({ valueOf: 1, constructor: 5 })).parameter, "constructor");
+
+    // Non-nullable: Object.prototype.toString / .constructor never satisfy the field.
+    const required = wrapper("(toString: int, constructor: string)");
+    for (const dir of DIRS) {
+      const e = validationError(() => run(required, dir, { v: {} }));
+      assert.equal(e.reason, "missing", dir);
+      assert.equal(e.parameter, "v.toString", dir);
+      const input = JSON.parse('{"v": {"toString": 5, "constructor": "x"}}') as unknown;
+      assert.deepEqual(run(required, dir, input), { v: { toString: 5, constructor: "x" } }, dir);
+    }
   });
 
   test("non-enumerable own fields count as absent", () => {
@@ -382,6 +415,9 @@ describe("maps", () => {
       { type: "[string]int", input: { a: 1, b: "x" }, expect: err("type", "v.b") },
       { type: "[string]int", input: { a: null }, expect: err("null", "v.a") },
       { type: "[string]int", input: { a: undefined, b: 1 }, dirs: ENCODE, expect: ok({ b: 1 }) },
+      // Decode (hand-made input): an undefined value is null, as for array elements.
+      { type: "[string]int", input: { a: undefined, b: 1 }, dirs: DECODE, expect: err("null", "v.a") },
+      { type: "[string]?int", input: { a: undefined, b: 1 }, dirs: DECODE, expect: ok({ a: null, b: 1 }) },
       { type: "[string]int", input: new Map(), expect: err("type") },
       { type: "[string]int", input: [], expect: err("type") },
       { type: "[string]?int", input: { a: null, b: 1 }, expect: ok({ a: null, b: 1 }) },
@@ -573,10 +609,14 @@ describe("§7.1 integers end to end (codec + validator)", () => {
     ["1e3", 1000, 1000n],
     ["1.5", "type", "type"],
     ["1e18", "int-range", "int-range"],
-    ["1e400", "type", "type"],
+    ["1e400", "int-range", "int-range"],
+    // Exact bigint, out of range.
+    ["1" + "0".repeat(399), "int-range", "int-range"],
+    // Longer than MAX_BIGINT_SOURCE_LENGTH: stays Infinity, still int-range.
+    ["1" + "0".repeat(1999), "int-range", "int-range"],
   ];
   for (const [literal, asNumber, asBigint] of TABLE) {
-    test(literal, () => {
+    test(literal.length > 30 ? `${String(literal.length)}-digit integer` : literal, () => {
       for (const [ints, expected] of [
         ["number", asNumber],
         ["bigint", asBigint],
@@ -602,6 +642,9 @@ describe("§7.1 integers end to end (codec + validator)", () => {
     const value = codec.decode(`{"v":${String(P53 + 1n)}}`);
     assert.equal(validationError(() => wrapper("int").decode(value)).reason, "int-range");
     assert.deepEqual(wrapper("float").decode(value), { v: 2 ** 53 });
+    // A 400-digit literal is Infinity here (exact bigint with source): int-range either way.
+    const huge = codec.decode(`{"v":1${"0".repeat(399)}}`);
+    assert.equal(validationError(() => wrapper("int").decode(huge)).reason, "int-range");
     assert.throws(() => compileInterfaceText(DEFS, { ints: "bigint", codec }), OperationNotSupportedError);
   });
 });

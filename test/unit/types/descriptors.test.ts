@@ -75,8 +75,14 @@ type Checks = [
   Expect<Equal<MethodInput<string>, never>>,
 ];
 
+// Readonly arrays (e.g. `as const` data) are JsonValues too.
+const frozenList = [1, "a", null, [true]] as const;
+const readonlyJson: JsonValue = frozenList;
+const readonlyNested: JsonValue = { list: frozenList, inner: { r: [] as readonly JsonValue[] } };
+
 test("type-level checks", () => {
   const checks: Checks = [true, true, true, true];
+  assert.deepEqual([readonlyJson, readonlyNested], [frozenList, { list: frozenList, inner: { r: [] } }]);
   const desc: InterfaceDescriptor<typeof OrgExampleFtl.methods, typeof OrgExampleFtl.errors> = OrgExampleFtl;
   const cls: ErrorClass = ParameterOutOfRange;
   // @ts-expect-error null is not a JsonValue at the top level (`any` is non-null)
@@ -109,29 +115,62 @@ describe("compileDescriptor", () => {
     name: Monitor.name,
     method: Monitor.method,
   };
-  const mismatches: [string, Parameters<typeof withChanges>[0]][] = [
-    ["interface name", (d) => (d.name = "org.example.other")],
+  // Each change keeps every other member, so the message shows which check fired.
+  const mismatches: [string, Parameters<typeof withChanges>[0], RegExp][] = [
+    ["interface name", (d) => (d.name = "org.example.other"), /declares interface org\.example\.ftl/],
     [
       "unknown method",
       (d) => (d.methods = { ...d.methods, Fly: { ...Jump, name: "Fly", method: "org.example.ftl.Fly" } }),
+      /no IDL method for methods\.Fly/,
     ],
-    ["method key", (d) => (d.methods = { Hop: Jump })],
-    ["interface string", (d) => (d.methods = { Jump: { ...Jump, interface: "org.example" } })],
-    ["method string", (d) => (d.methods = { Jump: { ...Jump, method: "org.example.ftl.Monitor" } })],
-    ["missing more flag", (d) => (d.methods = { Monitor: monitorWithoutMore })],
-    ["wrong more flag", (d) => (d.methods = { Monitor: { ...Monitor, more: "supports" } })],
-    ["extra upgrade flag", (d) => (d.methods = { Jump: { ...Jump, upgrade: "supports" } })],
-    ["experimental flag", (d) => (d.methods = { Jump: { ...Jump, experimental: true } })],
-    ["error class name", (d) => (d.errors = { ParameterOutOfRange: errorClass("org.example.ftl.Other") })],
-    ["error key", (d) => (d.errors = { Other: ParameterOutOfRange })],
+    ["method key", (d) => (d.methods = { ...d.methods, Hop: Jump }), /no IDL method for methods\.Hop/],
+    [
+      "interface string",
+      (d) => (d.methods = { ...d.methods, Jump: { ...Jump, interface: "org.example" } }),
+      /Jump\.interface/,
+    ],
+    [
+      "method string",
+      (d) => (d.methods = { ...d.methods, Jump: { ...Jump, method: "org.example.ftl.Monitor" } }),
+      /Jump\.method/,
+    ],
+    ["missing more flag", (d) => (d.methods = { ...d.methods, Monitor: monitorWithoutMore }), /Monitor\.more/],
+    [
+      "wrong more flag",
+      (d) => (d.methods = { ...d.methods, Monitor: { ...Monitor, more: "supports" } }),
+      /Monitor\.more/,
+    ],
+    [
+      "extra upgrade flag",
+      (d) => (d.methods = { ...d.methods, Jump: { ...Jump, upgrade: "supports" } }),
+      /Jump\.upgrade/,
+    ],
+    [
+      "experimental flag",
+      (d) => (d.methods = { ...d.methods, Jump: { ...Jump, experimental: true } }),
+      /Jump\.experimental/,
+    ],
+    [
+      "error class name",
+      (d) => (d.errors = { ParameterOutOfRange: errorClass("org.example.ftl.Other") }),
+      /errors\.ParameterOutOfRange has errorName org\.example\.ftl\.Other/,
+    ],
+    ["error key", (d) => (d.errors = { ...d.errors, Other: ParameterOutOfRange }), /errors\.Other/],
     [
       "error of another interface",
       (d) => (d.errors = { ParameterOutOfRange: errorClass("org.example.x.ParameterOutOfRange") }),
+      /errorName org\.example\.x\.ParameterOutOfRange/,
     ],
+    ["missing method", (d) => (d.methods = { Jump }), /IDL method Monitor is missing/],
+    ["no methods", (d) => (d.methods = {}), /IDL method Monitor is missing/],
+    ["missing error", (d) => (d.errors = {}), /IDL error ParameterOutOfRange is missing/],
   ];
-  for (const [label, change] of mismatches) {
+  for (const [label, change, message] of mismatches) {
     test(`rejects: ${label}`, () => {
-      assert.throws(() => compileDescriptor(withChanges(change)), TypeError);
+      assert.throws(
+        () => compileDescriptor(withChanges(change)),
+        (e: unknown) => e instanceof TypeError && message.test(e.message),
+      );
     });
   }
 

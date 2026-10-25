@@ -1,12 +1,13 @@
 // JSON codec with lossless integers (DESIGN.md §4.3): unsafe integer literals decode to bigint, bigint encodes
-// exactly, non-finite numbers are refused. The only place in core that calls JSON.
+// exactly, non-finite numbers are refused, nesting is limited. The only place in core that parses or
+// serializes messages.
 import { OperationNotSupportedError, ProtocolError } from "../errors/local.ts";
 
 /** Converts between message text and JS values. */
 export interface Codec {
-  /** @throws {ProtocolError} on invalid JSON (or nesting the parser cannot handle). */
+  /** @throws {ProtocolError} on invalid JSON or nesting deeper than the codec allows. */
   decode(text: string): unknown;
-  /** @throws {TypeError} on NaN/±Infinity, a bigint it cannot write exactly, cycles, or a non-JSON top level. */
+  /** @throws {TypeError} on NaN/±Infinity, a bigint it cannot write exactly, cycles, too deep nesting, or a non-JSON top level. */
   encode(value: unknown): string;
   /** True when decode never rounds integers and encode can write bigint. Required by `ints: "bigint"`. */
   readonly losslessInts: boolean;
@@ -20,6 +21,14 @@ export interface JsonCodecOptions {
    */
   sourceText?: boolean;
 }
+
+/** Deepest `[`/`{` nesting decode accepts: sd-json's DEPTH_MAX (systemd src/libsystemd/sd-json/sd-json.c:49). */
+export const MAX_JSON_DEPTH: number = 2048;
+/**
+ * Longest integer literal (in characters) decoded as an exact bigint: the text is peer-controlled and BigInt()
+ * parsing is superlinear. Longer literals stay the number JSON.parse made (Infinity: they exceed 309 digits).
+ */
+export const MAX_BIGINT_SOURCE_LENGTH: number = 1024;
 
 // `context.source` (JSON.parse source text access) and JSON.rawJSON are newer than lib es2024.
 interface ReviverContext {
@@ -35,6 +44,8 @@ interface JsonExt {
 const json = JSON as unknown as JsonExt;
 
 const INTEGER_SOURCE = /^-?\d+$/;
+/** An unsafe integer literal has at least 16 digits (2^53 has 16), so text without such a run needs no reviver. */
+const LONG_DIGIT_RUN = /\d{16}/;
 
 function hasSourceText(): boolean {
   let supported = false;
@@ -51,10 +62,45 @@ function hasSourceText(): boolean {
 
 const reviver: SourceReviver = (_key, value, context) => {
   const source = context?.source;
-  if (typeof value === "number" && !Number.isSafeInteger(value) && source !== undefined && INTEGER_SOURCE.test(source))
+  if (
+    typeof value === "number" &&
+    !Number.isSafeInteger(value) &&
+    source !== undefined &&
+    source.length <= MAX_BIGINT_SOURCE_LENGTH &&
+    INTEGER_SOURCE.test(source)
+  )
     return BigInt(source);
   return value;
 };
+
+const QUOTE = 0x22; // "
+const BACKSLASH = 0x5c;
+const OPEN_BRACKET = 0x5b;
+const CLOSE_BRACKET = 0x5d;
+const OPEN_BRACE = 0x7b;
+const CLOSE_BRACE = 0x7d;
+
+/** Deepest `[`/`{` nesting outside strings. Runs before JSON.parse, so the text may not be valid JSON. */
+function nestingDepth(text: string): number {
+  let depth = 0;
+  let max = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === QUOTE) {
+      for (i++; i < text.length; i++) {
+        const s = text.charCodeAt(i);
+        if (s === BACKSLASH) i++;
+        else if (s === QUOTE) break;
+      }
+    } else if (c === OPEN_BRACKET || c === OPEN_BRACE) {
+      depth++;
+      if (depth > max) max = depth;
+    } else if (c === CLOSE_BRACKET || c === CLOSE_BRACE) {
+      depth--;
+    }
+  }
+  return max;
+}
 
 /** Creates the default JSON codec (DESIGN.md §4.3). */
 export function createJsonCodec(options?: JsonCodecOptions): Codec {
@@ -64,11 +110,17 @@ export function createJsonCodec(options?: JsonCodecOptions): Codec {
   const useSource = sourceSupported && options?.sourceText !== false;
   const rawJSON = typeof json.rawJSON === "function" ? (json.rawJSON as (text: string) => unknown) : undefined;
 
-  const replacer: Replacer = (_key, value) => {
-    if (typeof value === "bigint") {
+  const replacer: Replacer = function (key, value) {
+    // Read the holder: toJSON runs before the replacer, and a BigInt.prototype.toJSON polyfill must not turn
+    // bigints into strings or rounded numbers.
+    const raw = (this as Record<string, unknown>)[key];
+    const big = typeof raw === "bigint" ? raw : typeof value === "bigint" ? value : undefined;
+    if (big !== undefined) {
       if (rawJSON === undefined) throw new TypeError("bigint cannot be encoded: this runtime lacks JSON.rawJSON");
-      return rawJSON(value.toString());
+      return rawJSON(big.toString());
     }
+    // JSON.stringify writes -0 as 0; decode keeps a float -0, so encode does too.
+    if (rawJSON !== undefined && Object.is(value, -0)) return rawJSON("-0");
     const n = value instanceof Number ? value.valueOf() : value;
     if (typeof n === "number" && !Number.isFinite(n)) throw new TypeError("NaN/Infinity cannot be encoded (UAPI)");
     return value;
@@ -77,14 +129,24 @@ export function createJsonCodec(options?: JsonCodecOptions): Codec {
   return {
     losslessInts: useSource && rawJSON !== undefined,
     decode(text: string): unknown {
+      // A text of at most 2 * MAX_JSON_DEPTH characters cannot nest deeper than that.
+      if (text.length > 2 * MAX_JSON_DEPTH && nestingDepth(text) > MAX_JSON_DEPTH)
+        throw new ProtocolError(`JSON nested deeper than ${String(MAX_JSON_DEPTH)} levels`);
       try {
-        return useSource ? json.parse(text, reviver) : JSON.parse(text);
+        return useSource && LONG_DIGIT_RUN.test(text) ? json.parse(text, reviver) : JSON.parse(text);
       } catch (e) {
         throw new ProtocolError("invalid JSON message", { cause: e });
       }
     },
     encode(value: unknown): string {
-      const text = json.stringify(value, replacer);
+      let text: string | undefined;
+      try {
+        text = json.stringify(value, replacer);
+      } catch (e) {
+        if (e instanceof RangeError)
+          throw new TypeError("value too deeply nested or too large to encode", { cause: e });
+        throw e;
+      }
       if (text === undefined) throw new TypeError(`a top-level ${typeof value} cannot be encoded as JSON`);
       return text;
     },

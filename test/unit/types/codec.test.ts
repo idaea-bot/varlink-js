@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { ProtocolError } from "../../../src/core/errors/index.ts";
+import { MAX_BIGINT_SOURCE_LENGTH, MAX_JSON_DEPTH } from "../../../src/core/types/codec.ts";
 import { createJsonCodec, jsonCodec, type Codec } from "../../../src/core/types/index.ts";
 
 const P53 = 2n ** 53n;
@@ -81,14 +82,102 @@ describe("decode errors are ProtocolError", () => {
     test(`deep nesting (losslessInts ${String(codec.losslessInts)})`, () => {
       const isProtocol = (e: unknown): boolean => e instanceof ProtocolError && e.constructor === ProtocolError;
       assert.throws(() => codec.decode("[".repeat(1_000_000)), isProtocol);
-      // Valid but deep: the reviver (with source) recurses; either way only ProtocolError may escape.
-      try {
-        codec.decode("[".repeat(1_000_000) + "]".repeat(1_000_000));
-      } catch (e) {
-        assert.ok(isProtocol(e), String(e));
-      }
+      // Valid but deep: refused before parsing, the same in both modes.
+      assert.throws(() => codec.decode("[".repeat(200_000) + "]".repeat(200_000)), {
+        name: "ProtocolError",
+        message: `JSON nested deeper than ${String(MAX_JSON_DEPTH)} levels`,
+      });
     });
   }
+});
+
+describe(`decode: at most ${String(MAX_JSON_DEPTH)} levels (sd-json DEPTH_MAX)`, () => {
+  const arrays = (n: number, inner = ""): string => "[".repeat(n) + inner + "]".repeat(n);
+  const objects = (n: number): string => '{"a":'.repeat(n - 1) + "{}" + "}".repeat(n - 1);
+  /** [levels, innermost container] of a single-path nesting; iterative (assert.deepEqual overflows here). */
+  const depthOf = (value: unknown): [number, unknown] => {
+    let v = value;
+    let n = 0;
+    for (;;) {
+      if (typeof v !== "object" || v === null) return [n, v];
+      const children = Object.values(v);
+      if (children.length === 0) return [n + 1, v];
+      if (children.length > 1 || typeof children[0] !== "object") return [n + 1, children];
+      n++;
+      v = children[0];
+    }
+  };
+
+  for (const codec of [withSource, noSource]) {
+    const mode = `losslessInts ${String(codec.losslessInts)}`;
+    test(`exactly ${String(MAX_JSON_DEPTH)} decodes, one more is ProtocolError (${mode})`, () => {
+      assert.deepEqual(depthOf(codec.decode(arrays(MAX_JSON_DEPTH))), [MAX_JSON_DEPTH, []]);
+      assert.deepEqual(depthOf(codec.decode(objects(MAX_JSON_DEPTH))), [MAX_JSON_DEPTH, {}]);
+      // With a 16-digit number, so the source mode really runs its reviver.
+      const big = codec.decode(arrays(MAX_JSON_DEPTH, "18446744073709551615"));
+      assert.deepEqual(depthOf(big), [MAX_JSON_DEPTH, [codec.losslessInts ? 2n ** 64n - 1n : 2 ** 64]]);
+      // (An unclosed "[" × 2049 is shorter than the scan threshold: plain invalid JSON, still a ProtocolError.)
+      assert.throws(() => codec.decode("[".repeat(MAX_JSON_DEPTH + 1)), ProtocolError);
+      for (const text of [arrays(MAX_JSON_DEPTH + 1), objects(MAX_JSON_DEPTH + 1), "[".repeat(3 * MAX_JSON_DEPTH)])
+        assert.throws(() => codec.decode(text), { name: "ProtocolError", message: /nested deeper/ });
+    });
+
+    test(`brackets and escaped quotes inside strings do not count (${mode})`, () => {
+      const tricky = JSON.stringify('"' + "[{".repeat(5000) + '\\"[\\');
+      assert.equal(typeof codec.decode(tricky), "string");
+      assert.ok(codec.decode(arrays(MAX_JSON_DEPTH, tricky)));
+      assert.throws(() => codec.decode(arrays(MAX_JSON_DEPTH + 1, tricky)), ProtocolError);
+      const list = codec.decode(`[${tricky},${tricky}]`) as unknown[];
+      assert.equal(list.length, 2);
+    });
+  }
+});
+
+describe("decode: integer literal length limit", () => {
+  test(`literals of at most ${String(MAX_BIGINT_SOURCE_LENGTH)} characters are exact`, () => {
+    const longest = "1" + "0".repeat(MAX_BIGINT_SOURCE_LENGTH - 1);
+    assert.equal(withSource.decode(longest), 10n ** BigInt(MAX_BIGINT_SOURCE_LENGTH - 1));
+    const negative = "-" + "9".repeat(MAX_BIGINT_SOURCE_LENGTH - 1);
+    assert.equal(withSource.decode(negative), -(10n ** BigInt(MAX_BIGINT_SOURCE_LENGTH - 1) - 1n));
+    assert.equal(withSource.decode(longest + "0"), Infinity);
+    assert.equal(withSource.decode("-" + "9".repeat(MAX_BIGINT_SOURCE_LENGTH)), -Infinity);
+  });
+
+  test("a 2000-digit literal decodes to Infinity, quickly", () => {
+    assert.deepEqual(withSource.decode(`{"a":[1${"0".repeat(1999)}]}`), { a: [Infinity] });
+    const start = performance.now();
+    assert.equal(withSource.decode("1".repeat(1_000_000)), Infinity);
+    assert.ok(performance.now() - start < 1000, "a 1M-digit literal is not handed to BigInt()");
+  });
+});
+
+describe("decode: the reviver is skipped without a 16-digit run", () => {
+  // Adding a field with a 16-digit run forces the reviver; the rest of the result must not change.
+  const inputs = [
+    "1",
+    "-0",
+    '"x"',
+    "[1.5,1e3,-0,1e400,123456789012345]",
+    '{"a":{"b":[9007199254740991,-9007199254740991]},"c":null,"d":true}',
+    '{"__proto__":{"x":1},"s":"[{"}',
+  ];
+  for (const text of inputs) {
+    test(text, () => {
+      const plain = withSource.decode(text);
+      const forced = withSource.decode(`[${text},"0000000000000000"]`) as unknown[];
+      assert.deepEqual(forced, [plain, "0000000000000000"]);
+      assert.deepEqual(plain, noSource.decode(text));
+      if (typeof plain === "number") assert.ok(Object.is(plain, forced[0]));
+    });
+  }
+
+  test("a 16-digit run anywhere enables it", () => {
+    assert.equal(withSource.decode(String(P53)), P53);
+    assert.deepEqual(withSource.decode(`{"s":"1234567890123456","n":${String(P53)}}`), {
+      s: "1234567890123456",
+      n: P53,
+    });
+  });
 });
 
 describe("encode", () => {
@@ -103,8 +192,48 @@ describe("encode", () => {
 
   test("numbers, strings and nesting", () => {
     assert.equal(jsonCodec.encode({ a: 1, b: [true, null, "x"], c: 1.5 }), '{"a":1,"b":[true,null,"x"],"c":1.5}');
-    assert.equal(jsonCodec.encode(-0), "0");
     assert.equal(jsonCodec.encode({ u: undefined }), "{}");
+  });
+
+  test("-0 is written as -0 (decode keeps it too)", () => {
+    for (const codec of [withSource, noSource]) {
+      assert.equal(codec.encode(-0), "-0");
+      assert.equal(codec.encode({ f: [-0, 0] }), '{"f":[-0,0]}');
+      const back = codec.decode(codec.encode({ f: -0 })) as { f: number };
+      assert.ok(Object.is(back.f, -0));
+    }
+  });
+
+  test("a BigInt.prototype.toJSON polyfill does not change the output", () => {
+    const value = { a: 2n ** 64n - 1n, b: [-(2n ** 63n), 1n], c: 1 };
+    const expected = '{"a":18446744073709551615,"b":[-9223372036854775808,1],"c":1}';
+    const polyfills = [
+      function (this: bigint): string {
+        return this.toString();
+      },
+      function (this: bigint): number {
+        return Number(this);
+      },
+    ];
+    for (const toJSON of polyfills) {
+      try {
+        Object.defineProperty(BigInt.prototype, "toJSON", { value: toJSON, writable: true, configurable: true });
+        assert.equal(jsonCodec.encode(value), expected);
+        assert.equal(jsonCodec.encode(2n ** 64n - 1n), "18446744073709551615");
+      } finally {
+        delete (BigInt.prototype as { toJSON?: unknown }).toJSON;
+      }
+    }
+    assert.equal(Object.hasOwn(BigInt.prototype, "toJSON"), false);
+  });
+
+  test("a value nested too deeply to encode throws TypeError", () => {
+    let deep: unknown = [];
+    for (let i = 0; i < 1_000_000; i++) deep = [deep];
+    assert.throws(
+      () => jsonCodec.encode(deep),
+      (e: unknown) => e instanceof TypeError && e.cause instanceof RangeError && /too deeply/.test(e.message),
+    );
   });
 
   test("NaN and ±Infinity throw TypeError, also nested", () => {
