@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { describe, test } from "node:test";
 import { OperationNotSupportedError } from "../../../src/core/errors/index.ts";
 import type { ByteChannel } from "../../../src/core/protocol/index.ts";
-import { listen } from "../../../src/node/index.ts";
+import { createServer } from "../../../src/index.ts";
+import { connect, listen } from "../../../src/node/index.ts";
 import { listenUnixWithHooks } from "../../../src/node/listen.ts";
 import { closeServer, listening, tempDir, turns } from "./helpers.ts";
 
@@ -177,6 +178,114 @@ describe("listen unix", () => {
       s.destroy();
     } finally {
       await closeServer(other);
+    }
+  });
+
+  test("restore never overwrites: a third socket at the path keeps it, the moved one stays in the private dir", async () => {
+    const sub = join(dir(), "restore-race");
+    await mkdir(sub);
+    const path = join(sub, "s");
+    await staleSocket(path);
+    const other = createNetServer();
+    const third = createNetServer();
+    const err = await listenUnixWithHooks(
+      path,
+      {},
+      {
+        beforeReplace: async () => {
+          await listening(other, { path: join(sub, "other") });
+          await rename(join(sub, "other"), path);
+        },
+        beforeRestore: async () => {
+          await listening(third, { path: join(sub, "third") });
+          await rename(join(sub, "third"), path);
+        },
+      },
+    ).then(
+      async (l) => {
+        await l.close();
+        return new Error("listen() resolved");
+      },
+      (e: unknown) => e,
+    );
+    try {
+      assert.ok(inUse(err), String(err));
+      const kept = readdirSync(sub).filter((n) => n.startsWith(".vjs-"));
+      assert.equal(kept.length, 1);
+      const tomb = join(sub, kept[0] ?? "", "old");
+      assert.match(String(err), /another socket now occupies the path/);
+      assert.ok(String(err).includes(tomb));
+      // The third listener owns the path; the moved one is still reachable through its only name.
+      const acceptedThird = new Promise((resolve) => third.once("connection", resolve));
+      const s1 = await dial(path);
+      await acceptedThird;
+      s1.destroy();
+      const acceptedOther = new Promise((resolve) => other.once("connection", resolve));
+      const s2 = await dial(tomb);
+      await acceptedOther;
+      s2.destroy();
+      assert.deepEqual(readdirSync(join(sub, kept[0] ?? "")), ["old"]);
+    } finally {
+      await closeServer(other);
+      await closeServer(third);
+    }
+  });
+
+  test("no hard links (link fails with EPERM): falls back to binding at the path", async () => {
+    const sub = join(dir(), "nolink");
+    await mkdir(sub);
+    const path = join(sub, "s");
+    const l = await listenUnixWithHooks(
+      path,
+      { mode: 0o600 },
+      {
+        link: () => Promise.reject(Object.assign(new Error("operation not permitted"), { code: "EPERM" })),
+      },
+    );
+    try {
+      assert.equal(l.server.address(), path);
+      assert.equal(lstatSync(path).mode & 0o777, 0o600);
+      assert.deepEqual(readdirSync(sub), ["s"]);
+      const accepted = (async () => {
+        for await (const ch of l) return ch;
+        return undefined;
+      })();
+      const s = await dial(path);
+      const ch = await accepted;
+      assert.ok(ch !== undefined);
+      ch.close();
+      s.destroy();
+    } finally {
+      await l.close();
+    }
+    assert.deepEqual(readdirSync(sub), []);
+  });
+
+  test("a path longer than sun_path rejects with ENAMETOOLONG and creates nothing", async () => {
+    const sub = join(dir(), "toolong");
+    await mkdir(sub);
+    const path = join(sub, "n".repeat(120));
+    await assert.rejects(listen(`unix:${path}`), (e: unknown) => codeOf(e) === "ENAMETOOLONG");
+    assert.deepEqual(readdirSync(sub), []);
+  });
+
+  test("a second Server serving the same listener throws; the first keeps serving", async () => {
+    const path = join(dir(), "twoservers");
+    const l = await listen(path);
+    const a = createServer({ onError: () => undefined });
+    const b = createServer({ onError: () => undefined });
+    try {
+      a.serve(l);
+      assert.throws(() => {
+        b.serve(l);
+      }, TypeError);
+      const c = await connect(path);
+      assert.equal((await c.getInfo()).interfaces[0], "org.varlink.service");
+      await c.close();
+    } finally {
+      await a.shutdown();
+      await b.shutdown();
+      await l.close();
     }
   });
 

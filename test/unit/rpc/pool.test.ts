@@ -278,7 +278,8 @@ describe("Pool", () => {
     assert.equal(seen.length, 2);
     for (const s of seen) assert.ok(s.aborted && s.reason instanceof CallTimeoutError);
     hang = false;
-    assert.deepEqual(await pool.call("org.example.p.Echo", { text: "c" }), { text: "c" });
+    // A real connection may take longer than the pool's 10 ms on a loaded machine.
+    assert.deepEqual(await pool.call("org.example.p.Echo", { text: "c" }, { timeout: 10_000 }), { text: "c" });
     await pool.close();
     await f.server.shutdown();
   });

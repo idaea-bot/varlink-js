@@ -507,7 +507,9 @@ export class Server {
   /**
    * Accepts channels from `listener` in the background (returns at once) and serves each with {@link handle}. An
    * error from the iteration is reported as `accept-failed`, ends that loop and closes the listener (its errors
-   * swallowed). Several listeners may be served; {@link shutdown} closes them.
+   * swallowed). Several listeners may be served; {@link shutdown} closes them. The iterator is obtained
+   * synchronously: a listener that is already being iterated (served by this or another Server) makes `serve()`
+   * throw (TypeError for this Server's own listeners and for a Node listener) and is left untouched.
    *
    * @throws {TypeError} if `listener` is already being served (it is left alone).
    */
@@ -517,10 +519,16 @@ export class Server {
       void this.#closeListener(listener);
       return;
     }
+    // Obtained synchronously: a listener that refuses a second iteration (served by another Server) throws here,
+    // and that must not close it under its first user.
+    const iterator = listener[Symbol.asyncIterator]();
     this.#listeners.add(listener);
     void (async () => {
       try {
-        for await (const channel of listener) {
+        for (;;) {
+          const r = await iterator.next();
+          if (r.done === true) break;
+          const channel = r.value;
           if (this.#shutdown !== undefined) channel.close();
           else void this.handle(channel);
         }
@@ -543,8 +551,9 @@ export class Server {
    * call's signal (replies are still written), drops buffered calls and, once its active call finished, ends each
    * connection (FIN after the last reply) and discards its input until the peer closes, for at most 2000 ms; at the
    * `timeout` deadline (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves
-   * when every connection is closed. With `timeout: 0` it waits for every active handler to finish: a handler that
-   * ignores its signal holds it forever.
+   * when every connection is closed. With `timeout: 0` it waits for every active handler to finish and for its
+   * replies to be written: a handler that ignores its signal, or a peer that stops reading while a reply is being
+   * written, holds it forever (use a deadline).
    *
    * @throws {RangeError|TypeError} for invalid options (synchronously; nothing is stopped then).
    */

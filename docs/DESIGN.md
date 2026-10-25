@@ -801,7 +801,8 @@ over `pair()`, unix and tcp sockets.
   deadline, if sooner), then the connection is closed hard, so a peer that never closes its side (or never sends
   anything more, leaving the reader inside `read()`) cannot hold the shutdown; a `read()` rejection during the
   finish closes at once. At the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false`
-  everything is closed hard. With `timeout: 0` the shutdown still waits for every active handler: one that ignores
+  everything is closed hard. With `timeout: 0` the shutdown still waits for every active handler and for its reply writes (a peer that stops
+  reading while a reply is being written holds it too, since the linger only starts after `end()`): one that ignores
   its signal holds it forever. Protocol
   errors, unclaimed upgrades, transport errors and the clean-EOF close stay hard closes. No timers on server
   connections other than the shutdown deadline (F1).
@@ -838,7 +839,9 @@ over `pair()`, unix and tcp sockets.
   retried once (a second `EEXIST` → `EADDRINUSE`); if not (someone published a live socket meanwhile), it is renamed
   back (failing that, linked back; the rejection message says so) and `listen()` rejects `EADDRINUSE`. A live socket
   (connect succeeds, or `EAGAIN`) or a non-socket → `EADDRINUSE`, never touched. So of concurrent `listen()`s on one
-  path exactly one wins, in one process (mutex) and across processes (link + rename). Every error path closes the
+  path exactly one wins, in one process (mutex) and across processes (link + rename), assuming no third party
+  publishes at the path during the stale replace (then a live socket may end up kept in our private directory, see
+  the rejection message, rather than at `path`). Every error path closes the
   server and removes the private directory with its contents. libuv unlinks a pipe's bound name on close, which hits
   the (already removed) private name, so `close()` unlinks the path only if it is still our inode (dev+ino).
   Fallback: if `<dir>/s` would exceed sun_path (107 bytes on Linux, 103 elsewhere), or `mkdtemp`/the first `link`

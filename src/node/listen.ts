@@ -226,7 +226,14 @@ const sameInode = (a: Inode, b: Inode): boolean => a.dev === b.dev && a.ino === 
 /** Test hooks (internal): `beforeReplace` runs between probing a stale socket and moving it away. */
 export interface PublishHooks {
   beforeReplace?: () => Promise<void>;
+  /** Runs after a non-stale entry was moved away, before it is put back. */
+  beforeRestore?: () => Promise<void>;
+  /** Replaces `fs.promises.link` (to simulate a filesystem without hard links). */
+  link?: (existing: string, target: string) => Promise<void>;
 }
+
+/** Errors from `publish` after which the private directory must stay: it holds someone else's live socket. */
+const keepPrivateDir = new WeakSet<object>();
 
 /** `link` (or `mkdtemp`) failing like this means the filesystem cannot do the private-directory publish. */
 const NO_LINK_SUPPORT = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENAMETOOLONG"]);
@@ -270,9 +277,10 @@ async function publish(
   let replacedStale = false;
   let vanished = 0;
   let first = true;
+  const linkFn = hooks?.link ?? link;
   for (;;) {
     try {
-      await link(socket, path);
+      await linkFn(socket, path);
       return "published";
     } catch (e) {
       if (first && NO_LINK_SUPPORT.has(codeOf(e) as string)) return "unsupported";
@@ -296,8 +304,13 @@ async function publish(
         if (codeOf(e) !== "ENOENT") throw e;
       }
       if (st !== undefined) {
-        if (!sameInode(st, found.inode))
-          throw addressInUse(path, `it was replaced while probing${await restore(tomb, path)}`);
+        if (!sameInode(st, found.inode)) {
+          await hooks?.beforeRestore?.();
+          const restored = await restore(tomb, path);
+          const err = addressInUse(path, `it was replaced while probing${restored.message}`);
+          if (!restored.ok) keepPrivateDir.add(err);
+          throw err;
+        }
         await unlink(tomb);
         replacedStale = true;
         continue;
@@ -309,22 +322,38 @@ async function publish(
   }
 }
 
-/** Puts back an entry `publish` moved away by mistake; describes a failure (for the rejection message). */
-async function restore(tomb: string, path: string): Promise<string> {
+/**
+ * Puts back an entry `publish` moved away by mistake, never overwriting: `link` first (a third party may have
+ * published at `path` meanwhile: EEXIST), `rename` only if `link` fails otherwise. `ok: false` means the entry is
+ * still at `tomb` (its only name now): the caller must keep the private directory, and the message names it.
+ */
+async function restore(tomb: string, path: string): Promise<{ ok: boolean; message: string }> {
   try {
-    await rename(tomb, path);
-    return "";
+    await link(tomb, path);
+    await unlink(tomb).catch(() => undefined);
+    return { ok: true, message: "" };
   } catch (e) {
-    try {
-      await link(tomb, path);
-      return `; it was moved away, could not be renamed back (${String(e)}) and was linked back`;
-    } catch (e2) {
-      return `; it was moved away and could not be put back (${String(e)}; ${String(e2)})`;
+    if (codeOf(e) !== "EEXIST") {
+      try {
+        await rename(tomb, path);
+        return { ok: true, message: "" };
+      } catch (e2) {
+        return {
+          ok: false,
+          message: `; it was moved to ${tomb} and could not be put back (${String(e)}; ${String(e2)})`,
+        };
+      }
     }
+    return { ok: false, message: `; it was moved to ${tomb} and another socket now occupies the path` };
   }
 }
 
 async function listenUnix(path: string, options: ListenOptions, hooks?: PublishHooks): Promise<NodeListener> {
+  // A path that does not fit in sun_path could be published (link takes any length) but nobody could connect.
+  if (Buffer.byteLength(path) > SUN_PATH_MAX)
+    throw Object.assign(new Error(`unix socket path too long (over ${String(SUN_PATH_MAX)} bytes): ${path}`), {
+      code: "ENAMETOOLONG",
+    });
   return withPathLock(resolve(path), async () => {
     // The private socket path must fit in sun_path; else (or without hard links) bind at `path` directly.
     const placeholder = join(dirname(path), ".vjs-XXXXXX", "s");
@@ -378,7 +407,9 @@ async function listenPrivate(
   } catch (e) {
     // close() leaves `path` alone unless it is ours (inode set): only a failed cleanup gets here then.
     await listener.close();
-    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    // A socket we could not put back lives on only in `dir` (named in the error): remove just our own name then.
+    if (typeof e === "object" && e !== null && keepPrivateDir.has(e)) await unlink(socket).catch(() => undefined);
+    else await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     throw e;
   }
 }
