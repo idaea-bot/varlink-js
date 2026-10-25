@@ -1,9 +1,21 @@
 // Transport harness for the end-to-end regression suite (DESIGN.md §7.2, §4.11). A Transport serves a Server on
-// some kind of connection and gives clients (Connection) and raw byte-level peers. Phase A: pair(); phase B adds
-// unix/tcp sockets by implementing Transport and appending to `transports`.
+// some kind of connection and gives clients (Connection) and raw byte-level peers: pair(), unix and tcp sockets.
+import { mkdtemp, rm } from "node:fs/promises";
+import { connect as netConnect, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseAddress } from "../../src/core/address/index.ts";
 import { ConnectionClosedError } from "../../src/core/errors/index.ts";
 import type { ByteChannel, ReadChunk } from "../../src/core/protocol/index.ts";
-import { createConnection, type Connection, type ConnectionOptions, type Server } from "../../src/rpc/index.ts";
+import { socketOptions } from "../../src/node/connect.ts";
+import { connect, fromNodeSocket, listen, type NodeListener } from "../../src/node/index.ts";
+import {
+  createConnection,
+  type Connection,
+  type ConnectionOptions,
+  type ServeListener,
+  type Server,
+} from "../../src/rpc/index.ts";
 import { pair, type PairOptions } from "../../src/testing/index.ts";
 
 /** Byte-level access to one connection to the server (the client side). */
@@ -33,6 +45,11 @@ export interface Endpoint {
 
 export interface Transport {
   readonly name: string;
+  /**
+   * Whether `RawPeer.reset()` is seen by the server as a disconnect (a rejected read). False for unix sockets: they
+   * have no RST, so a destroyed peer is a clean EOF (half-close), which is not "gone" (DESIGN.md §4.11).
+   */
+  readonly abruptReset: boolean;
   start(server: Server): Promise<Endpoint>;
 }
 
@@ -86,21 +103,26 @@ export function resettable(inner: ByteChannel): ByteChannel & { reset(): void } 
 /** A RawPeer over the client end of a channel. */
 export function rawPeerOf(channel: ByteChannel, reset: () => void): RawPeer {
   const chunks: Uint8Array[] = [];
-  let buffer: Uint8Array = new Uint8Array(0);
+  /** Received bytes not yet returned as messages; joined only when a NUL arrives (sockets give small chunks). */
+  let pending: Uint8Array[] = [];
   let eof = false;
-  const join = (a: Uint8Array, b: Uint8Array): Uint8Array => {
-    const out = new Uint8Array(a.length + b.length);
-    out.set(a);
-    out.set(b, a.length);
+  const concat = (parts: readonly Uint8Array[]): Uint8Array => {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
     return out;
   };
   const readMessage = async (): Promise<string | null> => {
     for (;;) {
-      const nul = buffer.indexOf(0);
-      if (nul >= 0) {
-        const text = new TextDecoder().decode(buffer.subarray(0, nul));
-        buffer = buffer.slice(nul + 1);
-        return text;
+      // Only the newest chunk and a leftover (always first) can hold a NUL: the others were checked as newest.
+      if (pending.at(-1)?.includes(0) === true || pending[0]?.includes(0) === true) {
+        const buffer = concat(pending);
+        const nul = buffer.indexOf(0);
+        pending = nul + 1 < buffer.length ? [buffer.subarray(nul + 1)] : [];
+        return new TextDecoder().decode(buffer.subarray(0, nul));
       }
       if (eof) return null;
       const chunk = await channel.read().catch(() => null);
@@ -109,7 +131,7 @@ export function rawPeerOf(channel: ByteChannel, reset: () => void): RawPeer {
         continue;
       }
       chunks.push(chunk.bytes);
-      buffer = join(buffer, chunk.bytes);
+      pending.push(chunk.bytes);
     }
   };
   return {
@@ -120,7 +142,7 @@ export function rawPeerOf(channel: ByteChannel, reset: () => void): RawPeer {
       for (let m = await readMessage(); m !== null; m = await readMessage()) out.push(m);
       return out;
     },
-    received: () => chunks.reduce(join, new Uint8Array(0)),
+    received: () => concat(chunks),
     end: () => channel.end(),
     reset,
     close: () => {
@@ -134,6 +156,7 @@ export function pairTransport(options: TransportOptions = {}): Transport {
   const pairOptions: PairOptions = options.highWaterMark === undefined ? {} : { highWaterMark: options.highWaterMark };
   return {
     name: "pair",
+    abruptReset: true,
     start(server: Server): Promise<Endpoint> {
       const serverSides = new Set<ByteChannel>();
       const handled = new Set<Promise<void>>();
@@ -173,8 +196,92 @@ export function pairTransport(options: TransportOptions = {}): Transport {
   };
 }
 
-/** Every transport the e2e suite runs over (phase B appends unixTransport/tcpTransport). */
-export const transports: readonly Transport[] = [pairTransport({ highWaterMark: 16 * 1024 })];
+/** A served listener that records the server-side channels it hands out (so restart() can drop them). */
+function tracked(listener: NodeListener, channels: Set<ByteChannel>): ServeListener {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const channel of listener) {
+        channels.add(channel);
+        void channel.closed.then(() => channels.delete(channel));
+        yield channel;
+      }
+    },
+    close: () => listener.close(),
+  };
+}
+
+/** Connects a raw net.Socket (allowHalfOpen, like connect()). */
+function rawSocket(address: string): Promise<Socket> {
+  const opts = socketOptions(parseAddress(address));
+  return new Promise((resolve, reject) => {
+    const socket = netConnect(opts);
+    socket.once("connect", () => {
+      socket.off("error", reject);
+      resolve(socket);
+    });
+    socket.once("error", reject);
+  });
+}
+
+/** server.serve() over a real listening socket; `address` makes the listen address (and the temp dir if needed). */
+function socketTransport(name: string, abruptReset: boolean, address: (dir: string) => string): Transport {
+  return {
+    name,
+    abruptReset,
+    async start(server: Server): Promise<Endpoint> {
+      const dir = await mkdtemp(join(tmpdir(), "vj-"));
+      const channels = new Set<ByteChannel>();
+      let listener = await listen(address(dir));
+      // Restarts listen again on the very same address (tcp: the real port).
+      const canonical = listener.address;
+      server.serve(tracked(listener, channels));
+      const dropConnections = async (): Promise<void> => {
+        const all = [...channels];
+        for (const channel of all) channel.close();
+        await Promise.all(all.map((c) => c.closed));
+      };
+      const peers = new Set<Socket>();
+      return {
+        connect: (options) => connect(canonical, options),
+        raw: async () => {
+          const socket = await rawSocket(canonical);
+          peers.add(socket);
+          socket.once("close", () => peers.delete(socket));
+          const channel = fromNodeSocket(socket);
+          return rawPeerOf(channel, () => {
+            // tcp: a real RST; unix has none, so the server sees EOF.
+            if (abruptReset) socket.resetAndDestroy();
+            else socket.destroy();
+          });
+        },
+        restart: async () => {
+          await listener.close();
+          await dropConnections();
+          listener = await listen(canonical);
+          server.serve(tracked(listener, channels));
+        },
+        close: async () => {
+          await listener.close();
+          for (const socket of peers) socket.destroy();
+          await dropConnections();
+          await rm(dir, { recursive: true, force: true });
+        },
+      };
+    },
+  };
+}
+
+/** server.serve(listen("unix:<tmp>/s")). */
+export const unixTransport: Transport = socketTransport("unix", false, (dir) => `unix:${join(dir, "s")}`);
+/** server.serve(listen("tcp:127.0.0.1:0")). */
+export const tcpTransport: Transport = socketTransport("tcp", true, () => "tcp:127.0.0.1:0");
+
+/** Every transport the e2e suite runs over. */
+export const transports: readonly Transport[] = [
+  pairTransport({ highWaterMark: 16 * 1024 }),
+  unixTransport,
+  tcpTransport,
+];
 
 /** Polls `condition` on the event loop (no wall-clock sleeps) until true, or fails after `turns`. */
 export async function waitFor(condition: () => boolean, turns = 10_000): Promise<void> {

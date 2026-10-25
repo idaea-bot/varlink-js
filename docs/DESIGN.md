@@ -412,7 +412,9 @@ systemd before shipping M8.*
 ### 4.7 Runtime adapters
 
 - **Node** (`varlink-js/node`): `node:net` (unix, tcp, abstract), `node:child_process` (exec/ssh/bridge),
-  `server.listen({fd})` for socket activation.
+  `server.listen({fd})` for socket activation. Found in M4 (§4.11): libuv unlinks a unix socket's bound path on
+  `server.close()` even after it was replaced (hence bind-on-temp-name + rename), and `server.address()` is `null`
+  for a unix socket listened via `{fd}` (hence the `fd:<n>` placeholder address).
 - **Bun, Deno 2**: start by running the Node adapter through their `node:` compat; M10 adds CI jobs. Native
   adapters (`Bun.connect`, `Deno.connect`) only if CI shows gaps. Unknowns to test: abstract sockets,
   `listen({fd})`, half-close.
@@ -705,8 +707,10 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
 internal `util.ts`), all runtime-agnostic (I/O only through `ByteChannel`, Web `setTimeout`/`AbortSignal` only).
 The root entry re-exports the rpc API (`createConnection`/`Connection`, `createPool`/`Pool`,
 `createServer`/`Server`, their option/handler types, `InterfaceProxy`, `StreamIterator`, …) and `parseAddress`,
-`formatAddress`, `AddressSpec`; sessions stay internal (§4.10). Phase B adds `src/node/` (`connect`, `listen`,
-`createPool(address)` wrapping the factory-based pool) and runs the e2e suite over sockets.
+`formatAddress`, `AddressSpec`; sessions stay internal (§4.10). `varlink-js/node` (`src/node/`: `socket.ts`,
+`connect.ts`, `listen.ts`, `pool.ts`) exports `connect`, `listen`, `createPool(address)`, `fromNodeSocket` and the
+types `ConnectOptions`, `ListenOptions`, `NodeListener` (`createServer` stays in the root entry); the e2e suite runs
+over `pair()`, unix and tcp sockets.
 - **Addresses** (§4.6): `parseAddress` returns `unix {path}` (`unix:` + any non-empty path as given, bare `/…`,
   `./…`, `../…`), `unix-abstract {name}`, `tcp {host, port}` (`[v6]` brackets removed; a bracketed host must contain
   `:`; an unbracketed one is split at its last `:` and may not contain `[`/`]`; port 1–5 decimal digits ≤ 65535, so
@@ -776,15 +780,59 @@ The root entry re-exports the rpc API (`createConnection`/`Connection`, `createP
   closes the listeners, then aborts active calls' signals and closes each connection when its call finished (buffered
   calls dropped); at the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false` everything is
   closed hard. No timers on server connections other than the shutdown deadline (F1).
-- **Tests**: `test/unit/rpc/` (connection, pool, server, proxy), `test/unit/address/`, `test/regression/harness.ts`
-  (`Transport`/`Endpoint`/`RawPeer`; `pairTransport` resets the server end like an RST; `transports` is the list the
-  suite runs over) and `e2e.test.ts` (one `describe` per F-id), `test/fuzz/server.test.ts` (fast-check, seeded,
+- **Node channel** (`fromNodeSocket(socket)`): the socket is paused and read on demand: `read()` returns the next
+  buffered chunk (a plain `Uint8Array` view of the Buffer's memory) or resumes the socket for one `data` event and
+  pauses again, so Node's own buffering is the read backpressure. Order: buffered data, then a socket error (rejects
+  one read; later reads give `null`), then `null` (after the peer's FIN once drained, or after a local `close()`,
+  which drops buffered data). Concurrent `read()` is a `TypeError`. `write()` resolves on `socket.write`'s callback,
+  rejects with its error, and with `ConnectionClosedError` when the socket closes (or is `close()`d) before the
+  callback fired, or at once after `end()`/`close()`/destroy (F3: no `flush` event, `drain` is implicit in the
+  callback). `end()` = `socket.end()`, resolves on `finish` or `close`; `close()` = `destroy()`, idempotent;
+  `closed` resolves on `close`. An `error` listener is always attached (F1/F8). `capabilities: {}`.
+- **`connect(address, {…ConnectionOptions, signal})`**: `unix` (path), `unix-abstract` (Linux: Node path
+  `"\0" + name`; elsewhere `OperationNotSupportedError`), `tcp` (`noDelay`); other kinds →
+  `OperationNotSupportedError` naming the kind (M8/M10). All sockets `allowHalfOpen`. The connect phase is bounded by
+  `timeout` (default 45 s, 0 = none → `CallTimeoutError("connect timed out")`) and `signal` (its reason); the socket
+  is destroyed on either; Node errors (`ENOENT`, `ECONNREFUSED`) reject as they are. `createPool(address, options)`
+  splits `max`/`idleTimeout` off and passes the rest, plus the factory's signal, to `connect`.
+- **`listen(address | {fd}, {mode, backlog})`** → `NodeListener` (`Listener` + read-only `server: net.Server`):
+  `net.createServer({allowHalfOpen, pauseOnConnect})`; `listen()` rejects on `EADDRINUSE` and every other listen
+  error (F8); later server `error`s are stored and thrown by the iterator (→ `accept-failed`), and connections
+  arriving after that are destroyed. Unix paths: an existing path that is a socket is probed with a connect:
+  refused (or vanished) = stale and replaced, connected = `EADDRINUSE` (a live socket is never stolen), not a socket
+  = `EADDRINUSE` (never unlinked). The socket is bound on a temporary name in the same directory (`.` + random hex,
+  as long as the target's basename where possible, for sun_path), `chmod`ed to `mode`, then `rename`d into place:
+  libuv unlinks a pipe's bound name on close even if it was replaced, and the rename means that unlink hits the
+  temporary name, so `close()` unlinks the path only if it is still our inode (dev+ino). This also closes the
+  "socket briefly has the umask mode" window and makes the stale replacement atomic; the stale probe → rename step
+  is still a check-then-act race against another process binding the same path at the same moment. Consequence:
+  `listener.server.address()` names the temporary path (use `listener.address`). `unix:@name` Linux only. tcp:
+  `address` from `server.address()` (port 0 → the real port, `tcp:[::1]:p` for IPv6). `{fd}` (socket activation,
+  §5.8; `listenFromEnv` in M8 builds on it): `server.listen({fd})`; `address` from `server.address()` (object →
+  `tcp:…`, string with leading NUL → `unix:@…`, other string → `unix:…`), but Node returns `null` for a unix socket
+  inherited this way (pipes have no getsockname in Node), so the address is the placeholder `fd:<n>` there (not a
+  dialable varlink address; M8 may pass the known path). Accepted sockets are wrapped (`fromNodeSocket`) at once,
+  queued and handed out by the iterator; `close()` (idempotent) stops listening without waiting for taken
+  connections, ends the iterator (a pending `next()` resolves done) and closes queued ones. A second concurrent
+  iteration is a `TypeError`; after `return()` the listener may be iterated again.
+- **Tests**: `test/unit/rpc/` (connection, pool, server, proxy), `test/unit/address/`, `test/unit/node/` (socket
+  channel, connect incl. a mocked-clock connect timeout, listen, `abstract.test.ts` Linux-only, `fd.test.ts`: a
+  child process serves on a listening fd inherited as `stdio[3]`), `test/regression/harness.ts`
+  (`Transport`/`Endpoint`/`RawPeer`; `pairTransport` resets the server end like an RST; `unixTransport` /
+  `tcpTransport` serve `listen()` in a `vj-` temp dir / on `127.0.0.1:0`, `restart()` closes the listener and every
+  server connection and listens again on the same address; `transports` is the list the suite runs over),
+  `e2e.test.ts` (one `describe` per F-id, every case over every transport), `sockets.test.ts` (F8, F3 with both
+  socket buffers full), `tooling.test.ts` (F10–F14, F16), `test/fuzz/server.test.ts` (fast-check, seeded,
   `VARLINK_FUZZ_RUNS` default 200). Soak: `VARLINK_SOAK_SECONDS=600 node test/fuzz/soak.ts` runs the same generator
   against one server, prints RSS every 10 s and exits non-zero on an unhandled rejection, uncaught exception, hang
   or a server that stops answering (`VARLINK_FC_SEED` fixes the seed).
 - **Known limits**: a `pair()` peer's `close()` looks like a clean EOF to the server (only a socket RST or the
   harness reset is a disconnect), so over `pair()` a handler waiting on its signal is not aborted by a client
-  `close()`; it is when its reply's write fails.
+  `close()`; it is when its reply's write fails. Unix sockets have no RST either: a destroyed unix peer is a clean
+  EOF to the server, so F1's "reset aborts `ctx.signal`" holds for pair and tcp only (`Transport.abruptReset`); over
+  unix the test checks that the server survives and keeps serving. F15's memory bound is 4 × `maxMessageSize` over
+  pair and 16 × over sockets (a fresh Buffer per read, garbage until the next GC, plus kernel buffers), still a
+  quarter of the 64 MiB input.
 
 ---
 

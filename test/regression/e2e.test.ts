@@ -1,7 +1,6 @@
 // End-to-end regressions for the 0.1.x findings (DESIGN.md §3, §7.2; ~/oss/data/review-varlink-js.md), run over
-// every transport in harness.ts: a real Server and Connection/Pool, or a raw byte-level peer.
-// Phase B (sockets, tooling): F8 (EADDRINUSE rejects listen()), F10/F11 (exports, one module graph: covered by
-// test/unit/exports.test.ts and the consumer fixture), F12/F13/F16 (toolchain, release), F14 (this suite).
+// every transport in harness.ts (pair, unix, tcp): a real Server and Connection/Pool, or a raw byte-level peer.
+// Socket-only cases (F3 with full socket buffers, F8) are in sockets.test.ts; F10–F14 and F16 in tooling.test.ts.
 /* eslint-disable @typescript-eslint/require-await -- streaming handlers are async generators without awaits */
 import assert from "node:assert/strict";
 import { after, before, describe, mock, test } from "node:test";
@@ -125,6 +124,15 @@ for (const transport of transports) {
         await waitFor(() => f.holds.length > before);
         const connections = f.server.connections;
         raw.reset();
+        if (!transport.abruptReset) {
+          // No RST on unix sockets: the server sees a clean EOF (half-close), so the call may still reply. It
+          // must not crash anything; the connection closes when the server is done with it (here: shutdown).
+          assert.deepEqual(await other.call(`${I}.Echo`, { text: "still here" }), { text: "still here" });
+          assert.equal(f.reported.length, reportedBefore);
+          await other.close();
+          await alive();
+          return;
+        }
         const signal = f.holds[before];
         await waitFor(() => signal?.aborted === true);
         assert.ok(signal?.reason instanceof ConnectionClosedError);
@@ -187,10 +195,12 @@ for (const transport of transports) {
           return;
         }
         const conn = await ep.connect();
-        const pending = conn.call(`${I}.Hold`);
-        await waitFor(() => f.server.connections > 0 && f.holds.length > 0);
+        const holdsBefore = f.holds.length;
+        // Handled from the start: over sockets it rejects while restart() is still running.
+        const pending = assert.rejects(conn.call(`${I}.Hold`), ConnectionClosedError);
+        await waitFor(() => f.holds.length > holdsBefore);
         await ep.restart();
-        await assert.rejects(pending, ConnectionClosedError);
+        await pending;
         await assert.rejects(conn.call(`${I}.Ping`), ConnectionClosedError);
         assert.equal(conn.isClosed, true);
       });
@@ -330,32 +340,42 @@ for (const transport of transports) {
       const maxMessageSize = 1024 * 1024;
       const fx = makeServer({ maxMessageSize });
       const ep2 = await transport.start(fx.server);
-      const raw = await ep2.raw();
-      const chunk = new Uint8Array(64 * 1024).fill(0x61);
-      const rssBefore = process.memoryUsage().rss;
-      let peak = rssBefore;
-      let written = 0;
       try {
-        while (written < 64 * 1024 * 1024) {
-          await raw.write(chunk);
-          written += chunk.length;
-          if ((written & (1024 * 1024 - 1)) === 0) peak = Math.max(peak, process.memoryUsage().rss);
+        const raw = await ep2.raw();
+        const chunk = new Uint8Array(64 * 1024).fill(0x61);
+        const rssBefore = process.memoryUsage().rss;
+        let peak = rssBefore;
+        let written = 0;
+        try {
+          while (written < 64 * 1024 * 1024) {
+            await raw.write(chunk);
+            written += chunk.length;
+            if ((written & (1024 * 1024 - 1)) === 0) peak = Math.max(peak, process.memoryUsage().rss);
+          }
+        } catch {
+          // The server closed the connection: later writes reject.
         }
-      } catch {
-        // The server closed the connection: later writes reject.
+        peak = Math.max(peak, process.memoryUsage().rss);
+        // Accepted before the close: the limit plus what the socket buffers (kernel, Node) absorbed.
+        assert.ok(written <= 16 * maxMessageSize, `the server read ${String(written)} bytes before closing`);
+        assert.deepEqual(await raw.readAll(), []);
+        await waitFor(() => fx.reported.length > 0);
+        assert.deepEqual(
+          fx.reported.map((r) => r.reason),
+          ["protocol-error"],
+        );
+        assert.ok(fx.reported[0]?.error instanceof MessageTooLargeError);
+        // pair: 4 × the limit. Sockets add a fresh Buffer per read (garbage until the next GC) and kernel buffers,
+        // so they get 16 × — still a quarter of the 64 MiB input, which is what 0.1.x buffered.
+        const bound = (transport.name === "pair" ? 4 : 16) * maxMessageSize;
+        assert.ok(peak - rssBefore < bound, `RSS grew by ${String(peak - rssBefore)} bytes`);
+        const conn = await ep2.connect();
+        assert.deepEqual(await conn.call(`${I}.Ping`), {});
+        await conn.close();
+      } finally {
+        await ep2.close();
+        await fx.server.shutdown({ graceful: false });
       }
-      peak = Math.max(peak, process.memoryUsage().rss);
-      assert.ok(written < 64 * 1024 * 1024, "the server stopped reading");
-      assert.deepEqual(await raw.readAll(), []);
-      await waitFor(() => fx.reported.length > 0);
-      assert.equal(fx.reported[0]?.reason, "protocol-error");
-      assert.ok(fx.reported[0].error instanceof MessageTooLargeError);
-      assert.ok(peak - rssBefore < 4 * maxMessageSize, `RSS grew by ${String(peak - rssBefore)} bytes`);
-      const conn = await ep2.connect();
-      assert.deepEqual(await conn.call(`${I}.Ping`), {});
-      await conn.close();
-      await ep2.close();
-      await fx.server.shutdown();
     });
   });
 }

@@ -89,6 +89,13 @@ test("varlink-js exports the RPC layer and the address parser; sessions stay int
     assert.equal(internal in root, false, internal);
 });
 
+test("varlink-js/node exports the socket adapter (M4)", () => {
+  assert.deepEqual(Object.keys(node).sort(), ["connect", "createPool", "fromNodeSocket", "listen"]);
+  for (const fn of ["connect", "createPool", "fromNodeSocket", "listen"] as const)
+    assert.equal(typeof node[fn], "function", fn);
+  assert.equal("createServer" in node, false); // createServer stays in the root entry
+});
+
 test("bin points at the compiled CLI entry", () => {
   assert.deepEqual(pkg.bin, { "varlink-js": "./dist/cli/main.js" });
   assert.ok(existsSync(resolve("src/cli/main.ts")));
