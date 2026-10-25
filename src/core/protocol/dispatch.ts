@@ -19,7 +19,10 @@ import type { ServerSession } from "./server-session.ts";
 
 /** What a handler sees besides its parameters. */
 export interface CallContext {
-  /** Aborts when `DispatchOptions.signal` aborts or a write fails (the connection is gone). */
+  /**
+   * Aborts when `DispatchOptions.signal` aborts, a write fails, or dispatch closes the session because not even
+   * InternalError could be encoded (the connection is gone).
+   */
   readonly signal: AbortSignal;
   /** Fully qualified method name. */
   readonly method: string;
@@ -30,15 +33,20 @@ export interface CallContext {
   readonly ext: Readonly<Record<string, unknown>>;
   /**
    * Sends a `continues` reply from a plain async handler (sd_varlink_notify style). With `more`: resolves when the
-   * reply was written. Without `more`: the first value becomes the single final reply and later values (and the
-   * handler's return value) are dropped. Oneway: a no-op. After the call's final reply on a live connection:
-   * resolves without sending.
+   * reply was written. Without `more`: the first value becomes the single final reply (resolves when written);
+   * later values (and the handler's return value) are dropped and resolve immediately. Oneway: nothing is sent,
+   * resolves immediately. After the call's final reply: resolves without sending.
    *
    * Rejects with a `ConnectionClosedError` (`cause`: the send failure, or `signal.reason`) once the connection is
-   * gone: a send of this call failed (also this notify's own), or the session is closed. So
-   * `for (;;) await ctx.notify(x)` ends when the client disconnects. Also rejects when the value is invalid in
-   * `validateReplies: "throw"` mode (the call then ends with InternalError), and when called re-entrantly from a
-   * reply's `toJSON` or getter. A fire-and-forget call never becomes an unhandled rejection.
+   * gone, for every kind of call: a send of this call failed (also this notify's own), or `signal` aborted. A
+   * peer that merely half-closed (EOF after its calls) is not gone. Also rejects, ending the call with
+   * InternalError, when the value is not a plain object (any `validateReplies` mode) or fails the method's output
+   * type in `validateReplies: "throw"` mode; and when called re-entrantly from a reply's `toJSON` or getter. A
+   * fire-and-forget call never becomes an unhandled rejection.
+   *
+   * Dropped notifies resolve immediately, so wait on real events between notifies (`for await (const c of
+   * changes({ signal: ctx.signal })) await ctx.notify(c)`), never a bare `for (;;) await ctx.notify(x)`, which
+   * busy-loops for a oneway or non-`more` call. Methods meant to stream should declare `more: "requires"`.
    */
   notify(parameters: Record<string, unknown>): Promise<void>;
 }
@@ -405,8 +413,8 @@ class Dispatch {
   }
 
   #notify(parameters: unknown): Promise<void> {
-    if (this.#call.oneway) return Promise.resolve();
     if (this.#gone()) return quiet(Promise.reject(this.#goneError()));
+    if (this.#call.oneway) return Promise.resolve();
     if (this.#done) {
       if (this.#settled)
         this.#report("late-notify", new Error(`${this.#call.method}: notify() after the call's final reply`));
@@ -435,9 +443,13 @@ class Dispatch {
     );
   }
 
-  /** The connection is gone: a send failed or the session was closed. */
+  /**
+   * The connection is gone: a send of this call failed, or `ctx.signal` aborted (the driver's signal, or dispatch
+   * closed the session itself). A session closed by a clean peer EOF is not gone: the peer may half-close after
+   * sending its calls and still read the replies.
+   */
   #gone(): boolean {
-    return this.#dead || this.#session.state === "closed";
+    return this.#dead || this.#controller.signal.aborted;
   }
 
   #goneError(): ConnectionClosedError {

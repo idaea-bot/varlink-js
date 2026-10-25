@@ -373,6 +373,31 @@ describe("faulty()", () => {
     assert.equal(innerWrites, 0);
   });
 
+  test("close() after the inner read resolved but before read() continues: null, no pieces kept", async () => {
+    const [a] = pair();
+    let innerReads = 0;
+    // An inner channel whose read has data at once and would keep giving it after close().
+    const inner: ByteChannel = {
+      read: () => {
+        innerReads++;
+        return Promise.resolve({ bytes: utf8("abc") });
+      },
+      end: () => a.end(),
+      close: (reason?: unknown) => {
+        a.close(reason);
+      },
+      closed: a.closed,
+      capabilities: a.capabilities,
+      write: () => Promise.resolve(),
+    };
+    const fb = faulty(inner, { splitReads: "every-byte" });
+    const read = fb.read(); // the inner read has resolved; the continuation has not run yet
+    fb.close();
+    assert.equal(await read, null);
+    assert.equal(await fb.read(), null);
+    assert.equal(innerReads, 1);
+  });
+
   test("bad plans are RangeErrors", () => {
     const [a] = pair();
     assert.throws(() => faulty(a, { splitReads: 0 }), RangeError);

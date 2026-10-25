@@ -684,7 +684,7 @@ describe("ctx.notify (rule 15)", () => {
     assert.deepEqual(s.reported, []);
   });
 
-  test("oneway: a no-op", async () => {
+  test("oneway: nothing is sent, resolves; rejects once ctx.signal aborted (gone is checked first)", async () => {
     let resolved = false;
     const r = await run(
       {
@@ -697,11 +697,31 @@ describe("ctx.notify (rule 15)", () => {
     );
     assert.equal(resolved, true);
     assert.deepEqual(r.replies, []);
+    assert.equal(r.output.length, 0);
+
+    let rejection: unknown;
+    const s = await run(
+      {
+        Plain: async (_p: unknown, ctx: CallContext) => {
+          rejection = await ctx.notify({ n: 1 }).then(
+            () => null,
+            (e: unknown) => e,
+          );
+        },
+      },
+      { method: `${I}.Plain`, oneway: true },
+      { signal: AbortSignal.abort("bye") },
+    );
+    assert.ok(rejection instanceof ConnectionClosedError);
+    assert.equal(rejection.cause, "bye");
+    assert.equal(s.output.length, 0);
+    assert.deepEqual(s.reported, []);
   });
 
-  test("after the final reply on a live connection: resolves without sending, late-notify", async () => {
+  test("after the final reply: resolves without sending, late-notify; rejects only once ctx.signal aborted", async () => {
     let saved: CallContext | undefined;
     const session = new ServerSession();
+    const controller = new AbortController();
     const r = await run(
       {
         Plain: (_p: unknown, ctx: CallContext) => {
@@ -710,16 +730,65 @@ describe("ctx.notify (rule 15)", () => {
         },
       },
       { method: `${I}.Plain`, more: true },
-      { session, eof: false },
+      { session, eof: false, signal: controller.signal },
     );
     assert.ok(saved !== undefined);
     await saved.notify({ n: 2 });
     assert.deepEqual(r.replies, [{ parameters: { n: 1 } }]);
     assert.deepEqual(reasons(r), ["late-notify"]);
-    // Once the session is closed (here: EOF delivered), the connection is gone: notify rejects.
+    // A closed session alone (e.g. a clean peer EOF) is not gone: still resolves.
     session.close();
-    await assert.rejects(saved.notify({ n: 3 }), ConnectionClosedError);
-    assert.deepEqual(reasons(r), ["late-notify"]);
+    await saved.notify({ n: 3 });
+    assert.deepEqual(reasons(r), ["late-notify", "late-notify"]);
+    // The driver's signal is no longer watched after the call ended, so ctx.signal stays as it was: resolves.
+    controller.abort("gone");
+    await saved.notify({ n: 4 });
+    assert.equal(messages(r.output).length, 1);
+  });
+
+  test("without more, clean EOF drained while the first notify's send is pending: later notify resolves, cleanup runs", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Plain` }));
+    session.receiveEnd();
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let release: () => void = () => undefined;
+    const sent: Uint8Array[] = [];
+    let cleanedUp = false;
+    const table = tableOf([FTL], {
+      [`${I}.Plain`]: async (_p: unknown, ctx: CallContext) => {
+        await ctx.notify({ n: 1 });
+        await ctx.notify({ n: 2 });
+        cleanedUp = true;
+        return { n: 3 };
+      },
+    });
+    const reported: DispatchErrorReason[] = [];
+    const done = dispatchCall(
+      session,
+      ev.id,
+      ev.call,
+      table,
+      (bytes) => {
+        sent.push(bytes);
+        return new Promise<void>((r) => {
+          release = r;
+        });
+      },
+      { onError: (_e, info) => reported.push(info.reason) },
+    );
+    // The first notify produced the final reply; the driver drains the session: a clean EOF close.
+    await Promise.resolve();
+    assert.deepEqual(session.nextEvent(), { type: "close" });
+    assert.equal(session.state, "closed");
+    await Promise.resolve();
+    assert.equal(sent.length, 1); // the first notify's send is pending
+    release();
+    await done;
+    assert.equal(cleanedUp, true);
+    assert.equal(sent.length, 1); // the second notify was dropped: no bytes
+    assert.deepEqual(messages(concat(sent)), [{ parameters: { n: 1 } }]);
+    assert.deepEqual(reported, []);
   });
 
   test("a send failure: notify rejects with ConnectionClosedError, so a notify loop ends", async () => {

@@ -334,6 +334,17 @@ describe("ServerSession upgrade", () => {
     assert.deepEqual(s.takeUpgradeRemainder(), new Uint8Array(0));
   });
 
+  test("close() while upgraded queues no close event: the driver owns the stream", () => {
+    const s = new ServerSession();
+    s.receive(msg({ method: M, upgrade: true }));
+    reply(s, callOf(s.nextEvent()).id, { ok: true });
+    assert.equal(s.state, "upgraded");
+    s.close();
+    assert.equal(s.state, "closed");
+    assert.equal(s.nextEvent(), null);
+    assert.equal(s.nextEvent(), null);
+  });
+
   test("takeUpgradeRemainder only when upgraded", () => {
     assert.throws(() => new ServerSession().takeUpgradeRemainder(), TypeError);
   });

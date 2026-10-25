@@ -663,12 +663,18 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   promise has a no-op handler attached, so a fire-and-forget notify is never an unhandled rejection). Without `more`
   the first notify is the single final reply and later notify calls and the return value are dropped (a later
   throw goes to `onError` only). sd_varlink_notify answers `ExpectedMore` there instead; we follow the generator
-  rule ("Monitor without more = current state") so a handler does not need two code paths. Oneway: a no-op. After
-  the call's final reply on a live connection: resolves without sending (`late-notify` once the handler settled).
-  Once the connection is gone it rejects with a `ConnectionClosedError` (`cause`: the send failure, or
-  `ctx.signal.reason`): a send of the call failed (also this notify's own), or the session is closed. So
-  `for (;;) await ctx.notify(x)` ends when the client disconnects (like sd_varlink_notify returning an error).
-  Every rejected notify promise has the no-op handler attached.
+  rule ("Monitor without more = current state") so a handler does not need two code paths. Oneway: nothing is
+  sent, resolves. Dropped notifies (oneway, non-`more` after the first) resolve immediately. After the call's final
+  reply: resolves without sending (`late-notify` once the handler settled). A `bad-result` value (any mode) or an
+  `invalid-reply` in `"throw"` mode ends the call with `InternalError` and rejects with that problem. Once the
+  connection is gone it rejects with a `ConnectionClosedError` (`cause`: the send failure, or `ctx.signal.reason`),
+  for every kind of call, oneway included: gone means a send of the call failed (also this notify's own) or
+  `ctx.signal` aborted (driver signal, or dispatch closed the session itself). A session merely closed by a clean
+  peer EOF is not gone (a UAPI client may half-close after sending its calls and still read the replies). Because
+  dropped notifies resolve immediately, a handler must wait on real events between notifies (`for await (const c
+  of changes({ signal: ctx.signal })) await ctx.notify(c)`); a bare `for (;;) await ctx.notify(x)` busy-loops for
+  a oneway or non-`more` call. Methods meant to stream should declare `more: "requires"`. Every rejected notify
+  promise has the no-op handler attached.
 - **Testing channels**: `pair({highWaterMark})` (default 64 KiB): chunks arrive in order as written (copied, never
   merged); `write()` resolves once the peer's unread bytes are ≤ `highWaterMark` and rejects after this side's
   `end()`/`close()` or the peer's `close()`; `read()` gives `null` after the peer's `end()` once drained and after
@@ -847,7 +853,10 @@ comment survives as UAPI requires), or `InterfaceNotFound` (fixes F9).
   "current state").
 - Plain async handlers can stream too: `ctx.notify(v)` sends a `continues` reply when `ctx.more` is true
   (sd-varlink's `sd_varlink_notify` style), and the returned value is final. `notify` rejects with a
-  `ConnectionClosedError` once the connection is gone, so a `for (;;) await ctx.notify(x)` loop ends (§4.10).
+  `ConnectionClosedError` once the connection is gone (a send failed or `ctx.signal` aborted). Dropped notifies
+  (oneway, or non-`more` after the first) resolve immediately, so wait on real events between notifies (`for await
+  (const c of changes({ signal: ctx.signal })) await ctx.notify(c)`), never a bare `for (;;) await
+  ctx.notify(x)`; methods meant to stream should declare `more: "requires"` (§4.10).
 
 Handler context `ctx`: `signal` (aborts when the client disconnects or the server shuts down),
 `more`/`oneway`/`upgrade` flags, `method`, `peer` (M11), `fds` (M11), `notify(partial)` (send a

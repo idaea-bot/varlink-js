@@ -68,7 +68,9 @@ function resetError(): ConnectionClosedError {
 
 /**
  * Wraps `channel` with the faults in `plan`. `closed`, `close` and `capabilities` delegate to the inner channel;
- * `end` too, but only after the writes before it settled (a real socket flushes them before its FIN). fds of a
+ * `end` too, but only after the writes before it settled (a real socket flushes them before its FIN): its promise
+ * resolves only once those queued writes settled, so unlike `pair().end()` it waits on their backpressure (await
+ * it only while the peer is reading). fds of a
  * split chunk go with its first piece. Concurrent writes are serialized: each starts after the previous one
  * settled, so they arrive in call order and never interleave. `close()` is immediate: from then on `read()` gives
  * `null` (also a read waiting for its delay; split pieces not yet delivered are dropped) and every write still
@@ -105,7 +107,8 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
     let next = pending.shift();
     if (next === undefined) {
       const chunk = await channel.read();
-      if (chunk === null) return null;
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- close() may run during the await
+      if (chunk === null || closed) return null;
       const pieces = split(chunk.bytes, plan.splitReads);
       pieces.forEach((bytes, i) => {
         pending.push(i === 0 && chunk.fds !== undefined ? { bytes, fds: chunk.fds } : { bytes });

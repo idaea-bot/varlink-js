@@ -24,7 +24,12 @@ export type ServerEvent =
   | { type: "call"; id: number; call: Call }
   | {
       type: "close";
-      /** Set iff the peer broke the protocol; without it: peer EOF and every call finished. */
+      /**
+       * Set iff the peer broke the protocol (or an upgrade's remainder was lost). Without it: peer EOF after every
+       * call finished, or a local {@link ServerSession.close} — by the driver, or by `dispatchCall` after a failed
+       * send or an InternalError it could not encode (then the call's `ctx.signal` was aborted and `onError` got
+       * the reason).
+       */
       error?: ProtocolError;
     };
 
@@ -218,13 +223,15 @@ export class ServerSession {
   /**
    * Local close: nothing more is produced, replies after it are TypeErrors. Idempotent. If no close event was
    * delivered yet, the next {@link nextEvent} returns one (exactly once): the pending one with its error if there
-   * is one (e.g. a lost upgrade remainder), else `{type: "close"}`. So a driver whose session was closed by
-   * `dispatchCall` (a failed send) still gets its final event.
+   * is one (e.g. a lost upgrade remainder), else `{type: "close"}` if the session was `open`. So a driver whose
+   * session was closed by `dispatchCall` (a failed send) still gets its final event. In state `upgraded` no event
+   * is queued: the driver already owns the stream and {@link nextEvent} stays null.
    */
   close(): void {
+    const wasOpen = this.#state === "open";
     this.#state = "closed";
     this.#active = null;
-    if (!this.#closeDelivered && this.#closeEvent === null) this.#closeEvent = { type: "close" };
+    if (wasOpen && !this.#closeDelivered && this.#closeEvent === null) this.#closeEvent = { type: "close" };
   }
 
   /**
