@@ -402,7 +402,16 @@ ServerSession:
 | any other `http://`/`https://` URL | simple HTTP mode, URL = bridge base URL (no oneway/upgrade/pipelining); service via option or derived from the method | UAPI |
 
 Anything after `;` is ignored (UAPI: future extensions). Programmatic `bridge: string[]` (spawn argv,
-speak on its stdio) covers python/libvarlink `--bridge`.
+speak on its stdio) covers python/libvarlink `--bridge` (`connectBridge(argv)`, §5.8).
+
+ssh notes (M8): the host must be non-empty, without whitespace or control characters, and must not start with `-`
+(else `TypeError`); sd-varlink does not check the `-`, we do so on purpose (a host `-oProxyCommand=…` would be an ssh
+option). The `ssh-unix:` path must be absolute and normalized. `ssh-exec:` splits the command line like sd-varlink's
+`strv_split_full(EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE)` (whitespace-separated words, `'…'` and `"…"` alike,
+quotes inside words, C escapes `\a \b \f \n \r \t \v \s \\ \" \' \xNN \NNN \uXXXX \UXXXXXXXX` everywhere, also
+inside quotes as in systemd's extract-word.c, no NUL, the result valid UTF-8; an unterminated quote, trailing backslash, unknown escape or zero
+words is a `TypeError`). As with varlinkctl, the words go to ssh as separate arguments and ssh joins them with spaces
+for the remote shell, so remote arguments containing spaces or shell metacharacters are re-parsed remotely.
 
 Interface resolution (`resolveInterface("io.systemd.Hostname")`): `/run/varlink/registry/<iface>`
 (then the `--user` registry `$XDG_RUNTIME_DIR/varlink/registry/`), then optional
@@ -876,8 +885,9 @@ over `pair()`, unix and tcp sockets.
   callback). `end()` = `socket.end()`, resolves on `finish` or `close`; `close()` = `destroy()`, idempotent;
   `closed` resolves on `close`. An `error` listener is always attached (F1/F8). `capabilities: {}`.
 - **`connect(address, {…ConnectionOptions, signal})`**: `unix` (path), `unix-abstract` (Linux: Node path
-  `"\0" + name`; elsewhere `OperationNotSupportedError`), `tcp` (`noDelay`); other kinds →
-  `OperationNotSupportedError` naming the kind (M8/M10). All sockets `allowHalfOpen`. The connect phase is bounded by
+  `"\0" + name`; elsewhere `OperationNotSupportedError`), `tcp` (`noDelay`), the spawned kinds `exec`, `ssh-unix`,
+  `ssh-exec` (M8, §5.8, process options in `spawn`); other kinds → `OperationNotSupportedError` naming the kind
+  (M10). All sockets `allowHalfOpen`. The connect phase is bounded by
   `timeout` (default 45 s, 0 = none → `CallTimeoutError("connect timed out")`) and `signal` (its reason); the socket
   is destroyed on either; Node errors (`ENOENT`, `ECONNREFUSED`) reject as they are. `createPool(address, options)`
   splits `max`/`idleTimeout` off and passes the rest, plus the factory's signal, to `connect`; `timeout` goes to
@@ -916,7 +926,7 @@ over `pair()`, unix and tcp sockets.
   §5.8; `listenFromEnv` in M8 builds on it): `server.listen({fd})`; `address` from `server.address()` (object →
   `tcp:…`, string with leading NUL → `unix:@…`, other string → `unix:…`), but Node returns `null` for a unix socket
   inherited this way (pipes have no getsockname in Node), so the address is the placeholder `fd:<n>` there (not a
-  dialable varlink address; M8 may pass the known path). Accepted sockets are wrapped (`fromNodeSocket`) at once,
+  dialable varlink address) unless `options.address` (M8, `{fd}` only) names it. Accepted sockets are wrapped (`fromNodeSocket`) at once,
   queued and handed out by the iterator; `close()` (idempotent) stops listening without waiting for taken
   connections, ends the iterator (a pending `next()` resolves done) and closes queued ones. A second concurrent
   iteration is a `TypeError`; after `return()` the listener may be iterated again.
@@ -1409,7 +1419,8 @@ environment variables; set the option explicitly (e.g. `"off"` for hot paths).
 Limits: from sd-varlink, `maxConnections` 4096, `maxConnectionsPerUid` 128 (only when peer credentials
 are available, M11) and `maxMessageSize` 16 MiB; our own default, `maxQueuedCalls` 64 per connection
 (beyond that, stop reading: backpressure). No idle timeout on server connections (F1). Optional
-`exitOnIdle: ms` for socket-activated services (M8).
+`exitOnIdle: ms` for socket-activated services (M8): the *server* shuts down after that long without any open
+connection (0 = when the last one closed), and `server.closed` resolves after any shutdown (§5.8).
 
 ### 5.5 Errors
 
@@ -1470,20 +1481,85 @@ generated in M6. Details in §4.13.
 
 ### 5.8 Socket activation and exec
 
-- `listenAuto()` mirrors `sd_varlink_server_listen_auto` (sd-varlink.c:3883): if
-  `SYSTEMD_VARLINK_LISTEN` is set, `-` means "serve one connection on stdin/stdout" (that is what
-  `ssh-exec:` relies on) and anything else is an address to listen on; otherwise use `listenFromEnv()`.
-- `listenFromEnv()` reads `LISTEN_PID` (must equal `process.pid`), `LISTEN_PIDFDID` (ignored unless we
-  can check it), `LISTEN_FDS`, `LISTEN_FDNAMES` (pick the fd named `varlink`; if there is one fd and no
-  names, use it). It returns a `Listener` over `net.Server.listen({fd})`. It unsets the variables
-  (like `sd_listen_fds(1)`). Connected (already-accepted) activation sockets are accepted via
-  `new net.Socket({fd})`. Without the native addon we can't `getsockopt(SO_ACCEPTCONN)`, so the
-  connected case is selected by an option. *Verify both in the VM.*
-- `exec:/path` client: create a listening unix socket in a private temp dir, spawn
-  `/bin/sh -c 'LISTEN_PID=$$ exec "$0" "$@"' /path` with the listener as fd 3, `LISTEN_FDS=1`,
-  `LISTEN_FDNAMES=varlink`, and `VARLINK_ADDRESS=unix:<path>` (the rust/python convention), then
-  connect. The `sh -c … exec` trick is needed because Node can't set env after fork. Clean up the
-  socket dir and kill the child on close.
+M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exitOnIdle`/`closed` in
+`src/rpc/server.ts` (registry and resolver are phase B). All exported from `varlink-js/node` except where noted.
+
+- **`fromNodeStreams(readable, writable, {onClose})`**: a ByteChannel over a separate Readable + Writable (a child's
+  stdout/stdin, `process.stdin`/`stdout`) with the `fromNodeSocket` contract (§4.11): paused, read on demand; `null`
+  after the readable's end/close or a local `close()`; a readable error rejects one read; `write()` resolves on the
+  callback, rejects with `ConnectionClosedError` once the writable closed/ended; `end()` ends the writable only;
+  `close()` destroys both (idempotent); `closed` once both closed and `onClose` (called once, on `close()` or when
+  both streams closed) settled; error listeners on both.
+- **Spawning** (`connectExec(command, opts)`, `connectBridge(argv, opts)`, and `connect()` dispatching `exec:`,
+  `ssh-unix:`/`ssh:`, `ssh-exec:` with the process options in `ConnectOptions.spawn`). Process options: `env`
+  (default `process.env`), `cwd`, `stderr: "inherit" | "ignore"`, `killTimeout` (2000 ms; 0 = SIGKILL at once),
+  `ssh`. Every child's environment drops `LISTEN_PID`, `LISTEN_PIDFDID`, `LISTEN_FDS`, `LISTEN_FDNAMES`,
+  `SYSTEMD_VARLINK_LISTEN` (an inherited `LISTEN_PIDFDID` from our own activation would make a systemd child ignore
+  its fds) before the kind's variables are added. Lifetime: the channel's `close()` destroys the transport, sends
+  SIGTERM to a still-running child and SIGKILL after `killTimeout` (unref'd timer); `closed` resolves once the
+  transport closed **and** the child exited (no zombies), then cleanup ran. A child that exits on its own gives EOF
+  and the Connection closes as usual (which calls `close()`; only `close()` signals). Spawn errors reject the
+  connect; the connect phase (spawning, the listening-mode connect) is bounded by `timeout`/`signal` as in
+  `connect()`, the child killed on either. `end()` half-closes only.
+- **`exec:/path`** (sd-varlink `connect_exec`): `command` absolute and normalized (`TypeError`), `access(X_OK)`
+  first (`ENOENT`/`EACCES` reject as they are). Spawned as `/bin/sh -c 'LISTEN_PID=$$; export LISTEN_PID; exec "$0"
+  "$@"' command argv[1…]` (Node can't set env after fork), so the child's argv[0] is always `command`; `LISTEN_FDS=1`,
+  `LISTEN_FDNAMES=varlink`; stdin `/dev/null`, stdout on **our fd 2** (never our stdout: we may be stdio-served
+  ourselves). fd 3 per `socket`: `"connected"` (default, what sd-varlink/varlinkctl pass and systemd services with
+  `sd_varlink_invocation(ALLOW_ACCEPT)` expect): stdio `"pipe"`, which libuv creates as an AF_UNIX socketpair; the
+  parent end `child.stdio[3]` is a `net.Socket` created with `allowHalfOpen: false`, so we set it to `true`
+  (verified: then the child's FIN does not end our write side). `"listening"` (libvarlink/python `--activate`): a
+  `mkdtemp(os.tmpdir()/varlink-exec-)` 0700 dir, a `net.Server` bound at `<dir>/socket.tmp` and renamed to
+  `<dir>/socket` (so closing our copy, which makes libuv unlink the bound name, leaves the path), its `_handle.fd`
+  (else `OperationNotSupportedError`) as fd 3, `VARLINK_ADDRESS=unix:<dir>/socket`; our server is closed right after
+  the spawn (so only the child accepts) and then we connect; the dir is removed when the channel closed (and on every
+  failure path).
+- **Bridge** (`connectBridge(argv)`, libvarlink/python `--bridge`): `argv[0]` spawned with the rest (no shell),
+  varlink over its stdin/stdout via `fromNodeStreams`; empty argv `TypeError`. No activation variables are added; to
+  have a varlink-js/systemd child serve on its stdio, pass `["env", "SYSTEMD_VARLINK_LISTEN=-", …]` (our env
+  stripping removes it from `env`).
+- **ssh** (§4.6): binary `opts.ssh ?? $SYSTEMD_SSH ?? "ssh"`. `ssh-unix:host:/path` → `[ssh, "-W", path, host]`
+  (path absolute + normalized), `ssh-exec:host:cmdline` → `[ssh, "-e", "none", "-T", host, "env",
+  "SYSTEMD_VARLINK_LISTEN=-", ...words]`, both over the child's stdin/stdout.
+- **`listenFromEnv({name = "varlink", unsetEnvironment = true, accept = "auto"})`** (sd_listen_fds_with_names +
+  sd_varlink_server_listen_name): `null` unless `LISTEN_PID` equals `process.pid` and `LISTEN_FDS` is set;
+  `LISTEN_FDS` must be a decimal 1…1024 and `LISTEN_FDNAMES` (split on `:`, empty names kept) must have that many
+  names (else `TypeError` naming the variable). The variables are unset in every outcome (like `sd_listen_fds(1)`).
+  fds 3… named `name` are used; with no `LISTEN_FDNAMES` a single fd is used. Per fd, `accept: "auto"` on Linux
+  reads `/proc/self/fd/N` (`socket:[ino]`) and looks the inode up in `/proc/self/net/unix` (Flags `__SO_ACCEPTCON`
+  = listening; the Path column, the name at bind time, gives the address, `@…` → `unix:@…`) and `tcp`/`tcp6` (st
+  `0A`); unknown, not Linux, or `/proc` unreadable → listening. A listening fd → `listen({fd}, {address})` (the new
+  `ListenOptions.address`, `{fd}` only, parsed and canonicalized; closing never unlinks); a connected one → a
+  one-shot listener over `new net.Socket({fd, allowHalfOpen: true})` (`fd:<n>` or the `/proc` address) that yields
+  that connection and ends (`close()` before it was taken closes it). Several fds → one merged listener.
+- **`mergeListeners(listeners)`**: yields from all until all ended (a source's iteration error reaches `next()`
+  once), `close()` closes all, `address` is the first one's, one iteration at a time (again after `return()`).
+- **`listenStdio()`**: a one-shot listener over `fromNodeStreams(process.stdin, process.stdout)`, address `stdio:`
+  (not a dialable varlink address); the streams are touched only when the channel is taken. Nothing else may write
+  to stdout meanwhile.
+- **`listenAuto({…, mode})`** (sd_varlink_server_listen_auto, sd-varlink.c:3873): the `listenFromEnv()` fds plus,
+  if `SYSTEMD_VARLINK_LISTEN` is set, `-` → `listenStdio()`, anything else → `listen(value, {mode})`; merged, `null`
+  if nothing. `SYSTEMD_VARLINK_LISTEN` is not unset (sd parity).
+- **Server** (§5.4): `exitOnIdle` (ms, finite ≥ 0, off by default): once serving started (first `serve()` or
+  `handle()`), whenever there is no open connection a timer runs; a connection cancels it; on expiry `shutdown()`
+  (graceful defaults). It starts at the first `serve()` (spurious activation, a client that gave up). `0` = when the
+  last connection closed (sd-varlink `exit_on_idle`, sd-varlink.c:3979). The expiry is confirmed one timer turn
+  later, so a connection already queued on a listener (in the kernel backlog when the service starts) is accepted
+  first instead of losing the race against a 0 ms timer. No timers once shut down. `Server.closed` resolves when a
+  shutdown by any trigger completed (never rejects): `server.serve((await listenAuto()) ?? …); await server.closed;
+  process.exit(0)`.
+- Tests (macOS; Linux-only parts skip on darwin, the VM runs them): `test/unit/node/spawn-channel.test.ts`
+  (PassThrough pairs and `cat`), `spawn.test.ts` (an `activation-child.ts` fixture behind an executable `#!/bin/sh`
+  wrapper: exec connected/listening, env stripping, half-close, SIGTERM → SIGKILL, bridge, ssh via a fake ssh script
+  that logs its argv, the word splitter table), `activation.test.ts` (fds and `LISTEN_*` set by
+  `/bin/sh -c 'LISTEN_PID=$$ … exec'`; `/proc` detection Linux-only), `test/unit/rpc/exit-on-idle.test.ts`.
+
+**M8 deviations** from the earlier text of this section: `exec:` passes a *connected* socketpair by default (as
+sd-varlink does and systemd services expect), the listening socket + `VARLINK_ADDRESS` is the `socket: "listening"`
+option; the single-unnamed-fd rule is kept (sd-varlink names such an fd "unknown" and would not pick it);
+`LISTEN_PIDFDID` is ignored (Node cannot read the inode id of its own pidfd); a connected activation fd is detected
+from `/proc` on Linux, elsewhere it needs `accept: "connected"` (no `getsockopt(SO_ACCEPTCONN)` without the native
+addon, and probing with `listen()` is not an option: a failed `listen({fd})` closes the fd).
 
 ---
 

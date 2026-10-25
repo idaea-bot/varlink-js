@@ -22,6 +22,11 @@ export interface ListenOptions {
    * listener keeps accepting. Default: ignore them. Exceptions from it are swallowed.
    */
   onError?: (error: unknown) => void;
+  /**
+   * `{fd}` only: the listener's `address` when it is known otherwise (e.g. from `/proc`, §5.8), replacing the one
+   * derived from the socket (or the `fd:<n>` placeholder). Parsed and stored in canonical form; never unlinked.
+   */
+  address?: string;
 }
 
 /** A {@link Listener} over a `net.Server`. */
@@ -493,7 +498,8 @@ function addressOf(server: Server, fd?: number): string {
  * - `unix:@name`: Linux only (else `OperationNotSupportedError`).
  * - `tcp:host:port`: port 0 picks a free port; `address` carries the real one (`tcp:[::1]:p` for IPv6).
  * - `{fd}`: an already-listening socket fd (socket activation, §5.8). `address` comes from the socket
- *   (`tcp:…`, `unix:@…`); Node cannot name a unix path socket inherited this way, so it is `fd:<n>` there.
+ *   (`tcp:…`, `unix:@…`); Node cannot name a unix path socket inherited this way, so it is `fd:<n>` there unless
+ *   `options.address` names it. Closing never unlinks anything.
  *
  * `listen()` rejects on `EADDRINUSE` and every other listen error (F8). Later server errors (accept failures such
  * as `EMFILE`) go to `options.onError` (default: ignored) and the listener keeps accepting. The iterator ends only
@@ -512,8 +518,10 @@ export async function listen(
   if (typeof address === "object" && "fd" in address) {
     const fd = address.fd;
     if (!Number.isSafeInteger(fd) || fd < 0) throw new TypeError("fd must be a non-negative integer");
-    return listenServer({ fd, ...backlog }, (server) => addressOf(server, fd), opts.onError);
+    const known = opts.address === undefined ? undefined : formatAddress(parseAddress(opts.address));
+    return listenServer({ fd, ...backlog }, (server) => known ?? addressOf(server, fd), opts.onError);
   }
+  if (opts.address !== undefined) throw new TypeError("the address option is only valid with {fd}");
   const spec = typeof address === "string" ? parseAddress(address) : address;
   switch (spec.kind) {
     case "unix":

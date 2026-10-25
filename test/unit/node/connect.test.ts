@@ -52,10 +52,8 @@ describe("connect", () => {
   });
 
   test("unsupported kinds reject with OperationNotSupportedError naming the kind", async () => {
+    // exec:/ssh-* are spawned (M8, spawn.test.ts).
     for (const [address, kind] of [
-      ["exec:/bin/true", "exec"],
-      ["ssh-unix:host:/run/x", "ssh-unix"],
-      ["ssh-exec:host:cmd", "ssh-exec"],
       ["ws://localhost/x", "websocket"],
       ["http://localhost/x", "http"],
     ] as const)

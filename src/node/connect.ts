@@ -5,11 +5,14 @@ import { CallTimeoutError, OperationNotSupportedError } from "../core/errors/loc
 import { createConnection, DEFAULT_TIMEOUT, type Connection, type ConnectionOptions } from "../rpc/connection.ts";
 import { checkTimeout } from "../rpc/util.ts";
 import { fromNodeSocket } from "./socket.ts";
+import { connectSpawned, type ExecProcessOptions } from "./spawn.ts";
 
 /** Options for {@link connect}: the connection's options, plus a `signal` bounding the connect phase. */
 export interface ConnectOptions extends ConnectionOptions {
   /** Aborts the connect phase (the promise rejects with the signal's reason). Not used after connecting. */
   signal?: AbortSignal;
+  /** `exec:`, `ssh-unix:`, `ssh-exec:`: how the child is spawned (see `connectExec`); ignored for socket kinds. */
+  spawn?: ExecProcessOptions;
 }
 
 /** The `net.connect` options for an address, or an OperationNotSupportedError for kinds Node cannot dial here. */
@@ -76,8 +79,10 @@ export function openSocket(spec: AddressSpec, timeout: number, signal: AbortSign
 
 /**
  * Connects to a varlink service (DESIGN.md §5.1) and returns a {@link Connection} over the socket. Supported here:
- * `unix:/path` (and bare paths), `unix:@name` (Linux only), `tcp:host:port` (`TCP_NODELAY` on). Other kinds reject
- * with `OperationNotSupportedError` (exec/ssh and WebSocket/HTTP come in later milestones). The connect phase is
+ * `unix:/path` (and bare paths), `unix:@name` (Linux only), `tcp:host:port` (`TCP_NODELAY` on), and the spawned
+ * kinds `exec:/path`, `ssh-unix:host:/path` (alias `ssh:`), `ssh-exec:host:cmdline` (§5.8: process options in
+ * `options.spawn`, see `connectExec`). Other kinds reject with `OperationNotSupportedError` (WebSocket/HTTP come in a
+ * later milestone). The connect phase is
  * bounded by `options.timeout` (default 45 s, 0 = none; expiry rejects with `CallTimeoutError("connect timed out")`)
  * and `options.signal` (rejects with its reason); the socket is destroyed on either. Connection errors (`ENOENT`,
  * `ECONNREFUSED`, …) reject with the Node error. Sockets are half-open capable (`allowHalfOpen`).
@@ -86,7 +91,9 @@ export function openSocket(spec: AddressSpec, timeout: number, signal: AbortSign
  */
 export async function connect(address: string | AddressSpec, options?: ConnectOptions): Promise<Connection> {
   const spec = typeof address === "string" ? parseAddress(address) : address;
-  const { signal, ...connectionOptions } = options ?? {};
+  const { signal, spawn, ...connectionOptions } = options ?? {};
+  if (spec.kind === "exec" || spec.kind === "ssh-unix" || spec.kind === "ssh-exec")
+    return connectSpawned(spec, connectionOptions, spawn, signal);
   const timeout = checkTimeout(connectionOptions.timeout, "timeout", DEFAULT_TIMEOUT);
   const socket = await openSocket(spec, timeout, signal);
   try {

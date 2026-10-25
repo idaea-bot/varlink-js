@@ -110,11 +110,24 @@ test("varlink-js/codegen exports generate(); the root entry the typed-client run
   assert.equal("OrgVarlinkService" in root, false);
 });
 
-test("varlink-js/node exports the socket adapter (M4)", () => {
-  assert.deepEqual(Object.keys(node).sort(), ["connect", "createPool", "fromNodeSocket", "listen"]);
-  for (const fn of ["connect", "createPool", "fromNodeSocket", "listen"] as const)
-    assert.equal(typeof node[fn], "function", fn);
+test("varlink-js/node exports the socket adapter (M4), spawning and activation (M8)", () => {
+  const fns = [
+    "connect",
+    "connectBridge",
+    "connectExec",
+    "createPool",
+    "fromNodeSocket",
+    "fromNodeStreams",
+    "listen",
+    "listenAuto",
+    "listenFromEnv",
+    "listenStdio",
+    "mergeListeners",
+  ] as const;
+  assert.deepEqual(Object.keys(node).sort(), [...fns].sort());
+  for (const fn of fns) assert.equal(typeof node[fn], "function", fn);
   assert.equal("createServer" in node, false); // createServer stays in the root entry
+  assert.equal("splitCommandLine" in node, false); // internal (tests import it from spawn.ts)
 });
 
 test("bin points at the compiled CLI entry", () => {

@@ -62,6 +62,14 @@ export interface ServerOptions {
   maxQueuedCalls?: number;
   /** Open connections; more are closed at once (`connection-limit`); default 4096. */
   maxConnections?: number;
+  /**
+   * Exit-on-idle for socket-activated services (§5.8), in ms: once serving started (the first `serve()` or
+   * `handle()`), the server shuts down (graceful defaults) when it had no open connection for this long; a new
+   * connection cancels the timer. `0` = as soon as the last connection closed (and at once if none arrives). The
+   * expiry is confirmed one timer turn later, so a connection already pending on a listener is accepted first.
+   * Default: off. Await {@link Server.closed} to exit the process afterwards.
+   */
+  exitOnIdle?: number;
 }
 
 /** Flags a registration may raise over the IDL's (never lower). */
@@ -378,6 +386,13 @@ export class Server {
   readonly #done = new Map<ServerConnection, Promise<void>>();
   readonly #listeners = new Set<ServeListener>();
   #shutdown: Promise<void> | undefined;
+  readonly #exitOnIdle: number | undefined;
+  /** `serve()` or `handle()` was called: exit-on-idle applies from now on. */
+  #serving = false;
+  #idleTimer: ReturnType<typeof setTimeout> | undefined;
+  #resolveClosed: () => void = () => undefined;
+  /** Resolves once a shutdown (by any trigger: {@link shutdown}, exit-on-idle) completed. Never rejects. */
+  readonly closed: Promise<void>;
 
   /** Use {@link createServer}. */
   constructor(options?: ServerOptions) {
@@ -395,6 +410,13 @@ export class Server {
     this.#maxMessageSize = checkMaxMessageSize(options?.maxMessageSize);
     this.#maxQueuedCalls = checkPositiveInt(options?.maxQueuedCalls, "maxQueuedCalls", DEFAULT_MAX_QUEUED_CALLS);
     this.#maxConnections = checkPositiveInt(options?.maxConnections, "maxConnections", DEFAULT_MAX_CONNECTIONS);
+    const exitOnIdle = options?.exitOnIdle;
+    if (exitOnIdle !== undefined && (typeof exitOnIdle !== "number" || !Number.isFinite(exitOnIdle) || exitOnIdle < 0))
+      throw new RangeError("exitOnIdle must be a finite non-negative number of milliseconds");
+    this.#exitOnIdle = exitOnIdle === undefined ? undefined : checkTimeout(exitOnIdle, "exitOnIdle", 0);
+    this.closed = new Promise((resolve) => {
+      this.#resolveClosed = resolve;
+    });
     const validateReplies = checkMode(options?.validateReplies, "validateReplies", ["off", "warn", "throw"], "warn");
     const builtins = builtinInterfaces(
       {
@@ -476,6 +498,7 @@ export class Server {
       channel.close();
       return;
     }
+    this.#serving = true;
     if (this.#connections.size >= this.#maxConnections) {
       this.#report(new Error(`connection limit (${String(this.#maxConnections)}) reached`), "connection-limit");
       channel.close();
@@ -492,10 +515,12 @@ export class Server {
       // Options were checked at construction; keep the "never rejects" promise anyway.
       this.#report(e, "transport-error");
       channel.close();
+      this.#updateIdle();
       return;
     }
     const conn = new ServerConnection(channel, session, this.#host);
     this.#connections.add(conn);
+    this.#updateIdle();
     const done = conn.run().catch((e: unknown) => {
       this.#report(e, "transport-error");
     });
@@ -503,6 +528,26 @@ export class Server {
     await done;
     this.#connections.delete(conn);
     this.#done.delete(conn);
+    this.#updateIdle();
+  }
+
+  /** Exit-on-idle: arms the timer while serving with no open connection, cancels it otherwise (and once shut down). */
+  #updateIdle(): void {
+    const ms = this.#exitOnIdle;
+    if (ms === undefined) return;
+    if (this.#shutdown !== undefined || this.#connections.size > 0) {
+      if (this.#idleTimer !== undefined) clearTimeout(this.#idleTimer);
+      this.#idleTimer = undefined;
+      return;
+    }
+    if (!this.#serving || this.#idleTimer !== undefined) return;
+    this.#idleTimer = setTimeout(() => {
+      // Confirmed one turn later: a connection the runtime is about to accept from a listener cancels it.
+      this.#idleTimer = setTimeout(() => {
+        this.#idleTimer = undefined;
+        if (this.#shutdown === undefined && this.#connections.size === 0) void this.shutdown();
+      }, 0);
+    }, ms);
   }
 
   /**
@@ -527,6 +572,8 @@ export class Server {
     // and that must not close it under its first user.
     const iterator = listener[Symbol.asyncIterator]();
     this.#listeners.add(listener);
+    this.#serving = true;
+    this.#updateIdle();
     void (async () => {
       try {
         for (;;) {
@@ -567,7 +614,10 @@ export class Server {
     const graceful = options?.graceful ?? true;
     if (typeof graceful !== "boolean") throw new TypeError("graceful must be a boolean");
     const timeout = checkTimeout(options?.timeout, "timeout", 5000);
-    this.#shutdown = this.#stop(graceful, timeout);
+    this.#shutdown = this.#stop(graceful, timeout).then(() => {
+      this.#resolveClosed();
+    });
+    this.#updateIdle();
     return this.#shutdown;
   }
 
