@@ -1,0 +1,52 @@
+name: Runtimes
+
+# Bun and Deno 2 (DESIGN.md §7.4, M10): the unit tests plus the integration subset (test/regression: e2e over
+# pair/unix/tcp, sockets, tooling), run with each runtime's own test runner and its node:test compatibility.
+# Node itself is only used for `npm ci` (dev dependencies such as fast-check); nothing is compiled.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtimes-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bun:
+    name: Test (Bun latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun --version
+      - run: npm ci
+      # Explicit directories, not a glob: bun test discovers *.test.ts below them.
+      - run: bun test test/unit test/regression
+
+  deno:
+    name: Test (Deno 2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno --version
+      - run: npm ci
+      # --no-check: types are checked by tsc in ci.yml; Deno's checker would apply its own lib settings.
+      - run: deno test -A --no-check test/unit test/regression
