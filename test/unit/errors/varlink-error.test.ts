@@ -39,6 +39,10 @@ describe("VarlinkError", () => {
     assert.equal(long.message.length, 256 + 3); // quotes and "…"
     assert.ok(long.message.endsWith('…"'));
     assert.equal(new VarlinkError("org.example.Foo").message, "org.example.Foo");
+    const longValid = `a.b.${"c".repeat(1000)}.X`;
+    assert.equal(new VarlinkError(longValid).error, longValid);
+    assert.ok(new VarlinkError(longValid).message.length <= 259);
+    assert.equal(new VarlinkError('a"b\\c\ud800\u202e').message, '"a\\"b\\\\c\ufffd\\u202e"');
     assert.equal(new VarlinkError("noInterface").message, '"noInterface"');
   });
 

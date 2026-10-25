@@ -318,8 +318,8 @@ client/server with `ints`:
   written as plain digits (`JSON.stringify` does so below 1e21; `2**60` → `1152921504606847000`), and a
   lossless peer, varlink-js included, decodes it as the `bigint` of those digits. Typed `int` slots are
   unaffected (they reject unsafe numbers), and typed `float` slots convert it back to `number`. Use `float`
-  fields for approximate large values. Conversely a safe `bigint` in untyped content is written as plain digits
-  and comes back as a `number`.
+  fields for approximate large values. Conversely a safe `bigint` in untyped content is written as plain
+  digits and comes back as a `number`.
 - UAPI allows accepting decimal strings for `int`; v1 does so only with `lenientInts: true`.
 
 - `float` fields accept any finite JSON number; a `bigint` produced by the codec is converted to `number`
@@ -540,18 +540,18 @@ entry.
   `INTERNAL_ERROR_INTERFACE_IDL`), each with `errorName` and `is()`. The class `InternalError` shadows
   SpiderMonkey's non-standard global of the same name in modules that import it; `e.name` is `"InternalError"`
   for both, so recognise ours with `InternalError.is(e)` or `isVarlinkError`. A `VarlinkError`'s `message` is
-  its name, but a name that is not a valid `interface.Name` (peers can send anything) is quoted with control
-  and format characters escaped and cut to 256 code units; `error` keeps the raw name. `ErrorRegistry.register` checks
-  `errorName` is `interface.Name`, ignores re-registering the same class and throws `TypeError` for a
-  different class under a taken name (also within one call); it is atomic (on a throw nothing is registered).
-  `create(name, params)` builds the registered class or a plain `VarlinkError`, without validating params.
-  `createErrorRegistry()` is pre-filled with the 8 classes above. `X.is(e)` and `create` match by name only
-  and don't validate parameters, so M4 MUST validate error parameters with the compiled error validators
-  (including `org.varlink.service` errors, using a compiled `org.varlink.service` IDL) before `create`, and
-  fall back to a plain `VarlinkError` when they don't validate. Outgoing errors (a handler throws a
-  `VarlinkError`): M4 MUST check that its `error` is a valid `interface.Name` and, when that interface is
-  known to the server, encode its `parameters` with the compiled error validator; on either failure it sends
-  `InternalError` instead and reports the original error to `onError`.
+  its name, but a name that is not a valid `interface.Name` (peers can send anything) or is over 256 code
+  units is quoted with control and format characters escaped and cut to 256 code units; `error` keeps the raw
+  name. `ErrorRegistry.register` checks `errorName` is `interface.Name`, ignores re-registering the same class
+  and throws `TypeError` for a different class under a taken name (also within one call); it is atomic (on a
+  throw nothing is registered). `create(name, params)` builds the registered class or a plain `VarlinkError`,
+  without validating params. `createErrorRegistry()` is pre-filled with the 8 classes above. `X.is(e)` and
+  `create` match by name only and don't validate parameters, so M4 MUST validate error parameters with the
+  compiled error validators (including `org.varlink.service` errors, using a compiled `org.varlink.service`
+  IDL) before `create`, and fall back to a plain `VarlinkError` when they don't validate. Outgoing errors (a
+  handler throws a `VarlinkError`): M4 MUST check that its `error` is a valid `interface.Name` and, when that
+  interface is known to the server, encode its `parameters` with the compiled error validator; on either
+  failure it sends `InternalError` instead and reports the original error to `onError`.
 - **Local errors** (`VarlinkLocalError`, own brand, `isVarlinkLocalError`, `localName`):
   `ConnectionClosedError` (`io.systemd.Disconnected`), `CallTimeoutError` (`io.systemd.TimedOut`),
   `ProtocolError` and `MessageTooLargeError` (`io.systemd.Protocol`), `UpgradePendingError`

@@ -18,8 +18,8 @@ export function isErrorName(name: unknown): name is string {
 
 /**
  * A varlink error reply: a fully qualified error name plus its parameters. `message` is the name; when `error` is
- * not a valid `interface.Name` (a peer can send anything) it is quoted with control/format characters escaped and
- * cut to 256 code units, so logging the error is safe. `error` itself stays exactly as given.
+ * not a valid `interface.Name` (a peer can send anything) or is longer than 256 code units, it is quoted with
+ * control/format characters escaped and cut to 256 code units, so logging the error is safe. `error` itself stays exactly as given.
  */
 export class VarlinkError<P extends Record<string, unknown> = Record<string, unknown>> extends Error {
   /** Fully qualified varlink error name, e.g. "org.varlink.service.MethodNotFound". */
@@ -27,7 +27,7 @@ export class VarlinkError<P extends Record<string, unknown> = Record<string, unk
   readonly parameters: P;
 
   constructor(error: string, parameters?: P, options?: ErrorOptions) {
-    super(isErrorName(error) ? error : safeQuote(String(error)), options);
+    super(isErrorName(error) && error.length <= 256 ? error : safeQuote(String(error)), options);
     this.name = new.target.name;
     this.error = error;
     this.parameters = parameters ?? ({} as P);

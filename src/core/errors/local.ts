@@ -98,10 +98,13 @@ function truncate(s: string): string {
   return `${s.slice(0, end)}…`;
 }
 
-/** Format characters (bidi overrides and isolates, zero-width, BOM, tags): they can reorder or hide log text. */
-const FORMAT_CHAR = /^\p{Cf}$/u;
+/**
+ * Format and default-ignorable characters (bidi overrides and isolates, zero-width, BOM, tags, fillers, variation
+ * selectors): they can reorder or hide log text.
+ */
+const FORMAT_CHAR = /^[\p{Cf}\p{Default_Ignorable_Code_Point}]$/u;
 
-/** C0 controls, DEL, C1 controls, U+2028/U+2029, and format characters (`\p{Cf}`). */
+/** C0 controls, DEL, C1 controls, U+2028/U+2029, and format/default-ignorable characters. */
 function isUnsafeInMessage(ch: string, c: number): boolean {
   return c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 || FORMAT_CHAR.test(ch);
 }

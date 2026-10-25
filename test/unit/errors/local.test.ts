@@ -110,6 +110,8 @@ describe("ValidationError", () => {
     const e = new ValidationError([key], "unknown-field", "unknown field");
     assert.equal(e.parameter, key);
     assert.equal(e.message, 'invalid parameter "\\u202eevil\\u2066\\u200b\\ufeff\\udb40\\udc41ok": unknown field');
+    const fillers = new ValidationError(["a\u3164\u115f\ufe0f\u034fb"], "type", "d");
+    assert.equal(fillers.message, 'invalid parameter "a\\u3164\\u115f\\ufe0f\\u034fb": d');
   });
 
   test("map keys are kept raw (a dot in a key is ambiguous)", () => {
