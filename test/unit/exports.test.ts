@@ -80,6 +80,15 @@ test("varlink-js exports the handler-facing protocol API, varlink-js/testing the
   assert.equal(typeof testing.faulty, "function");
 });
 
+test("varlink-js exports the RPC layer and the address parser; sessions stay internal (M4)", () => {
+  for (const fn of ["createConnection", "createPool", "createServer", "parseAddress", "formatAddress"] as const)
+    assert.equal(typeof root[fn], "function", fn);
+  for (const cls of ["Connection", "Pool", "Server"] as const) assert.equal(typeof root[cls], "function", cls);
+  assert.deepEqual(root.parseAddress("unix:@x"), { kind: "unix-abstract", name: "x" });
+  for (const internal of ["ServerSession", "ClientSession", "Framer", "dispatchCall", "encodeCall", "decodeReply"])
+    assert.equal(internal in root, false, internal);
+});
+
 test("bin points at the compiled CLI entry", () => {
   assert.deepEqual(pkg.bin, { "varlink-js": "./dist/cli/main.js" });
   assert.ok(existsSync(resolve("src/cli/main.ts")));

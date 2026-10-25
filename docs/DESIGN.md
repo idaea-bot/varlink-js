@@ -566,8 +566,9 @@ entry.
 `src/core/protocol/`: `channel.ts` (the §4.1 types), `framer.ts`, `messages.ts`, `client-session.ts`,
 `server-session.ts`, `dispatch.ts`, all re-exported by `src/core/index.ts`; the root entry exports only the
 handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the `ByteChannel` types and
-`DEFAULT_MAX_MESSAGE_SIZE`); M4 decides on exposing sessions. `src/testing/` (`varlink-js/testing`): `pair()`,
-`faulty()`.
+`DEFAULT_MAX_MESSAGE_SIZE`, plus the `ValidateReplies`/`DispatchErrorReason` types since M4). M4 decided: sessions,
+`Framer`, message codecs and `dispatchCall` stay internal (not exported from the root); transports (M10) import core
+by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `faulty()`.
 - **Framer**: one growable `Uint8Array` (doubling, compacted with `copyWithin` once the read offset passes half the
   buffer, or when it needs room and the read offset is at least a quarter of the buffer; otherwise it grows and
   copies only the unconsumed bytes); each byte is scanned for NUL twice, once on push (counting complete messages,
@@ -698,6 +699,93 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   pipelined behind an upgrade call that is not yet processed counts against `maxMessageSize`; if it overflows, the
   server session closes with `MessageTooLargeError` instead of handing over a truncated stream.
 
+### 4.11 RPC layer (M4)
+
+`src/core/address/` (`parse.ts`), `src/rpc/` (`connection.ts`, `pool.ts`, `server.ts`, `service.ts`, `proxy.ts`,
+internal `util.ts`), all runtime-agnostic (I/O only through `ByteChannel`, Web `setTimeout`/`AbortSignal` only).
+The root entry re-exports the rpc API (`createConnection`/`Connection`, `createPool`/`Pool`,
+`createServer`/`Server`, their option/handler types, `InterfaceProxy`, `StreamIterator`, …) and `parseAddress`,
+`formatAddress`, `AddressSpec`; sessions stay internal (§4.10). Phase B adds `src/node/` (`connect`, `listen`,
+`createPool(address)` wrapping the factory-based pool) and runs the e2e suite over sockets.
+- **Addresses** (§4.6): `parseAddress` returns `unix {path}` (`unix:` + any non-empty path as given, bare `/…`,
+  `./…`, `../…`), `unix-abstract {name}`, `tcp {host, port}` (`[v6]` brackets removed; a bracketed host must contain
+  `:`; an unbracketed one is split at its last `:` and may not contain `[`/`]`; port 1–5 decimal digits ≤ 65535, so
+  `080` is 80), `exec {path}`, `ssh-unix {host, path}` (alias `ssh:`; split at the first `:` like sd-varlink; path
+  absolute), `ssh-exec {host, command}`, `websocket {url}` / `http {url}` (`URL`-normalized `href`, scheme
+  case-insensitive; `http(s)` is WebSocket mode iff the path ends in `/ws/services/<svc>`). Everything after the
+  first `;` is dropped except in URL forms. No NUL in unix paths or abstract names. Errors are `TypeError`s quoting
+  the input with `safeQuote` (§4.9). `formatAddress` renders the canonical form and re-parses it: a spec with no
+  string form that parses back to it (a `;` the parser would cut, a unix path starting with `@`, an `http` URL
+  naming a WebSocket path) is a `TypeError`, so `parseAddress(formatAddress(x))` always equals `x`.
+- **Connection** (`createConnection(channel, options)`; options and defaults as in §5.1 plus `codec`, `errors`,
+  `interfaces`, `highWaterMark` 64 and `onError`). One serialized write queue: a call reaches
+  `ClientSession.call()` only when its turn to write comes (so a queued call can still be removed); each write is
+  awaited; a write failure closes the connection. A call that cannot be encoded (codec `TypeError`) rejects alone.
+  One reader loop (`read()` → `receive()` → events; `null` → `receiveEnd()`; a rejection closes with
+  `ConnectionClosedError(cause)`), top-level catches everywhere. `channel.closed` settling also closes it.
+  `closeReason` is the ProtocolError, transport error, CallTimeoutError, abort reason or `close(reason)`, undefined
+  for `close()` and a clean EOF. Closing rejects every queued and pending call with `ConnectionClosedError`
+  (`cause` where there is one) and settles `closed` once the channel's `closed` did; later calls reject at once.
+- **Timeouts**: armed when a call reaches the head of the reply FIFO (or, for oneway, when its write starts: it
+  covers the write); `call`/`collect` whole call, `stream` until the first reply, then `idleTimeout` (re-armed per
+  reply, paused while the stream's buffer is full). Expiry rejects with `CallTimeoutError` and closes. Timers and
+  abort listeners are removed on every settle path.
+- **Abort**: aborted before → reason, nothing written; while queued → removed, connection open; after it was handed
+  to the session → reason, connection closed, others `ConnectionClosedError(cause = reason)`.
+- **Streams**: `stream()` returns a `StreamIterator` (`AsyncIterableIterator` with a non-optional `return()`); the
+  call is enqueued at once; every reply, the final one included, is yielded; an error (error reply, close, timeout,
+  abort) rejects `next()` after the replies already buffered were consumed, then `done`. `return()` before the final
+  reply closes the connection if the call was handed to the session, and only drops it if it was still queued; after
+  the final reply it is a no-op. Read backpressure: while the head stream holds ≥ `highWaterMark` undelivered
+  replies the reader stops calling `read()`. `collect()` rejects with `RangeError` past `max` (1024).
+- **Validation** only for interfaces registered on the connection (`interfaces` option, `addInterface`; built-ins
+  `org.varlink.service` and `INTERNAL_ERROR_INTERFACE` always): parameters are `input.encode`d (a ValidationError
+  rejects before writing); replies per `validateReplies` (`"off"` raw, so unsafe ints may be bigints; `"warn"`
+  decode with `drop`, raw value + `onError invalid-reply` on failure; `"throw"` reject). An `int-range` in `"number"`
+  mode rejects in `"warn"` too. A rejection while replies are still pending (a stream's non-final reply, collect over
+  `max`) closes the connection; on a final reply the connection stays intact. Error replies of a registered
+  interface are decoded with its error validator (`drop`) and built with `errors.create`; invalid or undeclared →
+  plain `VarlinkError` + `invalid-error`; unregistered interface → plain `VarlinkError`. `addInterface`: same name
+  and same text is a no-op (a descriptor's error classes are still registered), different text a `TypeError`;
+  descriptors go through `assertIntsMode` + `compileDescriptor`. Typed overloads (descriptor must be registered) exist
+  for `call`, `oneway`, `stream`, `collect`. `getInfo`/`getInterfaceDescription` always validate their replies
+  (`"throw"`); `getInterface` parses + validates and checks the declared name (`TypeError` otherwise).
+- **Proxy** (`conn.proxy(name, {validateReplies = "throw"})`): `getInterface` + a private `compileInterface` (not
+  registered); a frozen plain object with one frozen function per method (`.stream`/`.collect`/`.oneway`), `name`
+  and `interface`; parameters always encoded, replies per the option, errors of that interface validated against it.
+- **Pool** (`createPool(factory, {max = 8, idleTimeout = 30_000})`): a FIFO of waiters served by idle connections
+  (most recently used first; closed ones are discarded) or new ones while `idle + leased + opening < max`. A lease
+  lasts until the operation settles; a stream's until its call is over for the connection (final reply, error,
+  `return()`), via an internal settle hook. A factory failure (also a synchronous throw) rejects that operation and
+  frees its slot; the factory's signal aborts when its waiter gives up or the pool closes (a connection that still
+  arrives goes idle). Connections are dropped when their `closed` settles. `close()` rejects waiters, closes all
+  connections, later operations reject. `size` counts open connections (not those being opened).
+- **Server** (`createServer(options)`, `service.ts` for the built-ins behind `builtinInterfaces()`): registration
+  compiles at once (verbatim text kept for GetInterfaceDescription); handlers are functions or `{handler,
+  requiresMore?: true, requiresUpgrade?: true}` (raising, never lowering, the IDL flag); unknown keys, bad values,
+  built-in or taken names are `TypeError`s and nothing is registered. `UntypedHandler` uses a method signature, so
+  an untyped handler may annotate its parameters. The dispatch table and GetInterfaceDescription use `Map`s only.
+  GetInfo lists `org.varlink.service`, user interfaces in registration order, then `INTERNAL_ERROR_INTERFACE`.
+- **Server driver**: per connection a reader task (`while wantsInput` read → receive; woken after each finished call)
+  and a dispatcher task (`nextEvent()` → `await dispatchCall(…, {signal})` → next). Clean EOF is not gone. A read
+  rejection reports `transport-error`, aborts the active call's signal (`ConnectionClosedError`), closes session and
+  channel; `channel.closed` settling does the same without a report. An unclaimed upgrade closes the connection.
+  `handle()` resolves once the channel is closed and the reader ended (a handler that ignores its signal is not
+  awaited) and never rejects; at `maxConnections` (or after shutdown) the channel is closed at once. `serve()` runs
+  `for await` over the listener in the background (`accept-failed` ends that loop). `shutdown({graceful, timeout})`
+  closes the listeners, then aborts active calls' signals and closes each connection when its call finished (buffered
+  calls dropped); at the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false` everything is
+  closed hard. No timers on server connections other than the shutdown deadline (F1).
+- **Tests**: `test/unit/rpc/` (connection, pool, server, proxy), `test/unit/address/`, `test/regression/harness.ts`
+  (`Transport`/`Endpoint`/`RawPeer`; `pairTransport` resets the server end like an RST; `transports` is the list the
+  suite runs over) and `e2e.test.ts` (one `describe` per F-id), `test/fuzz/server.test.ts` (fast-check, seeded,
+  `VARLINK_FUZZ_RUNS` default 200). Soak: `VARLINK_SOAK_SECONDS=600 node test/fuzz/soak.ts` runs the same generator
+  against one server, prints RSS every 10 s and exits non-zero on an unhandled rejection, uncaught exception, hang
+  or a server that stops answering (`VARLINK_FC_SEED` fixes the seed).
+- **Known limits**: a `pair()` peer's `close()` looks like a clean EOF to the server (only a socket RST or the
+  harness reset is a disconnect), so over `pair()` a handler waiting on its signal is not aborted by a client
+  `close()`; it is when its reply's write fails.
+
 ---
 
 ## 5. Public API sketch
@@ -772,7 +860,9 @@ await pool.call("org.example.Ping", {});   // same methods as Connection; each c
 await pool.close();
 ```
 
-The pool leases an idle healthy connection or opens one (up to `max`, then waits). A connection that
+The runtime-agnostic core is `createPool(factory, options)` from `varlink-js` (`factory(signal) =>
+Promise<Connection>`); the Node adapter's `createPool(address)` wraps it (§4.11). The pool leases an idle healthy
+connection or opens one (up to `max`, then waits). A connection that
 closed or failed is discarded, never reused (F4). Streams hold their lease until they end, so
 cancelling one stream doesn't kill other calls.
 
