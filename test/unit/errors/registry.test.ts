@@ -1,7 +1,7 @@
 // ErrorRegistry and the varlink-js InternalError interface (DESIGN.md §6, Q2).
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 import {
   createErrorRegistry,
@@ -16,11 +16,26 @@ import {
   isVarlinkError,
   MethodNotFoundError,
   MethodNotImplementedError,
+  ORG_VARLINK_SERVICE,
+  ORG_VARLINK_SERVICE_IDL,
   PermissionDeniedError,
   VarlinkError,
   type ErrorClass,
 } from "../../../src/core/errors/index.ts";
 import { formatInterface, parseInterface, validateInterface } from "../../../src/core/idl/index.ts";
+
+const SRC = join(import.meta.dirname, "../../../src");
+
+/** The seven org.varlink.service error classes. */
+const STANDARD_CLASSES: readonly ErrorClass[] = [
+  InterfaceNotFoundError,
+  MethodNotFoundError,
+  MethodNotImplementedError,
+  InvalidParameterError,
+  PermissionDeniedError,
+  ExpectedMoreError,
+  ExpectedUpgradeError,
+];
 
 /** A §6-style generated error class. */
 class ParameterOutOfRange extends VarlinkError<{ field: string }> {
@@ -101,22 +116,46 @@ describe("ErrorRegistry", () => {
     assert.equal(registry.has(""), false);
   });
 
+  test("register is atomic", () => {
+    const registry = new ErrorRegistry().register(ParameterOutOfRange);
+    const a = errorClass("org.example.a.A");
+    const b = errorClass("org.example.b.B");
+    // A conflict with an existing class, after valid ones: nothing is registered.
+    assert.throws(() => registry.register(a, b, errorClass(ParameterOutOfRange.errorName)), TypeError);
+    assert.equal(registry.has("org.example.a.A") || registry.has("org.example.b.B"), false);
+    // An invalid name after valid ones.
+    assert.throws(() => registry.register(a, errorClass("bad")), TypeError);
+    assert.equal(registry.has("org.example.a.A"), false);
+    // Two different classes with one name in the same call.
+    assert.throws(() => registry.register(a, b, errorClass("org.example.a.A")), TypeError);
+    assert.equal(registry.has("org.example.a.A") || registry.has("org.example.b.B"), false);
+    // The same class twice in one call is fine.
+    registry.register(a, b, a);
+    assert.equal(registry.get("org.example.a.A"), a);
+    assert.equal(registry.get("org.example.b.B"), b);
+  });
+
   test("createErrorRegistry holds the standard errors and InternalError", () => {
     const registry = createErrorRegistry();
-    const expected: ErrorClass[] = [
-      InterfaceNotFoundError,
-      MethodNotFoundError,
-      MethodNotImplementedError,
-      InvalidParameterError,
-      PermissionDeniedError,
-      ExpectedMoreError,
-      ExpectedUpgradeError,
-      InternalError,
-    ];
-    for (const cls of expected) assert.equal(registry.get(cls.errorName), cls, cls.errorName);
+    for (const cls of [...STANDARD_CLASSES, InternalError]) assert.equal(registry.get(cls.errorName), cls);
     const e = registry.create("org.varlink.service.MethodNotFound", { method: "a.b.C" });
     assert.ok(e instanceof MethodNotFoundError);
     assert.notEqual(createErrorRegistry(), registry);
+  });
+
+  test("a generated descriptor's errors re-exporting the core classes register without conflict (§5.7)", () => {
+    // What codegen emits for org.varlink.service and INTERNAL_ERROR_INTERFACE: the core classes, not new ones.
+    const serviceErrors = Object.fromEntries(
+      STANDARD_CLASSES.map((cls) => [cls.errorName.slice(ORG_VARLINK_SERVICE.length + 1), cls]),
+    );
+    const internalErrors = { InternalError };
+    const registry = createErrorRegistry();
+    registry.register(...Object.values(serviceErrors), ...Object.values(internalErrors));
+    assert.ok(registry.create(MethodNotFoundError.errorName, { method: "a.b.C" }) instanceof MethodNotFoundError);
+    // A different class under the same name (a regenerated copy) conflicts.
+    assert.throws(() => registry.register(errorClass(MethodNotFoundError.errorName)), TypeError);
+    assert.throws(() => registry.register(errorClass(InternalError.errorName)), TypeError);
+    assert.equal(registry.get(MethodNotFoundError.errorName), MethodNotFoundError);
   });
 });
 
@@ -155,7 +194,44 @@ describe("InternalError interface (Q2)", () => {
         }
       }
     };
-    walk(resolve("src"));
-    assert.deepEqual(hits, [resolve("src/core/errors/standard.ts")]);
+    walk(SRC);
+    assert.deepEqual(hits, [join(SRC, "core/errors/standard.ts")]);
+  });
+});
+
+describe("org.varlink.service interface", () => {
+  test("ORG_VARLINK_SERVICE_IDL is the UAPI text and matches the core classes", () => {
+    const corpus = readFileSync(join(import.meta.dirname, "../../corpus/uapi/org.varlink.service.varlink"), "utf8");
+    assert.equal(ORG_VARLINK_SERVICE_IDL, corpus);
+    const iface = parseInterface(ORG_VARLINK_SERVICE_IDL);
+    assert.equal(iface.name, ORG_VARLINK_SERVICE);
+    assert.deepEqual(validateInterface(iface), []);
+
+    // Field names typechecked against each class's `parameters` type (`[]` for the parameterless ones).
+    type Fields<E extends VarlinkError> = string extends keyof E["parameters"]
+      ? []
+      : (keyof E["parameters"] & string)[];
+    const expected = new Map<ErrorClass, string[]>([
+      [InterfaceNotFoundError, ["interface"] satisfies Fields<InterfaceNotFoundError>],
+      [MethodNotFoundError, ["method"] satisfies Fields<MethodNotFoundError>],
+      [MethodNotImplementedError, ["method"] satisfies Fields<MethodNotImplementedError>],
+      [InvalidParameterError, ["parameter"] satisfies Fields<InvalidParameterError>],
+      [PermissionDeniedError, [] satisfies Fields<PermissionDeniedError>],
+      [ExpectedMoreError, [] satisfies Fields<ExpectedMoreError>],
+      [ExpectedUpgradeError, [] satisfies Fields<ExpectedUpgradeError>],
+    ]);
+    const classes = new Map<string, ErrorClass>(STANDARD_CLASSES.map((cls) => [cls.errorName, cls]));
+    const errors = iface.members.filter((m) => m.kind === "error");
+    assert.equal(errors.length, classes.size);
+    for (const member of errors) {
+      const cls = classes.get(`${ORG_VARLINK_SERVICE}.${member.name}`);
+      assert.ok(cls, member.name);
+      assert.deepEqual(
+        member.type.fields.map((f) => f.name),
+        expected.get(cls),
+        member.name,
+      );
+      assert.ok(member.type.fields.every((f) => f.type.kind === "string"));
+    }
   });
 });

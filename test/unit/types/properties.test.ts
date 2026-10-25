@@ -13,7 +13,13 @@ import type {
   Type,
   TypeMember,
 } from "../../../src/core/idl/index.ts";
-import { compileInterface, jsonCodec, type IntsMode, type Validator } from "../../../src/core/types/index.ts";
+import {
+  compileInterface,
+  createJsonCodec,
+  jsonCodec,
+  type IntsMode,
+  type Validator,
+} from "../../../src/core/types/index.ts";
 
 const SEED = 20261025;
 const RUNS = 300;
@@ -228,6 +234,19 @@ const caseArb: fc.Arbitrary<Case> = fc
   .chain(([iface, ints]) =>
     new Gen(iface, ints).value(methodInput(iface), 4).map((sample): Case => ({ iface, ints, sample })),
   );
+const numberCaseArb: fc.Arbitrary<Case> = interfaceArb.chain((iface) =>
+  new Gen(iface, "number").value(methodInput(iface), 4).map((sample): Case => ({ iface, ints: "number", sample })),
+);
+
+/** `value` with every bigint replaced by `Number(bigint)`: what a codec without `context.source` decodes. */
+function bigintsToNumbers(value: unknown): unknown {
+  if (typeof value === "bigint") return Number(value);
+  if (Array.isArray(value)) return value.map(bigintsToNumbers);
+  if (typeof value !== "object" || value === null) return value;
+  const copy: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(value)) put(copy, k, bigintsToNumbers(x));
+  return copy;
+}
 
 function inputValidator(c: Case): Validator {
   const method = compileInterface(c.iface, { ints: c.ints }).methods.get("M");
@@ -423,6 +442,20 @@ describe("validator properties", () => {
         const v = inputValidator(c);
         const text = jsonCodec.encode(v.encode(c.sample.input));
         assert.deepEqual(v.decode(jsonCodec.decode(text)), c.sample.expected);
+      }),
+      params(RUNS),
+    );
+  });
+
+  test("2b. the same through a codec without context.source, number mode", () => {
+    const plain = createJsonCodec({ sourceText: false });
+    assert.equal(plain.losslessInts, false);
+    fc.assert(
+      fc.property(numberCaseArb, (c) => {
+        const v = inputValidator(c);
+        const text = plain.encode(v.encode(c.sample.input));
+        // int fields hold safe integers; unsafe integers inside object/any come back as (rounded) numbers.
+        assert.deepEqual(v.decode(plain.decode(text)), bigintsToNumbers(c.sample.expected));
       }),
       params(RUNS),
     );

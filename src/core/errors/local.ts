@@ -1,7 +1,10 @@
 // Local errors (DESIGN.md §6): raised by this library, never sent on the wire. `localName` is the
 // systemd-equivalent error name, for CLI output and logs.
 
-/** Instance brand of {@link VarlinkLocalError}: a non-enumerable own property whose value is `true`. */
+/**
+ * Instance brand of {@link VarlinkLocalError}: set as a non-enumerable own property whose value is `true`, but
+ * read like any property, so an object inheriting from a VarlinkLocalError also passes {@link isVarlinkLocalError}.
+ */
 export const VARLINK_LOCAL_ERROR_BRAND: unique symbol = Symbol.for("varlink-js.VarlinkLocalError");
 
 /** Base class of the local errors. */
@@ -83,6 +86,18 @@ export class OperationNotSupportedError extends VarlinkLocalError {
  */
 export type ValidationReason = "missing" | "null" | "type" | "enum" | "unknown-field" | "int-range" | "too-deep";
 
+/** Longest {@link ValidationError.parameter}, in UTF-16 code units, before the "…" marking a cut. */
+const MAX_PARAMETER_LENGTH = 256;
+
+/** `s` cut to {@link MAX_PARAMETER_LENGTH} code units on a code point boundary, with "…" appended if cut. */
+function truncate(s: string): string {
+  if (s.length <= MAX_PARAMETER_LENGTH) return s;
+  let end = MAX_PARAMETER_LENGTH;
+  const last = s.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end--; // do not split a surrogate pair (s is well-formed)
+  return `${s.slice(0, end)}…`;
+}
+
 /**
  * A value does not match its IDL type. On a server this becomes `org.varlink.service.InvalidParameter` with
  * {@link parameter}; on a client the call is rejected with it. Reason `int-range` always uses the
@@ -91,12 +106,16 @@ export type ValidationReason = "missing" | "null" | "type" | "enum" | "unknown-f
 export class ValidationError extends VarlinkLocalError {
   /** Path to the bad value: field names and map keys as strings, array indices as numbers. */
   readonly path: readonly (string | number)[];
-  /** {@link path} joined with "." ("" for the value itself). Ambiguous if a map key contains ".". */
+  /**
+   * {@link path} joined with "." ("" for the value itself). Ambiguous if a map key contains ".". Lone surrogates
+   * are replaced with U+FFFD and the result is cut to {@link MAX_PARAMETER_LENGTH} code units plus "…", so a
+   * peer-controlled path can always be sent back in `InvalidParameter`.
+   */
   readonly parameter: string;
   readonly reason: ValidationReason;
 
   constructor(path: readonly (string | number)[], reason: ValidationReason, detail: string, options?: ErrorOptions) {
-    const parameter = path.map(String).join(".");
+    const parameter = truncate(path.map((s) => (typeof s === "string" ? s.toWellFormed() : String(s))).join("."));
     super("org.varlink.service.InvalidParameter", `invalid parameter "${parameter}": ${detail}`, options);
     this.path = Object.freeze([...path]);
     this.parameter = parameter;

@@ -30,20 +30,23 @@ export class ErrorRegistry {
   readonly #classes = new Map<string, ErrorClass>();
 
   /**
-   * Registers classes by their `errorName`. Registering the same class again is a no-op.
+   * Registers classes by their `errorName`. Registering the same class again is a no-op. Atomic: if any class
+   * is rejected, none is registered.
    *
    * @throws {TypeError} if an `errorName` is not a fully qualified error name (`interface.Name`), or is already
-   * registered for a different class.
+   * registered (or passed earlier in the same call) for a different class.
    */
   register(...classes: ErrorClass[]): this {
+    const added = new Map<string, ErrorClass>();
     for (const cls of classes) {
       const name = cls.errorName;
       if (!isErrorName(name)) throw new TypeError(`invalid varlink error name: ${formatValue(name)}`);
-      const existing = this.#classes.get(name);
+      const existing = this.#classes.get(name) ?? added.get(name);
       if (existing === cls) continue;
       if (existing !== undefined) throw new TypeError(`error ${name} is already registered to another class`);
-      this.#classes.set(name, cls);
+      added.set(name, cls);
     }
+    for (const [name, cls] of added) this.#classes.set(name, cls);
     return this;
   }
 

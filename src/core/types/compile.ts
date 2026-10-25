@@ -225,7 +225,8 @@ class Compiler {
           if (!Array.isArray(v)) return wrongType(ctx, type, v);
           enter(ctx, depth);
           const out: unknown[] = [];
-          for (let i = 0; i < v.length; i++) {
+          const length = v.length;
+          for (let i = 0; i < length; i++) {
             ctx.path.push(i);
             const item: unknown = v[i];
             out.push(element(item === undefined ? null : item, ctx, depth + 1));
@@ -244,6 +245,8 @@ class Compiler {
             const item = v[key];
             if (item === undefined && ctx.dir === "encode") continue;
             ctx.path.push(key);
+            // Like string values: a lone surrogate cannot be encoded as UTF-8.
+            if (!key.isWellFormed()) fail(ctx, "type", "map key is not valid Unicode (lone surrogate)");
             // On decode (hand-made input: JSON has no undefined) undefined is null, as for array elements.
             entries.push([key, element(item === undefined ? null : item, ctx, depth + 1)]);
             ctx.path.pop();
@@ -280,6 +283,7 @@ class Compiler {
           if (ctx.dir !== "drop") {
             for (const key of Object.keys(v)) {
               if (declared.has(key) || (ctx.dir === "encode" && v[key] === undefined)) continue;
+              // ValidationError makes the key safe to send back (well-formed, length-capped) in `parameter`.
               ctx.path.push(key);
               fail(ctx, "unknown-field", "unknown field");
             }

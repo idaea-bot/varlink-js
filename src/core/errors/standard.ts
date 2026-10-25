@@ -4,6 +4,47 @@ import { isVarlinkError, VarlinkError } from "./varlink-error.ts";
 /** Interface of the standard errors. */
 export const ORG_VARLINK_SERVICE = "org.varlink.service";
 
+/** The UAPI.20 `org.varlink.service` interface, verbatim from the specification. */
+export const ORG_VARLINK_SERVICE_IDL: string = `# The Varlink Service Interface should be provided by every varlink service.
+# It describes the service and the interfaces it implements.
+interface ${ORG_VARLINK_SERVICE}
+
+# Get a list of all the interfaces a service provides and information
+# about the implementation.
+method GetInfo() -> (
+  vendor: string,
+  product: string,
+  version: string,
+  url: string,
+  interfaces: []string
+)
+
+# Get the description of an interface that is implemented by this service.
+method GetInterfaceDescription(interface: string) -> (description: string)
+
+# The requested interface was not found.
+error InterfaceNotFound (interface: string)
+
+# The requested method was not found
+error MethodNotFound (method: string)
+
+# The interface defines the requested method, but the service does not
+# implement it.
+error MethodNotImplemented (method: string)
+
+# One of the passed parameters is invalid.
+error InvalidParameter (parameter: string)
+
+# Client is denied access
+error PermissionDenied ()
+
+# Method is expected to be called with 'more' set to true, but wasn't
+error ExpectedMore ()
+
+# Method is expected to be called with 'upgrade' set to true, but wasn't
+error ExpectedUpgrade ()
+`;
+
 /** `error InterfaceNotFound (interface: string)` */
 export class InterfaceNotFoundError extends VarlinkError<{ interface: string }> {
   static readonly errorName: string = `${ORG_VARLINK_SERVICE}.InterfaceNotFound`;

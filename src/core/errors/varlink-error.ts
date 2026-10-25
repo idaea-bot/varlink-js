@@ -1,7 +1,10 @@
 // VarlinkError: an error reply on the wire (DESIGN.md §6). Recognised by a brand rather than instanceof, so
 // it works across duplicated module copies.
 
-/** Instance brand of {@link VarlinkError}: a non-enumerable own property whose value is `true`. */
+/**
+ * Instance brand of {@link VarlinkError}: set as a non-enumerable own property whose value is `true`, but read
+ * like any property, so an object inheriting from a VarlinkError also passes {@link isVarlinkError}.
+ */
 export const VARLINK_ERROR_BRAND: unique symbol = Symbol.for("varlink-js.VarlinkError");
 
 /** A varlink error reply: a fully qualified error name plus its parameters. */

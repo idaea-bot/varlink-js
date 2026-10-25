@@ -462,6 +462,23 @@ describe("maps", () => {
       assert.deepEqual(Object.keys(out.v), ["__proto__", "x"]);
     }
   });
+
+  test("a key that is not well-formed UTF-16 is refused in every direction", () => {
+    checkRows(
+      ["\uD800", "a\uDFFFb", "x\uD83D"].map((key): Row => ({
+        type: "[string]int",
+        input: { ok: 1, [key]: 1 },
+        expect: err("type", `v.${key.toWellFormed()}`),
+      })),
+    );
+    for (const dir of DIRS) {
+      const e = validationError(() => run(wrapper("[string]?int"), dir, { v: { "\uDC00": null } }));
+      assert.deepEqual(e.path, ["v", "\uDC00"]);
+      assert.equal(e.message, 'invalid parameter "v.�": map key is not valid Unicode (lone surrogate)');
+    }
+    // A well-formed surrogate pair is fine.
+    assert.deepEqual(wrapper("[string]int").decode({ v: { "\u{1F600}": 1 } }), { v: { "\u{1F600}": 1 } });
+  });
 });
 
 describe("recursive types and depth", () => {
@@ -559,19 +576,54 @@ describe("cross-cutting", () => {
       return x;
     };
     const type = "(a: []?(b: ?int, c: [string]int), d: ?string, e: int)";
-    const input = freeze({ v: { a: [{ b: null, c: { x: 1 } }, null], d: null, e: -0, extra: 1 } });
-    const snapshot = structuredClone(input);
+    const value = { a: [{ b: null, c: { x: 1 } }, null], d: null, e: -0 };
+    const withExtra = freeze({ v: { ...value, extra: 1 } });
+    const plain = freeze({ v: value });
     for (const dir of DIRS) {
-      try {
-        const out = run(wrapper(type), dir, input) as { v: { a: unknown[] } };
-        assert.notEqual(out, input);
-        assert.notEqual(out.v.a, input.v.a);
-        assert.deepEqual(out, { v: { a: [{ c: { x: 1 } }, null], e: 0 } });
-      } catch (e) {
-        assert.ok(e instanceof ValidationError && dir !== "drop");
+      // The unknown field is rejected except in drop mode; the outputs are checked without it there.
+      const inputs = dir === "drop" ? [withExtra] : [withExtra, plain];
+      for (const input of inputs) {
+        const snapshot = structuredClone(input);
+        if (input === withExtra && dir !== "drop") {
+          assert.equal(validationError(() => run(wrapper(type), dir, input)).reason, "unknown-field");
+        } else {
+          const out = run(wrapper(type), dir, input) as { v: { a: { c: unknown }[] } };
+          assert.notEqual(out, input);
+          assert.notEqual(out.v, input.v);
+          assert.notEqual(out.v.a, input.v.a);
+          assert.notEqual(out.v.a[0], input.v.a[0]);
+          assert.notEqual(out.v.a[0]?.c, input.v.a[0]?.c);
+          assert.deepEqual(out, { v: { a: [{ c: { x: 1 } }, null], e: 0 } });
+        }
+        assert.deepEqual(input, snapshot);
       }
-      assert.deepEqual(input, snapshot);
     }
+  });
+
+  test("ValidationError.parameter is well-formed and at most 256 code units plus …", () => {
+    const struct = wrapper("()");
+    for (const dir of ["reject", "encode"] as const) {
+      const lone = validationError(() => run(struct, dir, { v: { "\uD800": 1 } }));
+      assert.equal(lone.reason, "unknown-field");
+      assert.deepEqual(lone.path, ["v", "\uD800"]);
+      assert.equal(lone.parameter, "v.�");
+      assert.ok(lone.parameter.isWellFormed() && lone.message.isWellFormed());
+
+      const long = validationError(() => run(struct, dir, { v: { ["k".repeat(100_000)]: 1 } }));
+      assert.equal(long.path[1], "k".repeat(100_000));
+      assert.ok(long.parameter.length <= 257, String(long.parameter.length));
+      assert.ok(long.parameter.endsWith("…"));
+      assert.equal(long.parameter, `v.${"k".repeat(254)}…`);
+      assert.ok(long.message.length < 300);
+    }
+    // "v." + 253 chars puts a surrogate pair at code units 255–256: cut before it, never through it.
+    const key = `${"k".repeat(253)}\u{1F600}tail`;
+    const straddle = validationError(() => struct.decode({ v: { [key]: 1 } }));
+    assert.equal(straddle.parameter, `v.${"k".repeat(253)}…`);
+    assert.ok(straddle.parameter.isWellFormed());
+    // Exactly 256 code units with the pair inside: kept whole, no cut.
+    const fits = validationError(() => struct.decode({ v: { [`${"k".repeat(252)}\u{1F600}`]: 1 } }));
+    assert.equal(fits.parameter, `v.${"k".repeat(252)}\u{1F600}`);
   });
 });
 

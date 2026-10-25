@@ -25,6 +25,7 @@ export {
   MethodNotFoundError,
   MethodNotImplementedError,
   ORG_VARLINK_SERVICE,
+  ORG_VARLINK_SERVICE_IDL,
   PermissionDeniedError,
 } from "./standard.ts";
 export { isVarlinkError, VARLINK_ERROR_BRAND, VarlinkError, type ErrorClass } from "./varlink-error.ts";
