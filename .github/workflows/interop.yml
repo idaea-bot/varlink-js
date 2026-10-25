@@ -1,0 +1,124 @@
+name: Interop
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: python-varlink certification (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          check-latest: true
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install varlink==31.0.0
+      - run: npm ci
+      - name: Versions
+        run: |
+          node --version
+          python --version
+          python -m pip show varlink
+      # The four directions (JS client -> python server, python client -> JS server; unix and tcp) each print the
+      # full step log in the spec output. VARLINK_REQUIRE_INTEROP turns a skipped python test into a failure.
+      - name: Certification (JS server/client + python-varlink both ways, unix and tcp)
+        env:
+          VARLINK_PYTHON: python
+          VARLINK_REQUIRE_INTEROP: "1"
+        run: node --test --test-reporter=spec test/interop/certification.test.ts test/interop/python.test.ts
+
+  rust:
+    name: rust varlink certification
+    runs-on: ubuntu-latest
+    env:
+      RUST_VARLINK_COMMIT: 2041093de7d883b6354087aa39fc4ec9d70a6944
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          check-latest: true
+          cache: npm
+      - name: Clone varlink/rust at the pinned commit
+        run: |
+          git init rust-varlink
+          git -C rust-varlink fetch --depth 1 https://github.com/varlink/rust "$RUST_VARLINK_COMMIT"
+          git -C rust-varlink checkout --detach FETCH_HEAD
+          test "$(git -C rust-varlink rev-parse HEAD)" = "$RUST_VARLINK_COMMIT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            rust-varlink/target
+          key: rust-varlink-${{ runner.os }}-${{ env.RUST_VARLINK_COMMIT }}
+      - name: Build varlink-certification
+        working-directory: rust-varlink
+        run: |
+          cargo --version
+          cargo build --release -p varlink-certification
+      - run: npm ci
+      - name: Certification (JS server/client + rust both ways, unix and tcp)
+        env:
+          VARLINK_RUST_CERT: ${{ github.workspace }}/rust-varlink/target/release/varlink-certification
+          VARLINK_REQUIRE_INTEROP: "1"
+        run: node --test --test-reporter=spec test/interop/rust.test.ts
+
+  varlinkctl:
+    name: systemd varlinkctl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          check-latest: true
+          cache: npm
+      - name: Versions
+        run: |
+          {
+            echo "### systemd"
+            echo '```'
+            systemctl --version | head -n 1
+            varlinkctl --version | head -n 1
+            lsb_release -d
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Start systemd-userdbd (io.systemd.Multiplexer)
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y systemd-userdbd
+          sudo systemctl start systemd-userdbd.socket
+      - name: Multiplexer socket
+        run: |
+          if [ -S /run/systemd/userdb/io.systemd.Multiplexer ]; then
+            echo "Multiplexer socket: present" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Multiplexer socket: missing (the Multiplexer tests skip)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - run: npm ci
+      # VARLINK_REQUIRE_INTEROP makes a missing varlinkctl fatal; a missing Multiplexer socket still skips.
+      - name: varlinkctl against the JS server, validate-idl, Multiplexer
+        env:
+          VARLINK_VARLINKCTL: "1"
+          VARLINK_REQUIRE_INTEROP: "1"
+        run: node --test --test-reporter=spec test/interop/varlinkctl.test.ts

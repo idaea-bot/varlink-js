@@ -79,6 +79,7 @@
     "clean": "node -e \"for (const d of ['dist', 'build', 'pkg']) require('node:fs').rmSync(d, { recursive: true, force: true })\"",
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "build:test": "tsc -p tsconfig.json --noEmit false --outDir build",
+    "test:interop": "node --test \"test/interop/*.test.ts\"",
     "test:consumer": "node test/fixtures/consumer/run.js",
     "prepack": "npm run build"
   },

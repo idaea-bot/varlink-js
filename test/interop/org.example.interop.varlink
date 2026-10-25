@@ -1,0 +1,56 @@
+# Interop test interface for varlinkctl (systemd >= 255). Uses only constructs systemd 255 accepts:
+# no string sets, no empty struct types, no nullable any, no nullable array of nullables.
+interface org.example.interop
+
+# A colour.
+type Color (red, green, blue)
+
+type Point (
+  x: int,
+  y: int
+)
+
+type Shape (
+  name: string,
+  color: Color,
+  points: []Point,
+  tags: [string]string,
+  label: ?string
+)
+
+# Returns its parameters.
+method Echo(
+  int: int,
+  float: float,
+  string: string,
+  bool: bool,
+  nullable: ?string,
+  array: []int,
+  map: [string]string,
+  color: Color,
+  shape: Shape
+) -> (
+  int: int,
+  float: float,
+  string: string,
+  bool: bool,
+  nullable: ?string,
+  array: []int,
+  map: [string]string,
+  color: Color,
+  shape: Shape
+)
+
+# Replies i = 1 to n (the last one final).
+method Count(n: int) -> (i: int)
+
+# Meant to be called oneway: remembers the message.
+method Notify(message: string) -> ()
+
+# The message of the last Notify.
+method LastNotified() -> (message: ?string)
+
+# Always fails with Failed.
+method Fail(reason: string) -> ()
+
+error Failed (reason: string, code: int)
