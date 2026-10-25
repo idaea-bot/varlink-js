@@ -225,7 +225,9 @@ export class ServerSession {
    * delivered yet, the next {@link nextEvent} returns one (exactly once): the pending one with its error if there
    * is one (e.g. a lost upgrade remainder), else `{type: "close"}` if the session was `open`. So a driver whose
    * session was closed by `dispatchCall` (a failed send) still gets its final event. In state `upgraded` no event
-   * is queued: the driver already owns the stream and {@link nextEvent} stays null.
+   * is queued: the driver already owns the stream and {@link nextEvent} stays null. That includes a failed send of
+   * an upgrade call's confirming reply (the session was already `upgraded`), so after `dispatchCall` of an upgrade
+   * call resolves the driver checks {@link state} rather than waiting for an event.
    */
   close(): void {
     const wasOpen = this.#state === "open";

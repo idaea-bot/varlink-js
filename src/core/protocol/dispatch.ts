@@ -20,8 +20,9 @@ import type { ServerSession } from "./server-session.ts";
 /** What a handler sees besides its parameters. */
 export interface CallContext {
   /**
-   * Aborts when `DispatchOptions.signal` aborts, a write fails, or dispatch closes the session because not even
-   * InternalError could be encoded (the connection is gone).
+   * Aborts when `DispatchOptions.signal` aborts (client gone, server shutting down), a write fails, the session
+   * is closed while the call is unanswered, or dispatch closes the session because not even InternalError could
+   * be encoded.
    */
   readonly signal: AbortSignal;
   /** Fully qualified method name. */
@@ -37,9 +38,10 @@ export interface CallContext {
    * later values (and the handler's return value) are dropped and resolve immediately. Oneway: nothing is sent,
    * resolves immediately. After the call's final reply: resolves without sending.
    *
-   * Rejects with a `ConnectionClosedError` (`cause`: the send failure, or `signal.reason`) once the connection is
-   * gone, for every kind of call: a send of this call failed (also this notify's own), or `signal` aborted. A
-   * peer that merely half-closed (EOF after its calls) is not gone. Also rejects, ending the call with
+   * Rejects with a `ConnectionClosedError` (`cause`: `signal.reason`) once the connection is gone, for every kind
+   * of call: a send of this call failed (also this notify's own), or the session was closed while the call was
+   * unanswered (both also abort `signal`). An aborted `signal` alone is not gone (a graceful shutdown still writes
+   * replies), nor is a peer that merely half-closed (EOF after its calls). Also rejects, ending the call with
    * InternalError, when the value is not a plain object (any `validateReplies` mode) or fails the method's output
    * type in `validateReplies: "throw"` mode; and when called re-entrantly from a reply's `toJSON` or getter. A
    * fire-and-forget call never becomes an unhandled rejection.
@@ -198,6 +200,8 @@ class Dispatch {
   #done = false;
   /** A write failed: drop everything. */
   #dead = false;
+  /** The session was closed while this call was unanswered (by the driver, or by dispatch on the L6 path). */
+  #closedUnder = false;
   /** The handler (or iterator) settled: notify() after the end is late. */
   #settled = false;
   #chain: Promise<void> = Promise.resolve();
@@ -444,19 +448,31 @@ class Dispatch {
   }
 
   /**
-   * The connection is gone: a send of this call failed, or `ctx.signal` aborted (the driver's signal, or dispatch
-   * closed the session itself). A session closed by a clean peer EOF is not gone: the peer may half-close after
-   * sending its calls and still read the replies.
+   * The connection can no longer carry this call's replies: a send of this call failed, or the session was closed
+   * while the call was still unanswered (by the driver or by dispatch itself). An aborted `ctx.signal` alone is not
+   * gone (a graceful shutdown aborts it but still writes replies), and neither is a session closed by a clean peer
+   * EOF after the final reply (the peer may half-close after sending its calls and still read the replies).
    */
   #gone(): boolean {
-    return this.#dead || this.#controller.signal.aborted;
+    if (!this.#done && this.#session.state === "closed") this.#markClosedUnder();
+    return this.#dead || this.#closedUnder;
+  }
+
+  /** The session was closed under this unanswered call: end it and abort ctx.signal (if not aborted yet). */
+  #markClosedUnder(): void {
+    this.#closedUnder = true;
+    this.#done = true;
+    if (!this.#controller.signal.aborted)
+      this.#controller.abort(new ConnectionClosedError(`${this.#call.method}: the session was closed`));
   }
 
   #goneError(): ConnectionClosedError {
+    // A failed send and a close under us both abort the controller, so its reason is the cause.
     const signal = this.#controller.signal;
+    const cause: unknown = signal.aborted ? signal.reason : undefined;
     return new ConnectionClosedError(
       `${this.#call.method}: the connection is closed`,
-      signal.aborted ? { cause: signal.reason } : undefined,
+      cause === undefined ? undefined : { cause },
     );
   }
 
@@ -549,6 +565,7 @@ class Dispatch {
     if (outcome !== "invalid") return;
     // #produce reported the failure ("invalid-reply").
     this.#done = true;
+    this.#closedUnder = true;
     this.#controller.abort(this.#lastProblem);
     try {
       this.#session.close();
@@ -573,8 +590,9 @@ class Dispatch {
       bytes = make();
     } catch (e) {
       if (this.#session.state !== "open") {
-        // Closed under us (client gone, shutdown): replies are dropped silently.
-        this.#done = true;
+        // Closed under us (client gone, shutdown): replies are dropped silently, and the handler learns that
+        // the connection is gone (ctx.signal aborts, notify rejects) even if the driver did not abort its signal.
+        this.#markClosedUnder();
         return "dropped";
       }
       this.#lastProblem = e;

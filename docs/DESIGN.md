@@ -667,10 +667,12 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   sent, resolves. Dropped notifies (oneway, non-`more` after the first) resolve immediately. After the call's final
   reply: resolves without sending (`late-notify` once the handler settled). A `bad-result` value (any mode) or an
   `invalid-reply` in `"throw"` mode ends the call with `InternalError` and rejects with that problem. Once the
-  connection is gone it rejects with a `ConnectionClosedError` (`cause`: the send failure, or `ctx.signal.reason`),
-  for every kind of call, oneway included: gone means a send of the call failed (also this notify's own) or
-  `ctx.signal` aborted (driver signal, or dispatch closed the session itself). A session merely closed by a clean
-  peer EOF is not gone (a UAPI client may half-close after sending its calls and still read the replies). Because
+  connection is gone it rejects with a `ConnectionClosedError` (`cause`: `ctx.signal.reason`), for every kind of
+  call, oneway included: gone means a send of the call failed (also this notify's own) or the session was closed
+  while the call was still unanswered (by the driver or by dispatch); either also aborts `ctx.signal`. An aborted
+  `ctx.signal` alone is not gone (a graceful shutdown aborts it and still writes replies, so a notify-style reply
+  goes out like a returned one), and neither is a session closed by a clean peer EOF after the final reply (a UAPI
+  client may half-close after sending its calls and still read the replies). Because
   dropped notifies resolve immediately, a handler must wait on real events between notifies (`for await (const c
   of changes({ signal: ctx.signal })) await ctx.notify(c)`); a bare `for (;;) await ctx.notify(x)` busy-loops for
   a oneway or non-`more` call. Methods meant to stream should declare `more: "requires"`. Every rejected notify
@@ -853,7 +855,7 @@ comment survives as UAPI requires), or `InterfaceNotFound` (fixes F9).
   "current state").
 - Plain async handlers can stream too: `ctx.notify(v)` sends a `continues` reply when `ctx.more` is true
   (sd-varlink's `sd_varlink_notify` style), and the returned value is final. `notify` rejects with a
-  `ConnectionClosedError` once the connection is gone (a send failed or `ctx.signal` aborted). Dropped notifies
+  `ConnectionClosedError` once the connection is gone (a send failed, or the session closed under the call). Dropped notifies
   (oneway, or non-`more` after the first) resolve immediately, so wait on real events between notifies (`for await
   (const c of changes({ signal: ctx.signal })) await ctx.notify(c)`), never a bare `for (;;) await
   ctx.notify(x)`; methods meant to stream should declare `more: "requires"` (§4.10).

@@ -684,7 +684,7 @@ describe("ctx.notify (rule 15)", () => {
     assert.deepEqual(s.reported, []);
   });
 
-  test("oneway: nothing is sent, resolves; rejects once ctx.signal aborted (gone is checked first)", async () => {
+  test("oneway: nothing is sent, resolves (also with an aborted signal); rejects once the session closed under it", async () => {
     let resolved = false;
     const r = await run(
       {
@@ -699,11 +699,12 @@ describe("ctx.notify (rule 15)", () => {
     assert.deepEqual(r.replies, []);
     assert.equal(r.output.length, 0);
 
-    let rejection: unknown;
+    // An aborted signal alone (graceful shutdown) is not gone.
+    let outcome: unknown = "unset";
     const s = await run(
       {
         Plain: async (_p: unknown, ctx: CallContext) => {
-          rejection = await ctx.notify({ n: 1 }).then(
+          outcome = await ctx.notify({ n: 1 }).then(
             () => null,
             (e: unknown) => e,
           );
@@ -712,13 +713,103 @@ describe("ctx.notify (rule 15)", () => {
       { method: `${I}.Plain`, oneway: true },
       { signal: AbortSignal.abort("bye") },
     );
-    assert.ok(rejection instanceof ConnectionClosedError);
-    assert.equal(rejection.cause, "bye");
+    assert.equal(outcome, null);
     assert.equal(s.output.length, 0);
     assert.deepEqual(s.reported, []);
+
+    // The session closed while the oneway call is still active (gone is checked before the oneway shortcut).
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Plain`, oneway: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let release: () => void = () => undefined;
+    let rejection: unknown;
+    const table = tableOf([FTL], {
+      [`${I}.Plain`]: async (_p: unknown, ctx: CallContext) => {
+        await new Promise<void>((res) => {
+          release = res;
+        });
+        rejection = await ctx.notify({ n: 1 }).then(
+          () => null,
+          (e: unknown) => e,
+        );
+      },
+    });
+    const sent: Uint8Array[] = [];
+    const done = dispatchCall(session, ev.id, ev.call, table, (b) => {
+      sent.push(b);
+      return Promise.resolve();
+    });
+    await Promise.resolve();
+    session.close();
+    release();
+    await done;
+    assert.ok(rejection instanceof ConnectionClosedError);
+    assert.equal(sent.length, 0);
   });
 
-  test("after the final reply: resolves without sending, late-notify; rejects only once ctx.signal aborted", async () => {
+  test("an aborted signal on a live session is not gone: a non-more notify-style reply is still sent", async () => {
+    const r = await run(
+      {
+        Plain: async (_p: unknown, ctx: CallContext) => {
+          await ctx.notify({ n: 1 });
+        },
+      },
+      { method: `${I}.Plain` },
+      { signal: AbortSignal.abort("shutdown") },
+    );
+    assert.deepEqual(r.replies, [{ parameters: { n: 1 } }]);
+    assert.deepEqual(r.reported, []);
+    const m = await run(
+      {
+        Plain: async (_p: unknown, ctx: CallContext) => {
+          await ctx.notify({ n: 1 });
+          return { n: 2 };
+        },
+      },
+      { method: `${I}.Plain`, more: true },
+      { signal: AbortSignal.abort("shutdown") },
+    );
+    assert.deepEqual(m.replies, [{ parameters: { n: 1 }, continues: true }, { parameters: { n: 2 } }]);
+  });
+
+  test("the driver closes the session without aborting its signal: ctx.signal aborts and notify rejects", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Plain`, more: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let release: () => void = () => undefined;
+    const rejections: unknown[] = [];
+    let signalAborted = false;
+    const table = tableOf([FTL], {
+      [`${I}.Plain`]: async (_p: unknown, ctx: CallContext) => {
+        await new Promise<void>((res) => {
+          release = res;
+        });
+        for (let i = 0; i < 3; i++) {
+          await ctx.notify({ n: i }).catch((e: unknown) => {
+            rejections.push(e);
+          });
+        }
+        signalAborted = ctx.signal.aborted;
+      },
+    });
+    const sent: Uint8Array[] = [];
+    const done = dispatchCall(session, ev.id, ev.call, table, (b) => {
+      sent.push(b);
+      return Promise.resolve();
+    });
+    await Promise.resolve();
+    session.close();
+    release();
+    await done;
+    assert.equal(rejections.length, 3);
+    for (const e of rejections) assert.ok(e instanceof ConnectionClosedError);
+    assert.equal(signalAborted, true);
+    assert.equal(sent.length, 0);
+  });
+
+  test("after the final reply: resolves without sending, late-notify (also after a clean close or a later abort)", async () => {
     let saved: CallContext | undefined;
     const session = new ServerSession();
     const controller = new AbortController();
