@@ -110,8 +110,9 @@ test("varlink-js/codegen exports generate(); the root entry the typed-client run
   assert.equal("OrgVarlinkService" in root, false);
 });
 
-test("varlink-js/node exports the socket adapter (M4), spawning and activation (M8)", () => {
+test("varlink-js/node exports the socket adapter (M4), spawning, activation, registry and resolver (M8)", () => {
   const fns = [
+    "bindRegistry",
     "connect",
     "connectBridge",
     "connectExec",
@@ -122,10 +123,18 @@ test("varlink-js/node exports the socket adapter (M4), spawning and activation (
     "listenAuto",
     "listenFromEnv",
     "listenStdio",
+    "listRegistry",
     "mergeListeners",
+    "registryDirectory",
+    "resolveInterface",
+    "resolverGetInfo",
+    "resolverResolve",
   ] as const;
-  assert.deepEqual(Object.keys(node).sort(), [...fns].sort());
+  const constants = ["DEFAULT_RESOLVER_ADDRESS", "ORG_VARLINK_RESOLVER_IDL"] as const;
+  assert.deepEqual(Object.keys(node).sort(), [...fns, ...constants].sort());
   for (const fn of fns) assert.equal(typeof node[fn], "function", fn);
+  assert.equal(node.DEFAULT_RESOLVER_ADDRESS, "unix:/run/org.varlink.resolver");
+  assert.match(node.ORG_VARLINK_RESOLVER_IDL, /^interface org\.varlink\.resolver$/m);
   assert.equal("createServer" in node, false); // createServer stays in the root entry
   assert.equal("splitCommandLine" in node, false); // internal (tests import it from spawn.ts)
 });

@@ -5,6 +5,8 @@ import { dirname, join, resolve } from "node:path";
 import { formatAddress, parseAddress, type AddressSpec } from "../core/address/parse.ts";
 import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
+import type { RegistryBindOptions, RegistryBinding } from "../rpc/server.ts";
+import { bindRegistry } from "./registry.ts";
 import { fromNodeSocket } from "./socket.ts";
 
 /** Options for {@link listen}. */
@@ -33,6 +35,11 @@ export interface ListenOptions {
 export interface NodeListener extends Listener {
   /** The underlying server, for diagnostics. Do not close it directly: use {@link Listener.close}. */
   readonly server: Server;
+  /**
+   * Present only on unix path listeners (also `{fd}` ones whose `address` option names a unix path): publishes the
+   * socket in a registry directory (`bindRegistry` of `./registry.ts`), for `server.serve(listener, {registry})`.
+   */
+  readonly bindRegistry?: (interfaces: readonly string[], options: RegistryBindOptions) => Promise<RegistryBinding>;
 }
 
 interface Waiter {
@@ -53,6 +60,16 @@ function codeOf(e: unknown): unknown {
   return typeof e === "object" && e !== null ? (e as { code?: unknown }).code : undefined;
 }
 
+/** The path of a `unix:/path` address (not `unix:@`, tcp or the `fd:<n>` placeholder). */
+function unixPath(address: string): string | undefined {
+  try {
+    const spec = parseAddress(address);
+    return spec.kind === "unix" ? spec.path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** A unix socket path we publish; `inode` is set once our socket is at `path` (close() unlinks only that). */
 interface UnixOwnership {
   readonly path: string;
@@ -62,6 +79,10 @@ interface UnixOwnership {
 class NodeListenerImpl implements NodeListener {
   readonly server: Server;
   readonly address: string;
+  declare readonly bindRegistry?: (
+    interfaces: readonly string[],
+    options: RegistryBindOptions,
+  ) => Promise<RegistryBinding>;
   readonly #queue: ByteChannel[] = [];
   readonly #unix: UnixOwnership | undefined;
   #waiter: Waiter | undefined;
@@ -72,6 +93,12 @@ class NodeListenerImpl implements NodeListener {
     this.server = server;
     this.address = address;
     this.#unix = unix;
+    // Only a unix path socket can be a registry entry's target (absolute: the cwd may change later).
+    const path = unixPath(address);
+    if (path !== undefined) {
+      const target = resolve(path);
+      this.bindRegistry = (interfaces, options) => bindRegistry(target, interfaces, options);
+    }
     server.on("connection", (socket) => {
       const channel = fromNodeSocket(socket);
       if (this.#closing !== undefined) {
@@ -505,7 +532,8 @@ function addressOf(server: Server, fd?: number): string {
  * as `EMFILE`) go to `options.onError` (default: ignored) and the listener keeps accepting. The iterator ends only
  * when `close()` is called or the server closes. `close()` stops listening, ends the iterator and destroys accepted
  * connections nobody took yet; it does not wait for taken ones. Iterating twice concurrently is a `TypeError`. Other
- * address kinds reject with `OperationNotSupportedError`.
+ * address kinds reject with `OperationNotSupportedError`. Unix path listeners (and `{fd}` ones whose `address` names
+ * a unix path) have `bindRegistry`, for `server.serve(listener, {registry})` (§5.4); the others do not.
  */
 export async function listen(
   address: string | AddressSpec | { readonly fd: number },

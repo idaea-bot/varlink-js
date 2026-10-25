@@ -136,8 +136,8 @@ Cells for C/sd/python/rust come from reading their sources (paths in §0), not f
 | Bridge (spawn command, speak on its stdio) | ✅ `--bridge` | ◐ (bridge helpers) | ✅ | ✅ | ❌ | ✅ M8 |
 | HTTP simple mode / WebSocket mode (client) | ❌ | — (separate bridge) | ❌ | ❌ | ❌ | ✅ M10 |
 | Socket activation (`LISTEN_FDS`, `LISTEN_FDNAMES=varlink`) | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ M8 |
-| `/run/varlink/registry/` lookup | ❌ | ✅ (v260) | ❌ | ❌ | ❌ | ✅ M8 |
-| `org.varlink.resolver` client | ✅ | ❌ | ✅ | ✅ | ◐ (schema only) | ◐ M8 |
+| `/run/varlink/registry/` lookup | ❌ | ✅ (v260) | ❌ | ❌ | ❌ | ✅ M8 (lookup, list, publish via `serve(…, {registry})`) |
+| `org.varlink.resolver` client | ✅ | ❌ | ✅ | ✅ | ◐ (schema only) | ◐ M8 (untyped, Resolve + GetInfo only) |
 | fd passing (`SCM_RIGHTS`) | ❌ | ✅ (opt-in per direction) | ❌ | ❌ | ❌ | ✅ M11 (optional native addon, Linux) |
 | Peer credentials (`SO_PEERCRED`/pidfd) | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ M11 (native addon) |
 | `user.varlink` xattr tagging | ❌ | ✅ | ❌ | ❌ | ❌ | ◐ M11 (best effort, native addon) |
@@ -413,10 +413,30 @@ inside quotes as in systemd's extract-word.c, no NUL, the result valid UTF-8; an
 words is a `TypeError`). As with varlinkctl, the words go to ssh as separate arguments and ssh joins them with spaces
 for the remote shell, so remote arguments containing spaces or shell metacharacters are re-parsed remotely.
 
-Interface resolution (`resolveInterface("io.systemd.Hostname")`): `/run/varlink/registry/<iface>`
-(then the `--user` registry `$XDG_RUNTIME_DIR/varlink/registry/`), then optional
-`org.varlink.resolver` at `unix:/run/org.varlink.resolver`. *Verify the user registry path against
-systemd before shipping M8.*
+**Service registry (M8, `src/node/registry.ts`).** UAPI.20 "Service Registry Directory": entries named after the
+interface, each a socket inode or a symlink to one; other inodes are ignored and readers must not assume the list is
+complete. The directory is systemd's `runtime_directory_generic(scope, "varlink/registry")` (verified against
+varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_RUNTIME_DIR/varlink/registry`
+(user). `registryDirectory(scope = "system")` returns it (user scope without an absolute `XDG_RUNTIME_DIR`:
+`TypeError`).
+
+- `listRegistry({scope?, directory?})` (like `varlinkctl list-registry`, varlinkctl.c:1182-1260): entries sorted by
+  interface, `{interface, address: "unix:<entry path>", target}` (`address` is connectable through the symlink and
+  short; `target` the socket, symlinks chased with `realpath`). Names failing `isInterfaceName`, dangling symlinks and
+  non-sockets are skipped; a missing directory gives `[]`.
+- `resolveInterface(name, {scope = "auto", directory?, resolver?, timeout?, signal?})` → an address: the entry
+  `<dir>/<name>` (socket or symlink to one → `unix:<entry path>`) in `directory` if given, else the system registry
+  then (scope `"auto"`, if `XDG_RUNTIME_DIR` is set and absolute) the user one; then `org.varlink.resolver` at
+  `resolver` (default `unix:/run/org.varlink.resolver`, `false` = none). Nothing found: `InterfaceNotFoundError`
+  `{interface}` with `cause` = the resolver's `org.varlink.resolver.InterfaceNotFound` (or the service's
+  InterfaceNotFound of a peer without the resolver interface), or the connect error if the resolver was unreachable.
+  An aborted `signal` and other resolver failures (timeouts, invalid replies) reject as they are. Invalid name:
+  `TypeError`.
+- Resolver client (partial and untyped until M6 regenerates it): `resolverResolve(conn, iface)` (the reply's
+  `address` must be a string `parseAddress` accepts, else `ValidationError` for `address`) and
+  `resolverGetInfo(conn)` (reply checked against the IDL), plus `ORG_VARLINK_RESOLVER_IDL` for implementing one
+  (`server.addInterface(ORG_VARLINK_RESOLVER_IDL, …)`, as the tests do).
+- Publishing: `serve(listener, {registry})` (§5.4) through `bindRegistry` below.
 
 ### 4.7 Runtime adapters
 
@@ -1422,6 +1442,37 @@ are available, M11) and `maxMessageSize` 16 MiB; our own default, `maxQueuedCall
 `exitOnIdle: ms` for socket-activated services (M8): the *server* shuts down after that long without any open
 connection (0 = when the last one closed), and `server.closed` resolves after any shutdown (§5.8).
 
+**`serve(listener): void` / `serve(listener, options): Promise<void>`** (M8, two overloads: the one-argument form
+keeps M4's `void`, so fire-and-forget calls need no `void` under `no-floating-promises`). Accepting starts at once, as
+before, and the synchronous throws stay synchronous. Without `options.registry` the promise is resolved at once and
+never rejects. `registry` publishes
+the listener in the service registry (§4.6): `true` = every interface registered at `serve()` time except
+`org.varlink.service` and `INTERNAL_ERROR_INTERFACE` (shared by every varlink-js server, never published); a list of
+names (each registered and not one of those two, no duplicates, else `TypeError`, synchronously); or `{interfaces =
+true, directory?, scope?: "system" | "user"}`. It needs `listener.bindRegistry(interfaces, {directory, scope})` →
+`{entries, unbind()}` (`ServeListener`, types in rpc): without it `OperationNotSupportedError`, synchronously, the
+listener untouched. With `registry` the promise resolves once every entry exists and rejects if binding failed:
+`bindRegistry` rolled its entries back, and the listener stops being served and is closed (all or nothing;
+connections accepted meanwhile are served on). **Callers using `registry` must await or handle the promise** (an
+unhandled rejection ends a Node process). Entries are removed in `shutdown()` *before* the listeners close (no entry
+ever points at a closed socket we own; a pending binding is waited for first) and when the listener's accept loop
+ends by itself; exit-on-idle shutdowns do the same. Unbind failures go to `onError` as `"registry-failed"` and the
+shutdown completes.
+
+Node (`bindRegistry(socketPath, interfaces, options)` in `src/node/registry.ts`, also exported): a `NodeListener` has
+a `bindRegistry` method only for unix path sockets (also `{fd}` ones whose `address` option names a unix path, e.g.
+from `/proc` under socket activation); `unix:@`, tcp and nameless fds have none. Merged listeners delegate to their
+first member that has one; one-shot (connected-fd, stdio) listeners have none. Per entry `<dir>/<iface>` (`dir` =
+`directory`, else `registryDirectory(scope ?? "system")`; names checked with `isInterfaceName` before any filesystem
+access, so no path traversal): `mkdir -p` the directory (0755); target = the absolute socket path; absent →
+`symlink` (an `EEXIST` race is re-evaluated once); a symlink whose `readlink` equals the target → adopted (removed on
+unbind too, not rolled back); stale (dangling symlink, or a socket / symlink to one that refuses 3 connects ~20 ms
+apart with `ECONNREFUSED`/`ENOENT`) → replaced atomically (`symlink` to `<dir>/.<iface>.<random>.tmp`, `rename` over
+the entry); anything else (a live socket of another service, a regular file, a directory) → an `Error` with `code:
+"EEXIST"` naming the entry, and the entries this call created are removed. `unbind()` (idempotent) unlinks each
+entry only while it is still a symlink to our target (ENOENT ignored), so foreign entries are left alone. The
+`user.varlink` xattr is M11 (native addon).
+
 ### 5.5 Errors
 
 See §6.
@@ -1482,7 +1533,8 @@ generated in M6. Details in §4.13.
 ### 5.8 Socket activation and exec
 
 M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exitOnIdle`/`closed` in
-`src/rpc/server.ts` (registry and resolver are phase B). All exported from `varlink-js/node` except where noted.
+`src/rpc/server.ts`. Phase B: `src/node/registry.ts` (registry and resolver, §4.6) and `serve(listener, {registry})`
+(§5.4). All exported from `varlink-js/node` except where noted.
 
 - **`fromNodeStreams(readable, writable, {onClose})`**: a ByteChannel over a separate Readable + Writable (a child's
   stdout/stdin, `process.stdin`/`stdout`) with the `fromNodeSocket` contract (§4.11): paused, read on demand; `null`
@@ -1552,14 +1604,24 @@ M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exit
   (PassThrough pairs and `cat`), `spawn.test.ts` (an `activation-child.ts` fixture behind an executable `#!/bin/sh`
   wrapper: exec connected/listening, env stripping, half-close, SIGTERM → SIGKILL, bridge, ssh via a fake ssh script
   that logs its argv, the word splitter table), `activation.test.ts` (fds and `LISTEN_*` set by
-  `/bin/sh -c 'LISTEN_PID=$$ … exec'`; `/proc` detection Linux-only), `test/unit/rpc/exit-on-idle.test.ts`.
+  `/bin/sh -c 'LISTEN_PID=$$ … exec'`; `/proc` detection Linux-only), `test/unit/rpc/exit-on-idle.test.ts`. Phase
+  B: `test/unit/node/registry.test.ts` (filesystem: list, bind, adopt, stale, conflict + rollback, foreign entries,
+  serve end to end), `registry-serve.test.ts` (serve semantics with fake listeners), `resolver.test.ts` (a JS
+  `org.varlink.resolver`), and the Linux interop suite `test/interop/vm/` (systemd-socket-activate, varlinkctl
+  `exec:`/`info`, systemd-pcrextend as root, registry via varlinkctl, real ssh behind `VARLINK_SSH_*`; each file skips
+  without its tools, see its README).
 
 **M8 deviations** from the earlier text of this section: `exec:` passes a *connected* socketpair by default (as
 sd-varlink does and systemd services expect), the listening socket + `VARLINK_ADDRESS` is the `socket: "listening"`
 option; the single-unnamed-fd rule is kept (sd-varlink names such an fd "unknown" and would not pick it);
 `LISTEN_PIDFDID` is ignored (Node cannot read the inode id of its own pidfd); a connected activation fd is detected
 from `/proc` on Linux, elsewhere it needs `accept: "connected"` (no `getsockopt(SO_ACCEPTCONN)` without the native
-addon, and probing with `listen()` is not an option: a failed `listen({fd})` closes the fd).
+addon, and probing with `listen()` is not an option: a failed `listen({fd})` closes the fd). Phase B: `serve()`
+returns a `Promise<void>` instead of `void` (resolved at once without `registry`; existing callers only need `void`
+or `await` for lint), `ServerErrorReason` gains `"registry-failed"`, and `bindRegistry` exists only on listeners that
+can be published (instead of throwing `OperationNotSupportedError` from the method), so `serve()` can refuse them
+synchronously with the listener untouched; one-shot (connected-fd) listeners are never published (the socket
+belongs to whoever accepted it).
 
 ---
 

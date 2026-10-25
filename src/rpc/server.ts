@@ -1,6 +1,6 @@
 // A varlink server (DESIGN.md §5.4, §4.11): interface registration, the dispatch table, a per-connection driver
 // over ServerSession + dispatchCall (DESIGN.md §4.10 contract), accept loops, limits and shutdown.
-import { ConnectionClosedError, safeQuote } from "../core/errors/local.ts";
+import { ConnectionClosedError, OperationNotSupportedError, safeQuote } from "../core/errors/local.ts";
 import { INTERNAL_ERROR_INTERFACE, ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
 import type { ByteChannel } from "../core/protocol/channel.ts";
 import {
@@ -36,7 +36,9 @@ export type ServerErrorReason =
   /** A channel arrived while `maxConnections` were open; it was closed at once. */
   | "connection-limit"
   /** A served listener's iteration failed; that accept loop ended and the listener was closed. */
-  | "accept-failed";
+  | "accept-failed"
+  /** Removing a listener's registry entries failed (shutdown, or its accept loop ended); the rest carried on. */
+  | "registry-failed";
 
 /** Options for {@link createServer}. */
 export interface ServerOptions {
@@ -110,9 +112,47 @@ export type UntypedHandler = {
 /** Handlers for `addInterface(idlText, handlers)`, by short method name. */
 export type UntypedHandlers = Readonly<Record<string, HandlerRegistration<UntypedHandler>>>;
 
+/** Where {@link ServeListener.bindRegistry} publishes: a directory, else the scope's registry directory. */
+export interface RegistryBindOptions {
+  directory?: string;
+  /** Default `"system"`. */
+  scope?: "system" | "user";
+}
+
+/** Registry entries published for a listener (DESIGN.md §4.6, §5.4). */
+export interface RegistryBinding {
+  /** The entry paths (created or adopted). */
+  readonly entries: readonly string[];
+  /** Removes the entries that still point at the listener's socket; idempotent. */
+  unbind(): Promise<void>;
+}
+
 /** What `serve()` accepts: a stream of accepted channels, optionally closable (a Listener is one). */
 export interface ServeListener extends AsyncIterable<ByteChannel> {
   close?(): Promise<void>;
+  /**
+   * Publishes the listener in a service registry directory under each interface name, all or nothing (a Node
+   * unix-path listener has it, see `varlink-js/node` `bindRegistry`). Used by `serve(listener, {registry})`.
+   */
+  bindRegistry?(interfaces: readonly string[], options: RegistryBindOptions): Promise<RegistryBinding>;
+}
+
+/** Options for {@link Server.serve}. */
+export interface ServeOptions {
+  /**
+   * Publish the listener in the service registry (UAPI.20; the listener must have `bindRegistry`): `true` = every
+   * interface registered now except `org.varlink.service` and the varlink-js InternalError interface, or a list of
+   * registered names, or `{interfaces, directory, scope}` (`interfaces` default `true`). The entries are removed at
+   * {@link Server.shutdown} (before the listeners close) and when the accept loop ends.
+   */
+  registry?:
+    true | readonly string[] | { interfaces?: true | readonly string[]; directory?: string; scope?: "system" | "user" };
+}
+
+/** A registry binding of one `serve()` call: `ready` never rejects (undefined if binding failed). */
+interface BindState {
+  readonly ready: Promise<RegistryBinding | undefined>;
+  unbound: Promise<void> | undefined;
 }
 
 /** Options for {@link Server.shutdown}. */
@@ -385,6 +425,7 @@ export class Server {
   readonly #connections = new Set<ServerConnection>();
   readonly #done = new Map<ServerConnection, Promise<void>>();
   readonly #listeners = new Set<ServeListener>();
+  readonly #bindings = new Set<BindState>();
   #shutdown: Promise<void> | undefined;
   readonly #exitOnIdle: number | undefined;
   /** `serve()` or `handle()` was called: exit-on-idle applies from now on. */
@@ -558,15 +599,30 @@ export class Server {
    * Server) makes `serve()` throw (TypeError for this Server's own listeners and for a Node listener) and is left
    * untouched. After {@link shutdown}, `serve()` just closes the listener.
    *
-   * @throws {TypeError} if `listener` is already being served by this server (it is left alone).
+   * Without `options` it returns nothing (the M4 signature, so existing fire-and-forget calls stay lint-clean). With
+   * `options` it returns a promise: without `options.registry` it is resolved at once and never rejects. With it, the
+   * listener's {@link ServeListener.bindRegistry} publishes the entries while accepting already runs; the promise
+   * resolves once they all exist and rejects if binding failed: then no entry is left, the listener stops being
+   * served and is closed (connections accepted meanwhile are served on). Await or handle it when using `registry`
+   * (an unhandled rejection ends a Node process).
+   *
+   * @throws {TypeError} if `listener` is already being served by this server (it is left alone), or for invalid
+   *   `options` (an unknown or unregistered interface, a built-in one, a bad `directory`/`scope`).
+   * @throws {OperationNotSupportedError} if `registry` is requested and the listener has no `bindRegistry` (a TCP,
+   *   abstract or stdio listener); it is left alone.
    * @throws whatever `listener[Symbol.asyncIterator]()` throws (a Node listener: TypeError when another Server
    *   iterates it); the listener is not closed then.
    */
-  serve(listener: ServeListener): void {
+  serve(listener: ServeListener): void;
+  serve(listener: ServeListener, options: ServeOptions): Promise<void>;
+  serve(listener: ServeListener, options?: ServeOptions): Promise<void> | void {
     if (this.#listeners.has(listener)) throw new TypeError("this listener is already being served");
+    const registry = this.#registryRequest(options);
+    if (registry !== undefined && typeof listener.bindRegistry !== "function")
+      throw new OperationNotSupportedError("this listener cannot be published in a registry (not a unix path socket)");
     if (this.#shutdown !== undefined) {
       void this.#closeListener(listener);
-      return;
+      return Promise.resolve();
     }
     // Obtained synchronously: a listener that refuses a second iteration (served by another Server) throws here,
     // and that must not close it under its first user.
@@ -574,7 +630,27 @@ export class Server {
     this.#listeners.add(listener);
     this.#serving = true;
     this.#updateIdle();
-    void (async () => {
+    let state: BindState | undefined;
+    let bound: Promise<void> = Promise.resolve();
+    if (registry !== undefined) {
+      const binding = (async () => listener.bindRegistry?.(registry.interfaces, registry.options))();
+      state = { ready: binding.catch(() => undefined), unbound: undefined };
+      this.#bindings.add(state);
+      bound = binding.then(
+        () => undefined,
+        async (e: unknown) => {
+          // All or nothing: bindRegistry rolled its entries back; stop serving the listener and release it.
+          try {
+            await iterator.return?.();
+          } catch {
+            // The binding error is the one to report.
+          }
+          await this.#closeListener(listener, false);
+          throw e;
+        },
+      );
+    }
+    const loop = async (): Promise<void> => {
       try {
         for (;;) {
           const r = await iterator.next();
@@ -593,12 +669,70 @@ export class Server {
         }
       } finally {
         this.#listeners.delete(listener);
+        if (state !== undefined) await this.#unbind(state);
       }
-    })();
+    };
+    void loop();
+    return bound;
+  }
+
+  /** `serve()`'s registry option checked against the registered interfaces, or undefined if not requested. */
+  #registryRequest(
+    options: ServeOptions | undefined,
+  ): { interfaces: readonly string[]; options: RegistryBindOptions } | undefined {
+    if (options === undefined) return undefined;
+    if (typeof options !== "object" || (options as unknown) === null)
+      throw new TypeError("serve options must be an object");
+    const registry: unknown = options.registry;
+    if (registry === undefined) return undefined;
+    let requested: unknown = registry;
+    const bindOptions: RegistryBindOptions = {};
+    if (registry !== true && !Array.isArray(registry)) {
+      if (typeof registry !== "object" || registry === null)
+        throw new TypeError("registry must be true, a list of interface names or an object");
+      const { interfaces, directory, scope } = registry as {
+        interfaces?: unknown;
+        directory?: unknown;
+        scope?: unknown;
+      };
+      requested = interfaces ?? true;
+      if (directory !== undefined) {
+        if (typeof directory !== "string" || directory === "")
+          throw new TypeError("registry.directory must be a non-empty string");
+        bindOptions.directory = directory;
+      }
+      if (scope !== undefined) bindOptions.scope = checkMode(scope, "registry.scope", ["system", "user"], "system");
+    }
+    if (requested === true) return { interfaces: [...this.#interfaces.keys()], options: bindOptions };
+    if (!Array.isArray(requested)) throw new TypeError("registry interfaces must be true or a list of interface names");
+    const names: string[] = [];
+    for (const name of requested as unknown[]) {
+      if (typeof name !== "string") throw new TypeError("registry interfaces must be strings");
+      if (name === ORG_VARLINK_SERVICE || name === INTERNAL_ERROR_INTERFACE)
+        throw new TypeError(`interface ${name} is built in and is not published in a registry`);
+      if (!this.#interfaces.has(name)) throw new TypeError(`interface ${safeQuote(name)} is not registered`);
+      if (names.includes(name)) throw new TypeError(`interface ${name} is listed twice`);
+      names.push(name);
+    }
+    return { interfaces: names, options: bindOptions };
+  }
+
+  /** Removes a serve() call's registry entries once (after its binding settled); failures go to onError. */
+  #unbind(state: BindState): Promise<void> {
+    state.unbound ??= state.ready
+      .then((binding) => binding?.unbind())
+      .catch((e: unknown) => {
+        this.#report(e, "registry-failed");
+      })
+      .finally(() => {
+        this.#bindings.delete(state);
+      });
+    return state.unbound;
   }
 
   /**
-   * Stops the server (idempotent): closes the served listeners, then — graceful (default) — aborts every active
+   * Stops the server (idempotent): removes the registry entries of served listeners (`serve(…, {registry})`;
+   * failures go to `onError` as `registry-failed`), closes the served listeners, then — graceful (default) — aborts every active
    * call's signal (replies are still written), drops buffered calls and, once its active call finished, ends each
    * connection (FIN after the last reply) and discards its input until the peer closes, for at most 2000 ms; at the
    * `timeout` deadline (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves
@@ -622,6 +756,8 @@ export class Server {
   }
 
   async #stop(graceful: boolean, timeout: number): Promise<void> {
+    // Registry entries first: none may point at a socket we are about to close.
+    await Promise.all([...this.#bindings].map((s) => this.#unbind(s)));
     await Promise.all([...this.#listeners].map((l) => this.#closeListener(l)));
     const conns = [...this.#connections];
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -638,11 +774,11 @@ export class Server {
     if (timer !== undefined) clearTimeout(timer);
   }
 
-  async #closeListener(listener: ServeListener): Promise<void> {
+  async #closeListener(listener: ServeListener, report = true): Promise<void> {
     try {
       await listener.close?.();
     } catch (e) {
-      this.#report(e, "accept-failed");
+      if (report) this.#report(e, "accept-failed");
     }
   }
 

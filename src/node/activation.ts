@@ -4,7 +4,9 @@
 import { readFileSync, readlinkSync } from "node:fs";
 import { Socket } from "node:net";
 import { formatAddress, type AddressSpec } from "../core/address/parse.ts";
+import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
+import type { ServeListener } from "../rpc/server.ts";
 import { checkMode } from "../rpc/util.ts";
 import { listen } from "./listen.ts";
 import { fromNodeSocket } from "./socket.ts";
@@ -111,7 +113,7 @@ function socketInode(fd: number): string | undefined {
   }
 }
 
-/** A listener that yields one channel (made on first `next()`), then ends. */
+/** A listener that yields one channel (made on first `next()`), then ends. No `bindRegistry`: nothing to publish. */
 class OneShotListener implements Listener {
   readonly address: string;
   #take: (() => ByteChannel) | undefined;
@@ -186,6 +188,7 @@ interface MergeState {
 
 class MergedListener implements Listener {
   readonly address: string;
+  declare readonly bindRegistry?: ServeListener["bindRegistry"];
   readonly #sources: readonly Listener[];
   #state: MergeState | undefined;
   #closing: Promise<void> | undefined;
@@ -193,6 +196,12 @@ class MergedListener implements Listener {
   constructor(sources: readonly Listener[], address: string) {
     this.#sources = sources;
     this.address = address;
+    // The registry names the first unix path socket among the sources (the others have no path to link to).
+    const bindable = (sources as readonly ServeListener[]).find((s) => typeof s.bindRegistry === "function");
+    if (bindable !== undefined)
+      this.bindRegistry = (interfaces, options) =>
+        bindable.bindRegistry?.(interfaces, options) ??
+        Promise.reject(new OperationNotSupportedError("the listener lost its bindRegistry"));
   }
 
   [Symbol.asyncIterator](): AsyncIterator<ByteChannel> {
@@ -301,7 +310,8 @@ class MergedListener implements Listener {
 /**
  * One {@link Listener} over several: iterating it yields the channels of all of them until all ended (an
  * iteration error of one is delivered once to `next()`); `close()` closes all; `address` is the first one's. One
- * iteration at a time (a second concurrent one is a `TypeError`); after `return()` it may be iterated again.
+ * iteration at a time (a second concurrent one is a `TypeError`); after `return()` it may be iterated again. It has
+ * `bindRegistry` (§5.4) if a source has one: the first such source's (a unix path socket).
  *
  * @throws {TypeError} for an empty list.
  */

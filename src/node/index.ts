@@ -1,6 +1,6 @@
 // `varlink-js/node` entry point (DESIGN.md §4.7, §4.11, §5.8): Node sockets (unix, unix:@, tcp, inherited fds),
-// spawned transports (exec:, ssh-*:, bridge), socket activation and stdio serving.
-// M8 phase B adds the registry and the resolver.
+// spawned transports (exec:, ssh-*:, bridge), socket activation and stdio serving,
+// and the service registry plus the org.varlink.resolver client (M8 phase B).
 export {
   listenAuto,
   listenFromEnv,
@@ -12,6 +12,21 @@ export {
 export { connect, type ConnectOptions } from "./connect.ts";
 export { listen, type ListenOptions, type NodeListener } from "./listen.ts";
 export { createPool } from "./pool.ts";
+export {
+  bindRegistry,
+  DEFAULT_RESOLVER_ADDRESS,
+  listRegistry,
+  ORG_VARLINK_RESOLVER_IDL,
+  registryDirectory,
+  resolveInterface,
+  resolverGetInfo,
+  resolverResolve,
+  type ListRegistryOptions,
+  type RegistryEntry,
+  type RegistryScope,
+  type ResolveOptions,
+  type ResolverInfo,
+} from "./registry.ts";
 export { fromNodeSocket } from "./socket.ts";
 export { fromNodeStreams, type NodeStreamsOptions } from "./spawn-channel.ts";
 export {
