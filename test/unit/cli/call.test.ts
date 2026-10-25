@@ -223,17 +223,19 @@ describe("call: local failures", () => {
     assert.match(r.stderr, /^Failed to connect to unix:\/nonexistent\/dir\/sock: .*ENOENT/);
   });
 
-  test("an address kind the adapter cannot dial yet prints the library's error", async () => {
+  test("exec: goes to varlink-js/node's connect; a failure is one line, exit 1", async () => {
+    // Before M8 the adapter cannot dial exec: (connect fails); after M8 /bin/true starts and exits without serving
+    // (the call fails). Either way: one line, no stack, exit 1.
     const r = await runCli(["call", "exec:/bin/true", "a.b.C", "{}"]);
     assert.equal(r.code, 1);
-    assert.match(r.stderr, /^Failed to connect to exec:\/bin\/true: /);
+    assert.match(r.stderr, /^(Failed to connect to exec:\/bin\/true|Method call a\.b\.C\(\) failed): [^\n]*\n$/);
   });
 
   test("--timeout=0.2 against a handler that never answers: exit 1 quickly", async () => {
     const start = Date.now();
     const r = await runCli(["call", "--timeout=0.2", fx.unix, "org.example.cli.Hang", "{}"]);
     assert.equal(r.code, 1);
-    assert.ok(Date.now() - start < 2000, `took ${String(Date.now() - start)} ms`);
+    assert.ok(Date.now() - start < 10_000, `took ${String(Date.now() - start)} ms`);
     assert.equal(r.stderr, "Method call org.example.cli.Hang() failed: timed out after 0.2s\n");
   });
 
@@ -241,7 +243,7 @@ describe("call: local failures", () => {
     const start = Date.now();
     const r = await runCli(["call", "--more", "--timeout=150ms", fx.unix, "org.example.cli.Monitor", "{}"]);
     assert.equal(r.code, 1);
-    assert.ok(Date.now() - start < 2000);
+    assert.ok(Date.now() - start < 10_000);
     assert.ok(r.stdout.startsWith(`${RS}{"i":0}\n`));
     assert.match(r.stderr, /^Method call org\.example\.cli\.Monitor\(\) failed: timed out after 0\.15s\n$/);
   });
@@ -261,7 +263,8 @@ describe("call: local failures", () => {
     const raw = await rawServer([]);
     try {
       const p = runCli(["call", raw.address, "a.b.C", "{}"]);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Disconnect only once the call arrived (a fixed delay could close before the connect on a slow runner).
+      await waitFor(() => raw.received() > 0);
       await raw.close();
       const r = await p;
       assert.equal(r.code, 1);

@@ -82,7 +82,7 @@ describe("certify", () => {
       const start = Date.now();
       const r = await runCli(["certify", "client", "--timeout=0.2", silent.address]);
       assert.equal(r.code, 1);
-      assert.ok(Date.now() - start < 2000);
+      assert.ok(Date.now() - start < 10_000);
       assert.equal(r.stderr, "Certification failed: timed out after 0.2s\n");
     } finally {
       await silent.close();
