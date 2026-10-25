@@ -344,7 +344,7 @@ async function restore(tomb: string, path: string): Promise<{ ok: boolean; messa
         };
       }
     }
-    return { ok: false, message: `; it was moved to ${tomb} and another socket now occupies the path` };
+    return { ok: false, message: `; it was moved to ${tomb} and something else now occupies the path` };
   }
 }
 

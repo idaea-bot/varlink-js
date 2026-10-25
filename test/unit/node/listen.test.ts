@@ -213,7 +213,7 @@ describe("listen unix", () => {
       const kept = readdirSync(sub).filter((n) => n.startsWith(".vjs-"));
       assert.equal(kept.length, 1);
       const tomb = join(sub, kept[0] ?? "", "old");
-      assert.match(String(err), /another socket now occupies the path/);
+      assert.match(String(err), /something else now occupies the path/);
       assert.ok(String(err).includes(tomb));
       // The third listener owns the path; the moved one is still reachable through its only name.
       const acceptedThird = new Promise((resolve) => third.once("connection", resolve));

@@ -789,9 +789,11 @@ over `pair()`, unix and tcp sockets.
   rejection reports `transport-error`, aborts the active call's signal (`ConnectionClosedError`), closes session and
   channel; `channel.closed` settling does the same without a report. An unclaimed upgrade closes the connection.
   `handle()` resolves once the channel is closed and the reader ended (a handler that ignores its signal is not
-  awaited) and never rejects; at `maxConnections` (or after shutdown) the channel is closed at once. `serve()` runs
-  `for await` over the listener in the background (a listener already being served is a synchronous `TypeError`,
-  and is left alone); an iteration error is reported as `accept-failed`, ends that loop and calls
+  awaited) and never rejects; at `maxConnections` (or after shutdown) the channel is closed at once. `serve()` takes the
+  listener's iterator synchronously and iterates it in the background; while the server runs, a listener already
+  being served (by this Server: `TypeError`; by another: whatever its `[Symbol.asyncIterator]()` throws, a
+  `TypeError` for a Node listener) makes `serve()` throw and is left alone (after shutdown, `serve()` closes the
+  listener); an iteration error is reported as `accept-failed`, ends that loop and calls
   `listener.close()` (its errors swallowed), so the address is released and shutdown has nothing dangling. `shutdown({graceful, timeout})` checks its options synchronously (`RangeError`/`TypeError`, nothing
   memoized, the server keeps running), closes the listeners, then aborts active calls' signals and closes each
   connection gracefully when its call finished (buffered calls dropped; idle connections at once): `session.close()`,
@@ -801,9 +803,9 @@ over `pair()`, unix and tcp sockets.
   deadline, if sooner), then the connection is closed hard, so a peer that never closes its side (or never sends
   anything more, leaving the reader inside `read()`) cannot hold the shutdown; a `read()` rejection during the
   finish closes at once. At the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false`
-  everything is closed hard. With `timeout: 0` the shutdown still waits for every active handler and for its reply writes (a peer that stops
-  reading while a reply is being written holds it too, since the linger only starts after `end()`): one that ignores
-  its signal holds it forever. Protocol
+  everything is closed hard. With `timeout: 0` the shutdown still waits for every active handler and for its reply writes: a handler that
+  ignores its signal holds it forever, and so does a peer that stops reading while a reply is being written (the
+  linger only starts after `end()`). Protocol
   errors, unclaimed upgrades, transport errors and the clean-EOF close stay hard closes. No timers on server
   connections other than the shutdown deadline (F1).
 - **Node channel** (`fromNodeSocket(socket)`): the socket is paused and read on demand: `read()` returns the next

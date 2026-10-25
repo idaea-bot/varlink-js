@@ -507,11 +507,14 @@ export class Server {
   /**
    * Accepts channels from `listener` in the background (returns at once) and serves each with {@link handle}. An
    * error from the iteration is reported as `accept-failed`, ends that loop and closes the listener (its errors
-   * swallowed). Several listeners may be served; {@link shutdown} closes them. The iterator is obtained
-   * synchronously: a listener that is already being iterated (served by this or another Server) makes `serve()`
-   * throw (TypeError for this Server's own listeners and for a Node listener) and is left untouched.
+   * swallowed). Several listeners may be served; {@link shutdown} closes them. While the server runs, the
+   * iterator is obtained synchronously: a listener that is already being iterated (served by this or another
+   * Server) makes `serve()` throw (TypeError for this Server's own listeners and for a Node listener) and is left
+   * untouched. After {@link shutdown}, `serve()` just closes the listener.
    *
-   * @throws {TypeError} if `listener` is already being served (it is left alone).
+   * @throws {TypeError} if `listener` is already being served by this server (it is left alone).
+   * @throws whatever `listener[Symbol.asyncIterator]()` throws (a Node listener: TypeError when another Server
+   *   iterates it); the listener is not closed then.
    */
   serve(listener: ServeListener): void {
     if (this.#listeners.has(listener)) throw new TypeError("this listener is already being served");
