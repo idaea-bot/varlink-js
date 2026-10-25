@@ -71,6 +71,12 @@ try {
   assert.equal(version, expected, "bin --version");
 
   if (!values["no-tsc"]) {
+    const tsc = join(repo, "node_modules", "typescript", "bin", "tsc");
+    // Web subpaths first, while the app has no @types/node at all: a `/// <reference types="node" />`
+    // that tsc emits into a public .d.ts would otherwise resolve quietly despite `types: []`.
+    assert.ok(!existsSync(join(app, "node_modules", "@types", "node")), "@types/node must not be installed yet");
+    run(process.execPath, [tsc, "-p", join(app, "tsconfig.web.json")], app);
+    console.log("tsc nodenext (web subpaths, no @types/node installed): ok");
     // Same @types/node as the repo's lockfile, so the check is reproducible.
     const typesNode = JSON.parse(readFileSync(join(repo, "node_modules", "@types", "node", "package.json"), "utf8"));
     run(
@@ -86,9 +92,6 @@ try {
       ],
       app,
     );
-    const tsc = join(repo, "node_modules", "typescript", "bin", "tsc");
-    run(process.execPath, [tsc, "-p", join(app, "tsconfig.web.json")], app);
-    console.log("tsc nodenext (web subpaths, no @types/node): ok");
     run(process.execPath, [tsc, "-p", join(app, "tsconfig.node.json")], app);
     console.log("tsc nodenext (node subpaths, ESM + CJS): ok");
   }

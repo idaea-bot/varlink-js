@@ -213,7 +213,7 @@ What to keep: the transport abstraction idea, typed method descriptors, async-fi
         └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-Rule: `src/core/**` and `src/rpc/**` must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
+Rule: `src/core/**` and `src/rpc/**` (and the browser-facing `src/index.ts`, `src/idl`, `src/websocket`, `src/http`) must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
 the browser/Deno/Bun story honest.
 
 ### 4.1 ByteChannel (the transport interface)
@@ -821,14 +821,18 @@ nightly (optional).
   Cards that run in parallel own disjoint files. Where a later milestone has to touch an earlier one's
   files (M6 regenerating built-ins, M9), the dependency graph in §10 serialises them.
 - Lint/format: ESLint 10 flat config + typescript-eslint (strict-type-checked), prettier pinned exact,
-  `package-lock.json` committed (F12). Layer rule for `src/core/**` and `src/rpc/**` (§4), enforced in M0:
-  a local rule (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve inside
-  `src/core` (core) or `src/core`+`src/rpc` (rpc), so `node:*`, bare built-ins, npm packages, the package's own
-  name and adapter paths are all rejected, including `export … from`, `import()` and `import("x").T`;
+  `package-lock.json` committed (F12). Layer rule (§4), enforced in M0 for `src/core`, `src/rpc` and the
+  browser-facing subpaths (`src/index.ts`, `src/idl`, `src/websocket`, `src/http`): a local rule
+  (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve inside the layer's allowed
+  directories (core → core; rpc and the root entry → core+rpc; idl → core+idl; websocket/http → core+rpc+self),
+  so `node:*`, bare built-ins, npm packages, the package's own name and adapter paths are all rejected,
+  including `export … from`, `import()`, `import("x").T` and `declare module "x"`;
   `no-restricted-globals` (`process`, `Buffer`, `Bun`, `Deno`, `require`, `window`, `document`, …), the same
-  names via `globalThis.*`, no `import.meta`, no aliasing `globalThis`. `tsconfig.core.json` typechecks both
-  layers with `lib: es2024 + dom` and **no `@types/node`**, so `NodeJS.Timeout`, `Buffer` or `.unref()` fail
-  to compile there. `test/tooling/lint-boundaries.test.ts` proves the rules fire. (M0 deviation: the design
+  names via `globalThis.*` (and `globalThis.globalThis`), no `import.meta`, no aliasing `globalThis`, no ambient
+  declarations (`declare const Deno`, `declare global`). Only the transports (websocket, http) may use
+  `fetch`/`WebSocket`/`EventSource`/workers; everything else does I/O through ByteChannel (§4.1).
+  `tsconfig.core.json` typechecks all of these with `lib: es2024 + dom` and **no `@types/node`**, so
+  `NodeJS.Timeout`, `Buffer` or `.unref()` fail to compile there. `test/tooling/lint-boundaries.test.ts` proves the rules fire. (M0 deviation: the design
   said ESLint 9, but 9.x is end-of-life and deprecated on npm since ESLint 10; TypeScript is pinned to 6.0.x
   because typescript-eslint 8 supports `typescript <6.1`, so TS 7 waits for typescript-eslint.)
 - CI (GitHub Actions on the fork): lint + typecheck + tests on Node 22/24/26; Bun and Deno jobs (M10);

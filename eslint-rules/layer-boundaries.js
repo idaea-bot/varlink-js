@@ -1,7 +1,7 @@
 // @ts-check
 // Local ESLint rule enforcing the DESIGN.md §4 layering: files in a layer may only import relative paths
 // that resolve into the layer's allowed directories. Bare specifiers (node:*, built-ins, npm packages,
-// the package's own name) are rejected, so src/core and src/rpc stay runtime-agnostic and dependency-free.
+// the package's own name) are rejected, so the agnostic layers (core, rpc, idl, websocket, http, root entry) stay runtime-agnostic and dependency-free.
 import { dirname, relative, resolve, sep } from "node:path";
 
 /** @param {string} p */
@@ -32,7 +32,7 @@ export const layerBoundaries = {
   create(context) {
     const { root, layers } = /** @type {{ root: string, layers: Record<string, string[]> }} */ (context.options[0]);
     const file = posix(relative(root, context.filename));
-    const layer = Object.keys(layers).find((l) => file.startsWith(l + "/"));
+    const layer = Object.keys(layers).find((l) => file === l || file.startsWith(l + "/"));
     if (layer === undefined) return {};
     const allowed = layers[layer] ?? [];
 
@@ -67,6 +67,8 @@ export const layerBoundaries = {
       TSImportType: (node) => check(node, literal(node.argument?.literal) ?? literal(node.argument)),
       /** @param {any} node `import x = require("x")` */
       TSExternalModuleReference: (node) => check(node, literal(node.expression)),
+      /** @param {any} node `declare module "x" {}` (also banned by no-restricted-syntax) */
+      TSModuleDeclaration: (node) => node.id?.type === "Literal" && check(node, node.id.value),
     };
   },
 };
