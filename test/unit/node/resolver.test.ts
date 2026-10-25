@@ -1,7 +1,7 @@
 // org.varlink.resolver client and resolveInterface (DESIGN.md §4.6), against a JS resolver on a temp unix socket.
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdir, symlink } from "node:fs/promises";
+import { mkdir, realpath, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import {
@@ -199,7 +199,11 @@ describe("org.varlink.resolver", () => {
       const saved = process.env.XDG_RUNTIME_DIR;
       process.env.XDG_RUNTIME_DIR = runtime;
       try {
-        const expected = `unix:${join(runtime, "varlink", "registry", name)}`;
+        // Through the entry, unless its path does not fit in sun_path (macOS temp dirs are long): then the target.
+        const entry = join(runtime, "varlink", "registry", name);
+        const fits = Buffer.byteLength(entry) <= (process.platform === "linux" ? 107 : 103);
+        const target = await realpath(good.listener.address.slice("unix:".length));
+        const expected = `unix:${fits ? entry : target}`;
         assert.equal(await resolveInterface(name, { scope: "user", resolver: false }), expected);
         assert.equal(await resolveInterface(name, { resolver: false }), expected);
         await assert.rejects(resolveInterface(name, { scope: "system", resolver: false }), InterfaceNotFoundError);

@@ -1,10 +1,13 @@
 // Spawned transports (DESIGN.md §4.6, §5.8): exec: (connected and listening), bridge argv, ssh-unix:/ssh-exec: with
 // a fake ssh, the ssh-exec word splitter.
 import assert from "node:assert/strict";
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import type { ChildProcess } from "node:child_process";
+import diagnostics from "node:diagnostics_channel";
+import { chmod, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { describe, test } from "node:test";
+import { CallTimeoutError } from "../../../src/core/errors/index.ts";
 import { connect, connectBridge, connectExec, listen } from "../../../src/node/index.ts";
 import { openBridge, openSpawned, splitCommandLine } from "../../../src/node/spawn.ts";
 import { createServer, type Connection } from "../../../src/rpc/index.ts";
@@ -12,8 +15,6 @@ import { tempDir } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "activation-child.ts");
-/** The child cannot ask the kernel whether fd 3 is connected except through Linux's /proc. */
-const CONNECTED = process.platform === "linux" ? "auto" : "connected";
 
 interface PingReply {
   pid: number;
@@ -54,19 +55,31 @@ const exitOf = (child: { once(ev: "exit", cb: (code: number | null, signal: stri
   });
 
 describe("exec:", () => {
+  // The child runs listenAuto() with the default accept: "auto" everywhere (off Linux the hint says "connected").
   test("connected (default): LISTEN_* for the child, unset by listenAuto; the child is gone after close", async () => {
     const cmd = await wrapper();
     const conn = await connectExec(cmd, {
-      argv: ["ignored-argv0", `--accept=${CONNECTED}`],
+      argv: ["ignored-argv0", "--some-arg"],
       // Ours must not leak: an inherited LISTEN_PIDFDID would make a systemd child ignore its fds.
-      env: { ...process.env, LISTEN_PIDFDID: "12345", SYSTEMD_VARLINK_LISTEN: "/nonexistent/x", LISTEN_FDS: "7" },
+      env: {
+        ...process.env,
+        LISTEN_PIDFDID: "12345",
+        SYSTEMD_VARLINK_LISTEN: "/nonexistent/x",
+        LISTEN_FDS: "7",
+        VARLINK_ADDRESS: "unix:/nonexistent/y",
+      },
     });
     const reply = await ping(conn);
-    assert.deepEqual(reply.before, { LISTEN_PID: String(reply.pid), LISTEN_FDS: "1", LISTEN_FDNAMES: "varlink" });
+    assert.deepEqual(reply.before, {
+      LISTEN_PID: String(reply.pid),
+      LISTEN_FDS: "1",
+      LISTEN_FDNAMES: "varlink",
+      VARLINK_JS_ACTIVATION: "connected",
+    });
     assert.deepEqual(reply.after, {});
     // A socketpair end has no bound path, not even in /proc.
     assert.equal(reply.address, "fd:3");
-    assert.deepEqual(reply.argv.slice(1), [`--accept=${CONNECTED}`]);
+    assert.deepEqual(reply.argv.slice(1), ["--some-arg"]);
     await conn.close();
     await conn.closed;
     assert.ok(gone(reply.pid), "the child was reaped when closed resolved");
@@ -74,7 +87,7 @@ describe("exec:", () => {
 
   test("via connect('exec:…', { spawn })", async () => {
     const cmd = await wrapper();
-    const conn = await connect(`exec:${cmd}`, { spawn: { argv: [cmd, `--accept=${CONNECTED}`] } });
+    const conn = await connect(`exec:${cmd}`);
     assert.equal(typeof (await ping(conn)).pid, "number");
     await conn.close();
     await conn.closed;
@@ -82,7 +95,7 @@ describe("exec:", () => {
 
   test("half-close: after our FIN the child still answers, then exits on its own (exit-on-idle)", async () => {
     const cmd = await wrapper();
-    const ch = await openSpawned({ kind: "exec", path: cmd }, { argv: [cmd, `--accept=${CONNECTED}`] }, never);
+    const ch = await openSpawned({ kind: "exec", path: cmd }, undefined, never);
     const exited = exitOf(ch.child);
     await ch.write(new TextEncoder().encode('{"method":"org.example.child.Ping"}\0'));
     await ch.end();
@@ -113,11 +126,7 @@ describe("exec:", () => {
 
   test("a child that ignores SIGTERM is SIGKILLed after killTimeout", async () => {
     const cmd = await wrapper();
-    const ch = await openSpawned(
-      { kind: "exec", path: cmd },
-      { argv: [cmd, `--accept=${CONNECTED}`, "--linger"], killTimeout: 100 },
-      never,
-    );
+    const ch = await openSpawned({ kind: "exec", path: cmd }, { argv: [cmd, "--linger"], killTimeout: 100 }, never);
     const exited = exitOf(ch.child);
     // Wait until it serves (its SIGTERM handler is installed by then).
     await ch.write(new TextEncoder().encode('{"method":"org.example.child.Ping"}\0'));
@@ -129,9 +138,14 @@ describe("exec:", () => {
 
   test("listening: VARLINK_ADDRESS names the socket; its private directory is removed on close", async () => {
     const cmd = await wrapper();
-    const conn = await connectExec(cmd, { argv: [cmd, "--accept=listening"], socket: "listening" });
+    // The default accept: "auto" too (no hint: listening). An inherited hint or address must not leak.
+    const conn = await connectExec(cmd, {
+      socket: "listening",
+      env: { ...process.env, VARLINK_JS_ACTIVATION: "connected", VARLINK_ADDRESS: "unix:/nonexistent/y" },
+    });
     const reply = await ping(conn);
     const address = reply.before.VARLINK_ADDRESS ?? "";
+    assert.equal(reply.before.VARLINK_JS_ACTIVATION, undefined);
     assert.match(address, /^unix:\/.+\/socket$/);
     assert.equal(reply.before.LISTEN_FDS, "1");
     assert.equal(reply.before.LISTEN_PID, String(reply.pid));
@@ -166,7 +180,76 @@ describe("exec:", () => {
     const reason = new Error("stop");
     await assert.rejects(connectExec(cmd, { signal: AbortSignal.abort(reason) }), (e) => e === reason);
   });
+
+  for (const socket of ["connected", "listening"] as const)
+    test(`${socket}: an abort while the child is being spawned kills it (and removes the private directory)`, async () => {
+      const cmd = await wrapper();
+      const ac = new AbortController();
+      const reason = new Error("stop");
+      const result = await withSpawnHook(
+        () => {
+          ac.abort(reason);
+        },
+        () => connectExec(cmd, { socket, signal: ac.signal }),
+      );
+      assert.equal(result.error, reason);
+      assert.notEqual((await result.exit).signal, null, "killed, not exited on its own");
+      assert.deepEqual(result.tmp, [], "no private directory left");
+    });
+
+  test("listening: the timeout expiring during the connect phase kills the child", async () => {
+    const cmd = await wrapper();
+    const result = await withSpawnHook(
+      () => {
+        // Overrun the 50 ms timeout synchronously, right at the spawn: the timer fires before the connect completes.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120);
+      },
+      () => connectExec(cmd, { socket: "listening", timeout: 50 }),
+    );
+    assert.ok(result.error instanceof CallTimeoutError, String(result.error));
+    assert.notEqual((await result.exit).signal, null);
+    assert.deepEqual(result.tmp, []);
+  });
 });
+
+/**
+ * Runs `connectAttempt` with `hook` called synchronously when it spawns the child (the `child_process`
+ * diagnostics channel), and TMPDIR pointing at a fresh directory (so the listening mode's private one shows up there).
+ * Expects the attempt to reject: the error, the child's exit, and what is left in that TMPDIR.
+ */
+async function withSpawnHook(
+  hook: () => void,
+  connectAttempt: () => Promise<Connection>,
+): Promise<{ error: unknown; exit: Promise<{ code: number | null; signal: string | null }>; tmp: string[] }> {
+  const tmp = await mkdtemp(join(dir(), "tmp-"));
+  const savedTmp = process.env.TMPDIR;
+  let child: ChildProcess | undefined;
+  const onSpawn = (message: unknown): void => {
+    if (child !== undefined) return;
+    child = (message as { process: ChildProcess }).process;
+    hook();
+  };
+  diagnostics.subscribe("child_process", onSpawn);
+  process.env.TMPDIR = tmp;
+  try {
+    const conn = await connectAttempt().then(
+      (c) => c,
+      (e: unknown) => ({ error: e }),
+    );
+    assert.ok("error" in conn, "the connect rejected");
+    assert.ok(child !== undefined, "a child was spawned");
+    const spawned = child;
+    const exit =
+      spawned.exitCode !== null || spawned.signalCode !== null
+        ? Promise.resolve({ code: spawned.exitCode, signal: spawned.signalCode })
+        : exitOf(spawned);
+    return { error: conn.error, exit, tmp: await readdir(tmp) };
+  } finally {
+    diagnostics.unsubscribe("child_process", onSpawn);
+    if (savedTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmp;
+  }
+}
 
 describe("bridge", () => {
   test("varlink over the child's stdio (SYSTEMD_VARLINK_LISTEN=- via env(1))", async () => {
@@ -190,6 +273,28 @@ describe("bridge", () => {
     while ((await ch.read()) !== null) n++;
     assert.ok(n > 0);
     assert.deepEqual(await exited, { code: 0, signal: null });
+    ch.close();
+    await ch.closed;
+  });
+
+  test("a stdio server closing its connection sends EOF while the process still runs", async () => {
+    // --hold: the child stays alive after its server closed, so EOF can only come from closing the channel.
+    const ch = await openBridge(
+      ["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", process.execPath, CHILD, "--hold"],
+      { killTimeout: 0 },
+      never,
+    );
+    await ch.write(new TextEncoder().encode('{"method":"org.example.child.Ping"}\0'));
+    await ch.end();
+    let eof = false;
+    const read = (async () => {
+      while ((await ch.read()) !== null);
+      eof = true;
+    })();
+    const deadline = new Promise((r) => setTimeout(r, 5000).unref());
+    await Promise.race([read, deadline]);
+    assert.ok(eof, "EOF before the child exited");
+    assert.equal(ch.child.exitCode, null, "the child is still running");
     ch.close();
     await ch.closed;
   });

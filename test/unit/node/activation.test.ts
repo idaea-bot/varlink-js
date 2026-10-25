@@ -2,16 +2,16 @@
 // `/bin/sh -c 'LISTEN_PID=$$ … exec'`), listenStdio, mergeListeners, listen({fd}, {address}).
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readlinkSync } from "node:fs";
 import { rename } from "node:fs/promises";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { describe, test } from "node:test";
 import type { ByteChannel, Listener } from "../../../src/core/protocol/index.ts";
 import { connect, fromNodeSocket, listen, listenStdio, mergeListeners } from "../../../src/node/index.ts";
-import { createConnection, type Connection } from "../../../src/rpc/index.ts";
+import { createConnection, createServer, type Connection } from "../../../src/rpc/index.ts";
 import { pair } from "../../../src/testing/index.ts";
-import { closeServer, listening, tempDir } from "./helpers.ts";
+import { closeServer, listening, tempDir, turns } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "activation-child.ts");
@@ -47,7 +47,14 @@ interface Activation {
 }
 
 function activate(a: Activation): { child: ChildProcess; exited: Promise<number | null>; sockets: Socket[] } {
-  const ours = ["LISTEN_PID", "LISTEN_PIDFDID", "LISTEN_FDS", "LISTEN_FDNAMES", "SYSTEMD_VARLINK_LISTEN"];
+  const ours = [
+    "LISTEN_PID",
+    "LISTEN_PIDFDID",
+    "LISTEN_FDS",
+    "LISTEN_FDNAMES",
+    "SYSTEMD_VARLINK_LISTEN",
+    "VARLINK_JS_ACTIVATION",
+  ];
   const env: Record<string, string | undefined> = {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !ours.includes(key))),
     ...a.env,
@@ -79,6 +86,9 @@ interface Report {
   message?: string;
   after?: Record<string, string>;
   exists?: boolean;
+  bound?: string[];
+  left?: string[];
+  fds?: { ours: Record<string, string>; theirs: Record<string, string | null> };
 }
 
 /** Runs the child in --report mode: its one JSON line. */
@@ -143,6 +153,90 @@ describe("listenFromEnv in an activated child", () => {
     await conn.close();
     assert.equal(await exited, 0);
   });
+
+  test("VARLINK_JS_ACTIVATION=connected: a connected fd with accept: auto on every system (hint unset)", async () => {
+    const { exited, sockets } = activate({
+      fds: ["pipe"],
+      env: { LISTEN_FDS: "1", LISTEN_FDNAMES: "varlink", VARLINK_JS_ACTIVATION: "connected" },
+      args: ["--accept=auto"],
+    });
+    const [socket] = sockets;
+    assert.ok(socket !== undefined);
+    const conn = createConnection(fromNodeSocket(socket));
+    const reply = await ping(conn);
+    assert.equal(reply.address, "fd:3");
+    assert.equal(reply.before.VARLINK_JS_ACTIVATION, "connected");
+    assert.deepEqual(reply.after, {});
+    await conn.close();
+    assert.equal(await exited, 0);
+  });
+
+  test(
+    "without the hint a connected fd needs accept: connected off Linux",
+    { skip: LINUX ? "Linux asks /proc" : false },
+    async () => {
+      // A connected socket taken for listening: listen() on it fails (and closes it).
+      for (const hint of [undefined, "listening", "yes"]) {
+        const env = { LISTEN_FDS: "1", ...(hint === undefined ? {} : { VARLINK_JS_ACTIVATION: hint }) };
+        const auto = await report({ fds: ["pipe"], env, args: ["--accept=auto"] });
+        assert.equal(auto.result, "error", String(hint));
+        assert.deepEqual(auto.after, {}, String(hint));
+      }
+      const explicit = await report({ fds: ["pipe"], env: { LISTEN_FDS: "1" }, args: ["--accept=connected"] });
+      assert.equal(explicit.result, "listener");
+    },
+  );
+
+  test("the hint never overrides an explicit accept mode", async () => {
+    const a = await unixSocket("hint-l");
+    try {
+      const r = await report({
+        fds: [a.fd],
+        env: { LISTEN_FDS: "1", VARLINK_JS_ACTIVATION: "connected" },
+        args: ["--accept=listening"],
+      });
+      assert.equal(r.result, "listener");
+      assert.equal(r.address, LINUX ? `unix:${a.procPath}` : "fd:3");
+    } finally {
+      await closeServer(a.server);
+    }
+  });
+
+  test("invalid options throw after the variables were unset", async () => {
+    const r = await report({ env: { LISTEN_FDS: "1", VARLINK_JS_ACTIVATION: "connected" }, args: ["--accept=bogus"] });
+    assert.equal(r.result, "error");
+    assert.match(r.message ?? "", /^TypeError: .*accept/);
+    assert.deepEqual(r.after, {});
+  });
+
+  test(
+    "the activation fds are /dev/null in our spawned children (not close-on-exec)",
+    { skip: LINUX ? false : "needs Linux /proc" },
+    async () => {
+      const a = await unixSocket("cloexec-a");
+      const b = await unixSocket("cloexec-b");
+      try {
+        // Two fds, only one selected: neither may reach a grandchild.
+        const r = await report({
+          fds: [a.fd, b.fd],
+          env: { LISTEN_FDS: "2", LISTEN_FDNAMES: "varlink:other" },
+          args: ["--accept=listening", "--grandchild"],
+        });
+        assert.equal(r.result, "listener");
+        const fds = r.fds;
+        assert.ok(fds !== undefined);
+        for (const fd of ["3", "4"]) {
+          assert.match(fds.ours[fd] ?? "", /^socket:\[\d+\]$/, `our fd ${fd}`);
+          const theirs = fds.theirs[fd];
+          assert.notEqual(theirs, fds.ours[fd], `the grandchild's fd ${fd} is not the activation socket`);
+          assert.ok(theirs === "/dev/null" || theirs === null, `grandchild fd ${fd}: ${String(theirs)}`);
+        }
+      } finally {
+        await closeServer(a.server);
+        await closeServer(b.server);
+      }
+    },
+  );
 
   test(
     "/proc detection: a connected socketpair with accept: auto",
@@ -300,6 +394,32 @@ describe("listen({fd}, { address })", () => {
     }
   });
 
+  test("registry entries of an {fd} listener stay at shutdown; a path listener's are removed", async () => {
+    const a = await unixSocket("fr");
+    const reg = join(dir(), "fd-registry");
+    try {
+      const r = await report({
+        fds: [a.fd],
+        pid: "absent",
+        args: [`--fd-address=unix:${a.path}`, `--registry=${reg}`],
+      });
+      assert.deepEqual(r.bound, ["org.example.child"]);
+      assert.deepEqual(r.left, ["org.example.child"], "the inherited socket outlives us: the entry stays");
+      assert.equal(readlinkSync(join(reg, "org.example.child")), a.path);
+    } finally {
+      await closeServer(a.server);
+    }
+    // A path listener owns its socket: its entries go at shutdown.
+    const own = join(dir(), "fr-own");
+    const reg2 = join(dir(), "path-registry");
+    const server = createServer({ onError: () => undefined });
+    server.addInterface("interface org.example.own\n\nmethod Ping() -> ()\n", {});
+    await server.serve(await listen(`unix:${own}`), { registry: { directory: reg2 } });
+    assert.deepEqual(readdirSync(reg2), ["org.example.own"]);
+    await server.shutdown();
+    assert.deepEqual(readdirSync(reg2), []);
+  });
+
   test("the address option needs {fd}", async () => {
     await assert.rejects(listen("tcp:127.0.0.1:0", { address: "tcp:127.0.0.1:1" }), TypeError);
   });
@@ -389,6 +509,49 @@ describe("mergeListeners", () => {
     const it = merged[Symbol.asyncIterator]();
     await assert.rejects(it.next(), (e) => e === boom);
     await merged.close();
+  });
+
+  test("a failing source close() still closes the others and the queued channels, then rejects", async () => {
+    const boom = new Error("close failed");
+    const [queued, peer] = pair();
+    const failing: Listener = {
+      address: "unix:/f",
+      close: () => Promise.reject(boom),
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise<never>(() => undefined) }),
+    };
+    const other = new FakeListener("unix:/a", [queued], false);
+    const merged = mergeListeners([failing, other]);
+    const it = merged[Symbol.asyncIterator]();
+    await turns(3); // the channel is queued, nobody took it
+    await assert.rejects(merged.close(), (e) => e === boom);
+    assert.equal(other.closed, 1);
+    assert.equal(await peer.read(), null, "the queued channel was closed");
+    assert.deepEqual(await it.next(), { value: undefined, done: true });
+  });
+
+  test("a rejecting return() of a source is not an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => {
+      unhandled.push(e);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const rejecting: Listener = {
+        address: "unix:/r",
+        close: () => Promise.resolve(),
+        [Symbol.asyncIterator]: () => ({
+          next: () => new Promise<never>(() => undefined),
+          return: () => Promise.reject(new Error("return failed")),
+        }),
+      };
+      const merged = mergeListeners([rejecting]);
+      const it = merged[Symbol.asyncIterator]();
+      await it.return?.();
+      await turns(5);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   test("needs at least one listener", () => {

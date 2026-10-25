@@ -3,10 +3,14 @@
 // once the server closed. Never writes to stdout (it may be the varlink channel).
 // Flags: --accept=auto|listening|connected, --name=<fd name>, --keep-env (unsetEnvironment: false),
 // --linger (ignore SIGTERM, no exit-on-idle: stays until SIGKILL), --report (print the listenAuto outcome as one
-// JSON line on stdout and exit, without serving), --fd-address=<address> (report `listen({fd: 3}, {address})`).
-import { existsSync } from "node:fs";
+// JSON line on stdout and exit, without serving), --fd-address=<address> (report `listen({fd: 3}, {address})`;
+// with --registry=<dir> it serves it with that registry, shuts down and reports the directory's entries instead),
+// --grandchild (with --report: also report what a bridge grandchild sees on our activation fd numbers, Linux),
+// --hold (after the server closed, stay alive instead of exiting, until signalled).
+import { existsSync, readdirSync, readlinkSync } from "node:fs";
 import type { Listener } from "../../../src/core/protocol/index.ts";
 import { listen, listenAuto } from "../../../src/node/index.ts";
+import { openBridge } from "../../../src/node/spawn.ts";
 import { createServer } from "../../../src/rpc/index.ts";
 
 const IDL = `interface org.example.child
@@ -21,6 +25,7 @@ const VARS = [
   "LISTEN_FDNAMES",
   "SYSTEMD_VARLINK_LISTEN",
   "VARLINK_ADDRESS",
+  "VARLINK_JS_ACTIVATION",
 ] as const;
 
 function snapshot(): Record<string, string> {
@@ -45,6 +50,17 @@ async function report(value: unknown): Promise<never> {
 }
 
 const fdAddress = flag("fd-address");
+const registry = flag("registry");
+if (fdAddress !== undefined && registry !== undefined) {
+  // Published through an inherited fd, then shut down: the entries stay (the socket is not ours).
+  const l = await listen({ fd: 3 }, { address: fdAddress });
+  const server = createServer({ onError: () => undefined });
+  server.addInterface(IDL, {});
+  await server.serve(l, { registry: { directory: registry } });
+  const bound = readdirSync(registry);
+  await server.shutdown();
+  await report({ result: "listener", bound, left: readdirSync(registry) });
+}
 if (fdAddress !== undefined) {
   // listen({fd: 3}, {address}) directly: report the address, and that closing it left the path alone.
   try {
@@ -70,11 +86,29 @@ async function auto(): Promise<Listener | null> {
     return report({ result: "error", message: String(e), after: snapshot() });
   }
 }
+/** What /proc/self/fd/<n> is for each of our activation fd numbers, ours and as a bridge grandchild sees it. */
+async function grandchild(): Promise<{ ours: Record<string, string>; theirs: Record<string, string | null> }> {
+  const count = Number(before.LISTEN_FDS ?? "0");
+  const fds = Array.from({ length: count }, (_, i) => 3 + i);
+  const ours = Object.fromEntries(fds.map((fd) => [fd, readlinkSync(`/proc/self/fd/${String(fd)}`)]));
+  const script = `const fs = require("node:fs"); const out = {};
+for (const fd of ${JSON.stringify(fds)}) { try { out[fd] = fs.readlinkSync("/proc/self/fd/" + fd); } catch { out[fd] = null; } }
+process.stdout.write(JSON.stringify(out));`;
+  const ch = await openBridge([process.execPath, "-e", script], {}, new AbortController().signal);
+  let text = "";
+  for (let chunk = await ch.read(); chunk !== null; chunk = await ch.read())
+    text += new TextDecoder().decode(chunk.bytes);
+  ch.close();
+  await ch.closed;
+  return { ours, theirs: JSON.parse(text) as Record<string, string | null> };
+}
+
 const found = await auto();
 const after = snapshot();
 if (args.includes("--report")) {
+  const fds = args.includes("--grandchild") ? await grandchild() : undefined;
   await found?.close();
-  await report({ result: found === null ? "null" : "listener", address: found?.address, after });
+  await report({ result: found === null ? "null" : "listener", address: found?.address, after, fds });
 }
 if (found === null) {
   process.stderr.write("activation-child: nothing to listen on\n");
@@ -91,4 +125,6 @@ server.addInterface(IDL, {
 });
 server.serve(listener);
 await server.closed;
-process.exit(0);
+// --hold: whatever the peer sees now comes from closing the connection, not from our exit.
+if (args.includes("--hold")) setInterval(() => undefined, 1000);
+else process.exit(0);

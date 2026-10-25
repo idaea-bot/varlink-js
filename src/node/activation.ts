@@ -8,9 +8,12 @@ import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
 import type { ServeListener } from "../rpc/server.ts";
 import { checkMode } from "../rpc/util.ts";
+import { ACTIVATION_HINT_ENV, recordActivationFds } from "./activation-fds.ts";
 import { listen } from "./listen.ts";
 import { fromNodeSocket } from "./socket.ts";
 import { fromNodeStreams } from "./spawn-channel.ts";
+
+export { inheritedActivationFds } from "./activation-fds.ts";
 
 /** Options for {@link listenFromEnv} (and {@link listenAuto}). */
 export interface ActivationOptions {
@@ -23,8 +26,10 @@ export interface ActivationOptions {
   unsetEnvironment?: boolean;
   /**
    * Whether an fd is a listening socket or an already-accepted connection (systemd `Accept=yes`, or a connected
-   * `exec:` socketpair). `"auto"` (default) asks `/proc` on Linux and assumes `"listening"` elsewhere (or when
-   * `/proc` does not know the socket): on other systems a connected fd needs `"connected"`.
+   * `exec:` socketpair). `"auto"` (default) asks `/proc` on Linux; where `/proc` says nothing about an fd (other
+   * systems, or a socket it does not know) the fd is taken as connected if `VARLINK_JS_ACTIVATION=connected` is set
+   * (see {@link listenFromEnv}), else as listening: on other systems a connected fd passed by anyone but a
+   * varlink-js `exec:` needs `"connected"`.
    */
   accept?: "auto" | "listening" | "connected";
 }
@@ -36,7 +41,7 @@ export interface ListenAutoOptions extends ActivationOptions {
 }
 
 /** The variables `listenFromEnv` reads (and by default unsets). */
-const ACTIVATION_ENV = ["LISTEN_PID", "LISTEN_PIDFDID", "LISTEN_FDS", "LISTEN_FDNAMES"];
+const ACTIVATION_ENV = ["LISTEN_PID", "LISTEN_PIDFDID", "LISTEN_FDS", "LISTEN_FDNAMES", ACTIVATION_HINT_ENV];
 
 /** The first passed fd (SD_LISTEN_FDS_START). */
 const LISTEN_FDS_START = 3;
@@ -176,6 +181,15 @@ function connectedListener(fd: number, address: string | undefined): Listener {
   );
 }
 
+/** `it.return()`, its failure (a throw or a rejection from a user's listener) ignored. */
+function quietReturn(it: AsyncIterator<ByteChannel>): void {
+  try {
+    it.return?.().catch(() => undefined);
+  } catch {
+    // Nothing to report it to: the merged iteration is over either way.
+  }
+}
+
 /** Per-iteration state of a {@link mergeListeners} listener. */
 interface MergeState {
   readonly queue: ByteChannel[];
@@ -210,7 +224,7 @@ class MergedListener implements Listener {
     try {
       for (const source of this.#sources) iterators.push(source[Symbol.asyncIterator]());
     } catch (e) {
-      for (const it of iterators) void it.return?.();
+      for (const it of iterators) quietReturn(it);
       throw e;
     }
     const state: MergeState = {
@@ -243,12 +257,15 @@ class MergedListener implements Listener {
   }
 
   close(): Promise<void> {
-    this.#closing ??= Promise.all(this.#sources.map((s) => s.close())).then(() => {
+    // Every source is closed and the queue cleaned up even if one fails; then the first failure rejects.
+    this.#closing ??= Promise.allSettled(this.#sources.map(async (s) => s.close())).then((results) => {
       const state = this.#state;
       if (state !== undefined) {
         for (const channel of state.queue.splice(0)) channel.close();
         this.#wake(state);
       }
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed !== undefined) throw failed.reason;
     });
     return this.#closing;
   }
@@ -302,7 +319,7 @@ class MergedListener implements Listener {
     if (state.finished) return;
     state.finished = true;
     if (this.#state === state) this.#state = undefined;
-    for (const it of state.iterators) void it.return?.();
+    for (const it of state.iterators) quietReturn(it);
     for (const channel of state.queue.splice(0)) channel.close();
   }
 }
@@ -330,26 +347,42 @@ export function mergeListeners(listeners: readonly Listener[]): Listener {
  * (sd-varlink would name it "unknown"). Each becomes a listener per `options.accept`: a listening socket via
  * `listen({fd})` (address from `/proc` on Linux, else as `listen()` derives it), a connected one as a listener that
  * yields that one connection, then ends. Several fds give one merged listener ({@link mergeListeners}). The
- * variables are unset unless `unsetEnvironment` is false, also when this throws or returns `null`.
+ * variables (and `VARLINK_JS_ACTIVATION`, below) are unset unless `unsetEnvironment` is false, also when this throws
+ * (invalid options included) or returns `null`.
+ *
+ * `VARLINK_JS_ACTIVATION=connected` is a varlink-js-private hint that a connected-mode `exec:` of varlink-js sets:
+ * with `accept: "auto"`, an fd `/proc` says nothing about (any system but Linux, or a socket `/proc` does not list)
+ * is then taken as connected instead of listening. Any other value, or the variable absent, changes nothing; it is
+ * never consulted in the other `accept` modes or where `/proc` knows the socket.
+ *
+ * The activation fds are not close-on-exec (systemd's `sd_listen_fds` sets `FD_CLOEXEC`; Node cannot without the
+ * native addon, M11), so a child process inherits fds 3 … 3 + `LISTEN_FDS` − 1, listening sockets included. Every
+ * fd seen in `LISTEN_FDS` is recorded, and varlink-js's own spawners (`exec:`, bridges, ssh) put `/dev/null` on
+ * those fd numbers in their children; a `child_process` spawn of your own does not: pass `/dev/null` (or
+ * `"ignore"` and an `stdio` array that covers those numbers) for them yourself.
  *
  * @throws {TypeError} (as a rejection) for invalid options or malformed `LISTEN_FDS`/`LISTEN_FDNAMES`.
  */
 export async function listenFromEnv(options?: ActivationOptions): Promise<Listener | null> {
+  const env = process.env;
+  const pid = env.LISTEN_PID;
+  const count = env.LISTEN_FDS;
+  const names = env.LISTEN_FDNAMES;
+  const hint = env[ACTIVATION_HINT_ENV];
+  // Unset before anything can throw (only an explicit `false` keeps them; an invalid value throws below).
+  if (options?.unsetEnvironment !== false) for (const key of ACTIVATION_ENV) Reflect.deleteProperty(env, key);
   const name = options?.name ?? "varlink";
   if (typeof name !== "string") throw new TypeError("name must be a string");
   const unset = options?.unsetEnvironment ?? true;
   if (typeof unset !== "boolean") throw new TypeError("unsetEnvironment must be a boolean");
   const accept = checkMode(options?.accept, "accept", ["auto", "listening", "connected"], "auto");
-  const env = process.env;
-  const pid = env.LISTEN_PID;
-  const count = env.LISTEN_FDS;
-  const names = env.LISTEN_FDNAMES;
-  if (unset) for (const key of ACTIVATION_ENV) Reflect.deleteProperty(env, key);
   if (pid === undefined || !/^[0-9]+$/.test(pid) || Number(pid) !== process.pid) return null;
   if (count === undefined) return null;
   if (!/^[0-9]+$/.test(count) || Number(count) < 1 || Number(count) > MAX_LISTEN_FDS)
     throw new TypeError(`LISTEN_FDS must be a decimal from 1 to ${String(MAX_LISTEN_FDS)}`);
   const n = Number(count);
+  // All of them, whatever their names: none may leak into our children (spawn.ts).
+  recordActivationFds(LISTEN_FDS_START, n);
   const fdNames = names?.split(":");
   if (fdNames !== undefined && fdNames.length !== n)
     throw new TypeError(`LISTEN_FDNAMES has ${String(fdNames.length)} names for ${String(n)} fds (LISTEN_FDS)`);
@@ -363,7 +396,9 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
     for (const fd of selected) {
       const inode = proc.size === 0 ? undefined : socketInode(fd);
       const info = inode === undefined ? undefined : proc.get(inode);
-      const mode = accept === "auto" ? (info === undefined || info.listening ? "listening" : "connected") : accept;
+      // /proc silent (not Linux, or an unknown inode): only our own exec:'s hint can say "connected".
+      const connected = info === undefined ? hint === "connected" : !info.listening;
+      const mode = accept === "auto" ? (connected ? "connected" : "listening") : accept;
       if (mode === "connected") listeners.push(connectedListener(fd, info?.address));
       else listeners.push(await listen({ fd }, info?.address === undefined ? {} : { address: info.address }));
     }
@@ -375,18 +410,50 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
   return listeners.length === 1 && only !== undefined ? only : mergeListeners(listeners);
 }
 
+/** Ends `process.stdout` (on a socket: FIN; elsewhere harmless); never throws. */
+function endStdout(): void {
+  try {
+    process.stdout.end();
+  } catch {
+    // A stdout that cannot end has nothing to tell the peer either.
+  }
+}
+
+/**
+ * The stdio channel: Node never closes fds 0 and 1 (destroying `process.stdout` leaves the fd open), so `end()` and
+ * `close()` also end `process.stdout`, which on a socket (libuv's `"pipe"` stdio, ssh) sends FIN.
+ */
+function stdioChannel(): ByteChannel {
+  const inner = fromNodeStreams(process.stdin, process.stdout);
+  return {
+    capabilities: inner.capabilities,
+    closed: inner.closed,
+    read: () => inner.read(),
+    write: (chunk) => inner.write(chunk),
+    end: () => {
+      endStdout();
+      return inner.end();
+    },
+    close: (reason) => {
+      endStdout();
+      inner.close(reason);
+    },
+  };
+}
+
 /**
  * A listener that yields one connection over `process.stdin`/`process.stdout` ({@link fromNodeStreams}), then ends
  * (`SYSTEMD_VARLINK_LISTEN=-`, what `ssh-exec:` and bridges rely on). `address` is `stdio:`, which is not a dialable
  * varlink address. Nothing else may write to stdout while it is served (use stderr for logs). The streams are
  * touched only when the channel is taken; `close()` before that leaves them alone.
+ *
+ * **A stdio-served process must exit when this connection ends.** Node cannot close fds 0 and 1 (sd-varlink
+ * `dup`s them away; that needs the native addon): closing the channel ends `process.stdout`, which sends FIN on a
+ * socket stdout (what our spawners and ssh give a child) but cannot close a pipe or a terminal, so the peer may see
+ * EOF only when the process exits. Serve with `exitOnIdle` and `await server.closed; process.exit()`.
  */
 export function listenStdio(): Listener {
-  return new OneShotListener(
-    "stdio:",
-    () => fromNodeStreams(process.stdin, process.stdout),
-    () => undefined,
-  );
+  return new OneShotListener("stdio:", stdioChannel, () => undefined);
 }
 
 /**
@@ -394,7 +461,8 @@ export function listenStdio(): Listener {
  * plus, if `SYSTEMD_VARLINK_LISTEN` is set, `-` → {@link listenStdio}, anything else → `listen(value, { mode })`;
  * merged into one listener, or `null` if there is nothing. `SYSTEMD_VARLINK_LISTEN` is not unset (sd-varlink
  * parity; our spawners strip it from children). Typical activated service:
- * `server.serve((await listenAuto()) ?? (await listen(fallback))); await server.closed; process.exit(0)`.
+ * `server.serve((await listenAuto()) ?? (await listen(fallback))); await server.closed; process.exit(0)` with
+ * `exitOnIdle` set: a stdio-served process must exit when its connection ends (see {@link listenStdio}).
  *
  * @throws as {@link listenFromEnv} and `listen()` (as a rejection; what was opened is closed again).
  */

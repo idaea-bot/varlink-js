@@ -89,12 +89,15 @@ describe("exitOnIdle", () => {
   });
 
   test("no timers once shut down (shutdown before expiry)", async () => {
-    const s = server(30);
+    const timeouts = (): number => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+    const baseline = timeouts();
+    // Long enough that only clearing it (not its expiry) can make it go away within the test.
+    const s = server(60_000);
     s.serve(new MemoryListener());
+    assert.equal(timeouts(), baseline + 1, "the idle timer is armed");
     await s.shutdown();
     await s.closed;
-    await sleep(60); // the expired timer would call shutdown() again: it is memoized either way, nothing to see
-    assert.equal(s.connections, 0);
+    assert.equal(timeouts(), baseline, "and cleared by the shutdown");
   });
 });
 

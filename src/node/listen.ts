@@ -38,6 +38,8 @@ export interface NodeListener extends Listener {
   /**
    * Present only on unix path listeners (also `{fd}` ones whose `address` option names a unix path): publishes the
    * socket in a registry directory (`bindRegistry` of `./registry.ts`), for `server.serve(listener, {registry})`.
+   * For an `{fd}` listener (an inherited, socket-activated socket) the binding's `unbind()` does nothing: the
+   * socket belongs to the service manager and outlives us, so its entries stay (a later binder adopts them).
    */
   readonly bindRegistry?: (interfaces: readonly string[], options: RegistryBindOptions) => Promise<RegistryBinding>;
 }
@@ -76,6 +78,15 @@ interface UnixOwnership {
   inode: Inode | undefined;
 }
 
+/**
+ * The binding of a socket we do not own (`{fd}`, socket activation): its entries stay at unbind, since the socket
+ * belongs to the service manager and outlives us (a connect through the entry activates the service again). A
+ * later binder adopts the entry; a stale one is replaced by binders and skipped by readers.
+ */
+function persistent(binding: RegistryBinding): RegistryBinding {
+  return { entries: binding.entries, unbind: () => Promise.resolve() };
+}
+
 class NodeListenerImpl implements NodeListener {
   readonly server: Server;
   readonly address: string;
@@ -97,7 +108,11 @@ class NodeListenerImpl implements NodeListener {
     const path = unixPath(address);
     if (path !== undefined) {
       const target = resolve(path);
-      this.bindRegistry = (interfaces, options) => bindRegistry(target, interfaces, options);
+      // No `unix` ownership: an inherited ({fd}) socket, held by the service manager, that outlives us.
+      this.bindRegistry =
+        unix === undefined
+          ? async (interfaces, options) => persistent(await bindRegistry(target, interfaces, options))
+          : (interfaces, options) => bindRegistry(target, interfaces, options);
     }
     server.on("connection", (socket) => {
       const channel = fromNodeSocket(socket);
@@ -517,7 +532,8 @@ function addressOf(server: Server, fd?: number): string {
  * - `unix:/path` (and bare paths): the socket is bound in a private 0700 directory next to the path (`.vjs-<hex>`,
  *   removed afterwards), `chmod`ed to `mode` and hard-linked to the path, which is never overwritten: an existing
  *   stale socket (it refused 3 connects ~20 ms apart) is moved away atomically and removed; a live socket, a
- *   non-socket, or a concurrent listen() that got there first rejects with `EADDRINUSE` and is left alone. Setups
+ *   non-socket, or a concurrent listen() that got there first rejects with `EADDRINUSE` and is left alone (on
+ *   macOS/BSD a live socket whose backlog is full refuses connects as a stale one does, and may be replaced). Setups
  *   on one path are serialized within the process. Without hard-link support (or if the private path would not
  *   fit in sun_path) the socket is bound at the path directly after the stale check: `mode` is then applied after
  *   bind, and another process may race the stale replace. `close()` unlinks the path only if it is still the
@@ -533,7 +549,8 @@ function addressOf(server: Server, fd?: number): string {
  * when `close()` is called or the server closes. `close()` stops listening, ends the iterator and destroys accepted
  * connections nobody took yet; it does not wait for taken ones. Iterating twice concurrently is a `TypeError`. Other
  * address kinds reject with `OperationNotSupportedError`. Unix path listeners (and `{fd}` ones whose `address` names
- * a unix path) have `bindRegistry`, for `server.serve(listener, {registry})` (§5.4); the others do not.
+ * a unix path) have `bindRegistry`, for `server.serve(listener, {registry})` (§5.4); the others do not. Entries of
+ * an `{fd}` listener are not removed when it is unbound (see {@link NodeListener.bindRegistry}).
  */
 export async function listen(
   address: string | AddressSpec | { readonly fd: number },

@@ -1,7 +1,8 @@
 // systemd-socket-activate → our listenAuto() (DESIGN.md §5.8): a listening fd (named and unnamed), an accepted
-// connection (Accept=yes style, detected via /proc), and a registry bound on an inherited fd. Linux only.
+// connection (Accept=yes style, detected via /proc), and a registry bound on an inherited fd (kept at exit). Linux
+// only.
 import assert from "node:assert/strict";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -72,7 +73,7 @@ describe("systemd-socket-activate", { skip }, () => {
     }
   });
 
-  test("the registry on an inherited listening fd: bound while serving, removed at exit", async () => {
+  test("the registry on an inherited listening fd: bound while serving, kept at exit (the socket is not ours)", async () => {
     const path = join(dir, "registered");
     const reg = join(dir, "registry");
     const child = start(tool(), [
@@ -100,7 +101,9 @@ describe("systemd-socket-activate", { skip }, () => {
       await viaRegistry.close();
       await conn.close();
       assert.equal(await within(child.exited, "the service to exit on idle"), 0, child.stderr());
-      assert.deepEqual(readdirSync(reg), [], "unbound at shutdown");
+      // The service manager owns the socket (a connect would activate the service again): the entry stays.
+      assert.deepEqual(readdirSync(reg), ["org.example.vm"], "kept at shutdown");
+      assert.equal(readlinkSync(join(reg, "org.example.vm")), path);
       assert.equal(existsSync(path), true, "the activated socket is not ours to unlink");
     } finally {
       await child.stop();

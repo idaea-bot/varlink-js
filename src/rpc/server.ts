@@ -123,7 +123,10 @@ export interface RegistryBindOptions {
 export interface RegistryBinding {
   /** The entry paths (created or adopted). */
   readonly entries: readonly string[];
-  /** Removes the entries that still point at the listener's socket; idempotent. */
+  /**
+   * Removes the entries that still point at the listener's socket (a listener on a socket it does not own may keep
+   * them); idempotent.
+   */
   unbind(): Promise<void>;
 }
 
@@ -142,8 +145,9 @@ export interface ServeOptions {
   /**
    * Publish the listener in the service registry (UAPI.20; the listener must have `bindRegistry`): `true` = every
    * interface registered now except `org.varlink.service` and the varlink-js InternalError interface, or a list of
-   * registered names, or `{interfaces, directory, scope}` (`interfaces` default `true`). The entries are removed at
-   * {@link Server.shutdown} (before the listeners close) and when the accept loop ends.
+   * registered names, or `{interfaces, directory, scope}` (`interfaces` default `true`). The binding is unbound at
+   * {@link Server.shutdown} (before the listeners close) and when the accept loop ends; that removes the entries,
+   * except for a listener on a socket it does not own (a Node `listen({fd})` one under socket activation keeps them).
    */
   registry?:
     true | readonly string[] | { interfaces?: true | readonly string[]; directory?: string; scope?: "system" | "user" };

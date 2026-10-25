@@ -113,6 +113,25 @@ describe("listRegistry", () => {
     }
   });
 
+  test("an entry path too long for sun_path is addressed by its target (listRegistry and resolveInterface)", async () => {
+    const reg = join(sub("long"), "x".repeat(110));
+    await mkdir(reg, { recursive: true });
+    const target = join(dir(), "long-target.sock");
+    const live = await liveSocket(target);
+    try {
+      await symlink(target, join(reg, "org.example.long"));
+      const real = await realpath(target);
+      const [entry] = await listRegistry({ directory: reg });
+      assert.equal(entry?.address, `unix:${real}`);
+      const address = await resolveInterface("org.example.long", { directory: reg, resolver: false });
+      assert.equal(address, `unix:${real}`);
+      const conn = await connect(address);
+      await conn.close();
+    } finally {
+      await live.close();
+    }
+  });
+
   test("invalid options are TypeErrors", async () => {
     await assert.rejects(listRegistry({ directory: "" }), TypeError);
     await assert.rejects(listRegistry({ scope: "auto" as never }), TypeError);
@@ -224,6 +243,39 @@ describe("bindRegistry", () => {
     await binding.unbind();
     assert.deepEqual(readdirSync(reg).sort(), ["org.example.file", "org.example.relinked"]);
     assert.equal(await readlink(join(reg, "org.example.relinked")), join(dir(), "someone-else.sock"));
+  });
+
+  test("a symlink spelled differently (relative) that resolves to our live socket is adopted, removed on unbind", async () => {
+    const reg = sub("relative");
+    const sock = join(dir(), "rel-live.sock");
+    const listener = await listen(`unix:${sock}`);
+    try {
+      await mkdir(reg, { recursive: true });
+      const entry = join(reg, "org.example.rel");
+      await symlink(relative(reg, sock), entry);
+      // Not taken for "another service listening on it": it is our own socket.
+      const binding = await bindRegistry(sock, ["org.example.rel"], { directory: reg });
+      assert.deepEqual(binding.entries, [entry]);
+      assert.equal(await readlink(entry), relative(reg, sock), "adopted as it is, not replaced");
+      await binding.unbind();
+      assert.deepEqual(readdirSync(reg), []);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  test("directories it creates are 0755 whatever the umask", async () => {
+    const base = sub("umask");
+    const reg = join(base, "a", "b", "registry");
+    const saved = process.umask(0o077);
+    try {
+      const binding = await bindRegistry(join(dir(), "umask.sock"), ["org.example.umask"], { directory: reg });
+      await binding.unbind();
+    } finally {
+      process.umask(saved);
+    }
+    for (const d of [base, join(base, "a"), join(base, "a", "b"), reg])
+      assert.equal(lstatSync(d).mode & 0o777, 0o755, d);
   });
 
   test("invalid or duplicate interface names are TypeErrors before the filesystem is touched", async () => {

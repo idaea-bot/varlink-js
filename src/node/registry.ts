@@ -1,9 +1,9 @@
 // The service registry directory (UAPI.20 "Service Registry Directory", DESIGN.md §4.6, §5.4) and the
 // org.varlink.resolver client. Reference: systemd varlinkctl.c verb_list_registry (2336319d, :1182-1260).
 import { randomBytes } from "node:crypto";
-import { lstat, mkdir, readdir, readlink, realpath, rename, stat, symlink, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, stat, symlink, unlink } from "node:fs/promises";
 import { connect as netConnect } from "node:net";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { formatAddress, parseAddress } from "../core/address/parse.ts";
 import { safeQuote, ValidationError } from "../core/errors/local.ts";
 import { InterfaceNotFoundError } from "../core/errors/standard.ts";
@@ -21,7 +21,10 @@ export type RegistryScope = "system" | "user";
 export interface RegistryEntry {
   /** The interface name (the entry's file name). */
   readonly interface: string;
-  /** `unix:<entry path>`: connectable through the symlink, and short. */
+  /**
+   * `unix:<entry path>`: connectable through the symlink, and short; `unix:<target>` instead if the entry path does
+   * not fit in sun_path (over 103 bytes, 107 on Linux) and the target does.
+   */
   readonly address: string;
   /** The socket the entry resolves to (the entry itself, or its symlink chased). */
   readonly target: string;
@@ -117,6 +120,15 @@ export function registryDirectory(scope: RegistryScope = "system"): string {
   return join(dir, "varlink", "registry");
 }
 
+/** Longest unix socket path `connect` takes: sun_path is 108 bytes on Linux, 104 elsewhere (less the NUL). */
+const SUN_PATH_MAX = process.platform === "linux" ? 107 : 103;
+
+/** The address of an entry: through the entry, or its target if only that fits in sun_path. */
+function entryAddress(entry: string, target: string): string {
+  const fits = (path: string): boolean => Buffer.byteLength(path) <= SUN_PATH_MAX;
+  return formatAddress({ kind: "unix", path: fits(entry) || !fits(target) ? entry : target });
+}
+
 /** The socket an entry leads to (itself, or its symlink chased), or undefined (missing, dangling, not a socket). */
 async function socketOf(entry: string): Promise<string | undefined> {
   try {
@@ -132,7 +144,8 @@ async function socketOf(entry: string): Promise<string | undefined> {
 /**
  * The usable entries of a registry directory (like `varlinkctl list-registry`), sorted by interface: names that
  * are valid interface names and are a socket or a symlink to one. Everything else is skipped; a missing directory
- * gives `[]`. Like any registry reader, do not assume it is complete (UAPI.20).
+ * gives `[]`. Like any registry reader, do not assume it is complete (UAPI.20). An entry's `address` goes through
+ * the entry unless its path is too long for a unix socket address (then the target's, if that fits).
  *
  * @throws {TypeError} (as a rejection) for invalid options; other errors reading the directory reject as they are.
  */
@@ -150,7 +163,7 @@ export async function listRegistry(options?: ListRegistryOptions): Promise<Regis
     if (!isInterfaceName(name)) continue;
     const path = join(directory, name);
     const target = await socketOf(path);
-    if (target !== undefined) entries.push({ interface: name, address: formatAddress({ kind: "unix", path }), target });
+    if (target !== undefined) entries.push({ interface: name, address: entryAddress(path, target), target });
   }
   return entries;
 }
@@ -197,7 +210,8 @@ export async function resolverGetInfo(conn: Connection, options?: CallOptions): 
 /**
  * Finds a service implementing `name` (DESIGN.md §4.6) and returns its address: the registry entry
  * `<dir>/<name>` (a socket or a symlink to one → `unix:<entry path>`) in `directory`, or by `scope` (`"auto"`: the
- * system registry, then the user's if `XDG_RUNTIME_DIR` is set); then `org.varlink.resolver` at `resolver`.
+ * system registry, then the user's if `XDG_RUNTIME_DIR` is set; `unix:<target>` instead if the entry path is too
+ * long for a unix socket address and the socket's is not); then `org.varlink.resolver` at `resolver`.
  * Nothing found rejects with {@link InterfaceNotFoundError} (`cause`: the resolver's error, or why it could not be
  * reached). Abort and resolver errors other than "not found" (timeouts, invalid replies) reject as they are.
  *
@@ -221,7 +235,8 @@ export async function resolveInterface(name: string, options?: ResolveOptions): 
   }
   for (const dir of dirs) {
     const path = join(dir, name);
-    if ((await socketOf(path)) !== undefined) return formatAddress({ kind: "unix", path });
+    const target = await socketOf(path);
+    if (target !== undefined) return entryAddress(path, target);
   }
   if (resolver === false) throw new InterfaceNotFoundError({ interface: name });
   let conn: Connection;
@@ -243,7 +258,7 @@ export async function resolveInterface(name: string, options?: ResolveOptions): 
   }
 }
 
-/** One connect to a unix socket: accepted (or EAGAIN, a full backlog) = live; refused; vanished. */
+/** One connect to a unix socket: accepted (or EAGAIN, a full backlog on Linux) = live; refused; vanished. */
 function probeOnce(path: string): Promise<"live" | "refused" | "gone"> {
   return new Promise((resolve, reject) => {
     const socket = netConnect({ path });
@@ -278,6 +293,18 @@ async function isStaleSocket(path: string): Promise<boolean> {
 /** What is at a registry entry, from our point of view. */
 type EntryState = "gone" | "ours" | "stale" | { conflict: string };
 
+/** Whether the symlink `entry` leads to `target`: spelled the same, or resolving to the same file (`realpath`). */
+async function linksTo(entry: string, target: string): Promise<boolean> {
+  const link = await readlinkOf(entry);
+  if (link === undefined) return false;
+  if (link === target) return true;
+  try {
+    return (await realpath(entry)) === (await realpath(target));
+  } catch {
+    return false; // dangling, or the target is gone
+  }
+}
+
 async function examine(entry: string, target: string): Promise<EntryState> {
   let st;
   try {
@@ -287,7 +314,7 @@ async function examine(entry: string, target: string): Promise<EntryState> {
     throw e;
   }
   if (st.isSymbolicLink()) {
-    if ((await readlink(entry)) === target) return "ours";
+    if (await linksTo(entry, target)) return "ours";
     try {
       st = await stat(entry);
     } catch (e) {
@@ -325,22 +352,26 @@ async function place(dir: string, name: string, entry: string, target: string): 
       await unlink(tmp).catch(() => undefined);
       throw e;
     }
-    return "created";
+    // Another binder may have replaced the stale entry right after us: then it is theirs, not "created".
+    if ((await readlinkOf(entry)) === target) return "created";
   }
   throw entryInUse(entry, "it keeps changing");
 }
 
-/** Removes `entry` if it is still a symlink to `target`. */
-async function removeIfOurs(entry: string, target: string): Promise<void> {
-  let current: string;
+/** `readlink`, or undefined if the entry is gone or no longer a symlink (EINVAL). */
+async function readlinkOf(entry: string): Promise<string | undefined> {
   try {
-    current = await readlink(entry);
+    return await readlink(entry);
   } catch (e) {
-    // Gone, or no longer a symlink (EINVAL): not ours any more.
-    if (codeOf(e) === "ENOENT" || codeOf(e) === "EINVAL") return;
+    if (codeOf(e) === "ENOENT" || codeOf(e) === "EINVAL") return undefined;
     throw e;
   }
-  if (current !== target) return;
+}
+
+/** Removes `entry` if it is still a symlink to `target` (as spelled, or resolving to it). */
+async function removeIfOurs(entry: string, target: string): Promise<void> {
+  // Gone, no longer a symlink, or leading elsewhere: not ours any more.
+  if (!(await linksTo(entry, target))) return;
   try {
     await unlink(entry);
   } catch (e) {
@@ -348,15 +379,34 @@ async function removeIfOurs(entry: string, target: string): Promise<void> {
   }
 }
 
+/** `mkdir -p dir`, the directories it created `chmod`ed to 0755 (whatever the umask: readers must get in). */
+async function makeDirectory(dir: string): Promise<void> {
+  const first = await mkdir(dir, { recursive: true, mode: 0o755 });
+  if (first === undefined) return;
+  const created: string[] = [];
+  for (let d = dir; ; d = dirname(d)) {
+    created.unshift(d);
+    if (d === first || dirname(d) === d) break;
+  }
+  for (const d of created) await chmod(d, 0o755);
+}
+
 /**
  * Publishes the unix socket at `socketPath` in a registry directory (DESIGN.md §5.4): one symlink
  * `<dir>/<interface>` → the absolute socket path per interface. `dir` is `options.directory`, else
- * {@link registryDirectory}`(options.scope ?? "system")`, created (0755) if missing. An existing entry that already
- * points at the socket is adopted; a stale one (dangling, or a socket refusing connects) is replaced atomically
- * (symlink + rename); anything else (a live socket of another service, a file, …) fails with an `EEXIST` error
- * naming the entry, and the entries this call created are removed again (all or nothing). `unbind()` (idempotent)
- * removes every entry that is still a symlink to the socket, leaving anything else alone. `server.serve(listener,
- * {registry})` calls this through the listener; use it directly for listeners of your own.
+ * {@link registryDirectory}`(options.scope ?? "system")`, created if missing (the directories created are `chmod`ed
+ * to 0755 whatever the umask). An existing symlink that already leads to the socket (as spelled, or resolving to
+ * the same file) is adopted; a stale one (dangling, or a socket refusing connects) is replaced atomically (symlink +
+ * rename); anything else (a live socket of another service, a file, …) fails with an `EEXIST` error naming the
+ * entry, and the entries this call created are removed again (all or nothing). `unbind()` (idempotent) removes
+ * every entry that is still a symlink to the socket, leaving anything else alone. `server.serve(listener,
+ * {registry})` calls this through the listener (a `listen({fd})` listener's binding keeps its entries at unbind);
+ * use it directly for listeners of your own.
+ *
+ * Caveats: on macOS/BSD a live socket whose backlog is full refuses connects (`ECONNREFUSED`) like a stale one,
+ * so a busy service's entry may be taken for stale and replaced (as with `listen()`). `unbind()` checks the entry
+ * with `readlink` and then unlinks it: an entry another binder puts in place between the two is removed (there is
+ * no atomic compare-and-unlink); that binder's readers fall back as for any missing entry.
  *
  * @throws {TypeError} (as a rejection) for an invalid or duplicate interface name or invalid options.
  */
@@ -377,7 +427,7 @@ export async function bindRegistry(
   }
   const dir = resolve(checkDirectory(options?.directory) ?? registryDirectory(checkScope(options?.scope)));
   const target = resolve(socketPath);
-  await mkdir(dir, { recursive: true, mode: 0o755 });
+  await makeDirectory(dir);
   const entries: string[] = [];
   const created: string[] = [];
   try {

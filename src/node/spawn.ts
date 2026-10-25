@@ -1,7 +1,7 @@
 // Spawned transports (DESIGN.md §4.6, §5.8): exec: (socket activation of a child), bridge argv (varlink on a
 // child's stdio), ssh-unix: and ssh-exec:. Reference: sd-varlink.c (connect_exec, ssh_unix, ssh_exec).
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { closeSync, constants as fsConstants, openSync } from "node:fs";
 import { access, mkdtemp, rename, rm } from "node:fs/promises";
 import { connect as netConnect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -11,15 +11,17 @@ import { CallTimeoutError, OperationNotSupportedError, safeQuote } from "../core
 import type { ByteChannel, ReadChunk } from "../core/protocol/channel.ts";
 import { createConnection, DEFAULT_TIMEOUT, type Connection, type ConnectionOptions } from "../rpc/connection.ts";
 import { checkMode, checkTimeout } from "../rpc/util.ts";
+import { ACTIVATION_HINT_ENV, inheritedActivationFds } from "./activation-fds.ts";
 import { fromNodeSocket } from "./socket.ts";
 import { fromNodeStreams } from "./spawn-channel.ts";
 
 /** How a spawned child is run (every spawn kind). */
 export interface SpawnProcessOptions {
   /**
-   * The child's environment; default `process.env`. `LISTEN_PID`, `LISTEN_PIDFDID`, `LISTEN_FDS`, `LISTEN_FDNAMES`
-   * and `SYSTEMD_VARLINK_LISTEN` are always removed (activation variables meant for us must not leak to the child),
-   * then the kind's own variables are added. `undefined` values are dropped.
+   * The child's environment; default `process.env`. `LISTEN_PID`, `LISTEN_PIDFDID`, `LISTEN_FDS`, `LISTEN_FDNAMES`,
+   * `SYSTEMD_VARLINK_LISTEN`, `VARLINK_ADDRESS` and `VARLINK_JS_ACTIVATION` are always removed (activation variables
+   * meant for us must not leak to the child), then the kind's own variables are added. `undefined` values are
+   * dropped.
    */
   env?: Readonly<Record<string, string | undefined>>;
   /** The child's working directory; default ours. */
@@ -44,8 +46,11 @@ export interface ExecProcessOptions extends SpawnProcessOptions {
   argv?: readonly string[];
   /**
    * The activation socket the child gets as fd 3: `"connected"` (default; one end of a unix socketpair, what
-   * sd-varlink/varlinkctl pass and systemd services expect) or `"listening"` (a listening unix socket in a private
-   * 0700 directory, also named in `VARLINK_ADDRESS`, as libvarlink/python-varlink `--activate` do; we connect to it).
+   * sd-varlink/varlinkctl pass and systemd services expect; `VARLINK_JS_ACTIVATION=connected` is set too, so a
+   * varlink-js child's `listenFromEnv` knows it without `/proc`) or `"listening"` (a listening unix socket in a
+   * private 0700 directory, also named in `VARLINK_ADDRESS`, as libvarlink/python-varlink `--activate` do; we
+   * connect to it). In `"listening"` mode the child's fd 3 is non-blocking (`O_NONBLOCK` lives on the open file
+   * description we share, and libuv set it): a child doing a blocking `accept()` must handle `EAGAIN` (poll first).
    */
   socket?: "connected" | "listening";
 }
@@ -67,8 +72,19 @@ export interface SpawnedChannel extends ByteChannel {
 /** Address kinds served by spawning a process. */
 export type SpawnAddress = Extract<AddressSpec, { kind: "exec" | "ssh-unix" | "ssh-exec" }>;
 
-/** Activation variables never passed on to a child (an inherited LISTEN_PIDFDID would make it ignore its fds). */
-const STRIPPED_ENV = ["LISTEN_PID", "LISTEN_PIDFDID", "LISTEN_FDS", "LISTEN_FDNAMES", "SYSTEMD_VARLINK_LISTEN"];
+/**
+ * Activation variables never passed on to a child (an inherited LISTEN_PIDFDID would make it ignore its fds; the
+ * listening mode sets its own VARLINK_ADDRESS, the connected one its own hint).
+ */
+const STRIPPED_ENV = [
+  "LISTEN_PID",
+  "LISTEN_PIDFDID",
+  "LISTEN_FDS",
+  "LISTEN_FDNAMES",
+  "SYSTEMD_VARLINK_LISTEN",
+  "VARLINK_ADDRESS",
+  ACTIVATION_HINT_ENV,
+];
 
 /** Sets LISTEN_PID to the shell's pid, then execs the command in its place (Node cannot set env after fork). */
 const LISTEN_PID_SCRIPT = 'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"';
@@ -289,8 +305,10 @@ class ChildHandle {
 }
 
 /**
- * The transport plus the child: `close()` kills a still-running child; `closed` waits for the transport and the
- * child's exit, then runs `cleanup`. (A Connection calls `close()` on EOF too, so the child never outlives it.)
+ * The transport plus the child: `close()` SIGTERMs a still-running child (SIGKILL after killTimeout); `closed`
+ * waits for the transport and the child's exit, then runs `cleanup`. A Connection closes its channel on EOF too, so
+ * a child that shuts its side down while it still runs is signalled then (sd-varlink kills its exec child too); a
+ * child that already exited is not signalled.
  */
 class ChildChannel implements SpawnedChannel {
   readonly capabilities: ByteChannel["capabilities"] = {};
@@ -303,7 +321,7 @@ class ChildChannel implements SpawnedChannel {
     this.#inner = inner;
     this.#handle = handle;
     this.child = handle.child;
-    // Only close() signals the child: one that exits on its own after the transport closed is left to do so.
+    // Only close() signals the child, and only while it runs (an exited child is not signalled).
     this.closed = Promise.all([inner.closed, handle.exited])
       .then(() => cleanup?.())
       .then(
@@ -330,16 +348,52 @@ class ChildChannel implements SpawnedChannel {
   }
 }
 
+/** A child's stdio as an array (one entry per fd). */
+type StdioSlots = Extract<StdioOptions, readonly unknown[]>;
+
 /** The stdio of a child: stdin ignored or a pipe, stdout to our fd 2 or a pipe, stderr per option, then fd 3. */
-function stdioFor(kind: "exec" | "stdio", stderr: "inherit" | "ignore", fd3?: number | "pipe"): StdioOptions {
+function stdioFor(kind: "exec" | "stdio", stderr: "inherit" | "ignore", fd3?: number | "pipe"): StdioSlots {
   const err = stderr === "inherit" ? 2 : "ignore";
   // exec: the child's stdout goes to our stderr, never our stdout (we may be a stdio-served varlink server).
   if (kind === "exec") return fd3 === undefined ? ["ignore", 2, err] : ["ignore", 2, err, fd3];
   return ["pipe", "pipe", err];
 }
 
-function spawnChild(file: string, args: readonly string[], o: CheckedProcessOptions, stdio: StdioOptions): ChildHandle {
-  const child = spawn(file, args, { env: o.env, stdio, ...(o.cwd === undefined ? {} : { cwd: o.cwd }) });
+/** The activation fds we inherited (`listenFromEnv`) that a child with `slots` stdio entries would get as they are. */
+function uncoveredActivationFds(slots: number): number[] {
+  return inheritedActivationFds().filter((fd) => fd >= 3 && fd >= slots);
+}
+
+/**
+ * Spawns with `stdio` extended by `/dev/null` on every uncovered activation fd: those are not close-on-exec (Node
+ * cannot set FD_CLOEXEC), and our children must not get them. They are contiguous from 3, so the array gets no gaps.
+ */
+function spawnChild(file: string, args: readonly string[], o: CheckedProcessOptions, stdio: StdioSlots): ChildHandle {
+  const options = { env: o.env, ...(o.cwd === undefined ? {} : { cwd: o.cwd }) };
+  const slots = [...stdio];
+  const uncovered = uncoveredActivationFds(slots.length);
+  if (uncovered.length === 0) return new ChildHandle(spawn(file, args, { ...options, stdio }), o.killTimeout);
+  // One /dev/null per spawn, which libuv dup2s onto each slot; ours is closed once the child has its copies.
+  const devNull = openSync("/dev/null", "r+");
+  let open = true;
+  const release = (): void => {
+    if (!open) return;
+    open = false;
+    closeSync(devNull);
+  };
+  for (const fd of uncovered) {
+    while (slots.length < fd) slots.push("ignore");
+    slots[fd] = devNull;
+  }
+  let child: ChildProcess;
+  try {
+    child = spawn(file, args, { ...options, stdio: slots });
+  } catch (e) {
+    release();
+    throw e;
+  }
+  child.once("spawn", release);
+  child.once("error", release);
   return new ChildHandle(child, o.killTimeout);
 }
 
@@ -406,7 +460,9 @@ async function openExec(command: string, o: CheckedProcessOptions, phase: AbortS
   const args = ["-c", LISTEN_PID_SCRIPT, command, ...argv.slice(1)];
   const env = { ...o.env, LISTEN_FDS: "1", LISTEN_FDNAMES: "varlink" };
   if (o.socket === "listening") return openExecListening(args, { ...o, env }, phase);
-  const handle = spawnChild("/bin/sh", args, { ...o, env }, stdioFor("exec", o.stderr, "pipe"));
+  // Tells a varlink-js child that fd 3 is connected where it cannot ask /proc (activation.ts).
+  const connected = { ...env, [ACTIVATION_HINT_ENV]: "connected" };
+  const handle = spawnChild("/bin/sh", args, { ...o, env: connected }, stdioFor("exec", o.stderr, "pipe"));
   try {
     await handle.spawned();
     phase.throwIfAborted();
@@ -600,13 +656,15 @@ export function connectSpawned(
  * connect_exec). `command` must be an absolute, normalized path (else `TypeError`) and executable (else the
  * `ENOENT`/`EACCES` error). The child runs through `/bin/sh -c 'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"'`
  * (Node cannot set the environment after fork), so the argv[0] it sees is `command`; it gets `LISTEN_FDS=1`,
- * `LISTEN_FDNAMES=varlink`, fd 3 per `options.socket` (default a connected unix socket; `"listening"` also sets
- * `VARLINK_ADDRESS`), stdin from `/dev/null`, stdout on our stderr, stderr per `options.stderr`, and the
+ * `LISTEN_FDNAMES=varlink`, fd 3 per `options.socket` (default a connected unix socket, plus
+ * `VARLINK_JS_ACTIVATION=connected`; `"listening"` sets `VARLINK_ADDRESS` instead), stdin from `/dev/null`, stdout
+ * on our stderr, stderr per `options.stderr`, `/dev/null` on any other activation fd number we inherited, and the
  * environment of {@link SpawnProcessOptions.env} without the activation variables meant for us.
  *
  * Closing the connection destroys the transport and sends SIGTERM to a still-running child, SIGKILL after
  * `killTimeout`; `Connection.closed` resolves once the child exited (and the private directory of the listening
- * mode is removed). If the child exits on its own, the connection reads EOF and closes. The connect phase
+ * mode is removed). The connection closes on EOF too: a child that shuts its side down but keeps running is
+ * signalled then (sd-varlink kills its exec child too); one that already exited is not. The connect phase
  * (spawning, the listening-mode connect) is bounded by `timeout` and `signal` as in `connect()`; the child is
  * killed on either.
  */
