@@ -435,7 +435,9 @@ line/column) so ASTs can also be built by hand, and `validateInterface` checks t
   type), and systemd's rejection of empty `()` (`type T ()`, `[string]()`), which UAPI allows.
 - **Lenient** vs the UAPI grammar: zero-member interfaces (libvarlink and systemd accept them); whitespace,
   line breaks and comments before `,` (the PEG has no `_` there; it does allow `_*` before `)`); a final
-  comment without a trailing newline (PEG `comment` must end in `eol_r`; a final member without one is legal).
+  comment without a trailing newline (PEG `comment` must end in `eol_r`; a final member without one is legal);
+  a trailing comment after whitespace at the end of an interface or member line (PEG `eol` only allows a
+  comment directly after the code; libvarlink and systemd accept it too).
 - **Strict**: nothing between `?`/`[]`/`[string]` and their element (the PEG has no `_` there); every member
   keyword must follow a line break; `?any` parses (it is grammatical); nesting is capped at 64 levels
   (`too-deep`), so neither parser nor validator can overflow the stack.
@@ -805,7 +807,8 @@ without NUL → connection closed and memory bounded, wire output contains no `c
   quickly; otherwise manual.
 - **systemd**: 
   - CI (GitHub `ubuntu-latest` has systemd and `varlinkctl`; version to check in M5): `varlinkctl info`,
-    `introspect` and `call` against our test server, `varlinkctl validate-idl` on our formatter output, and
+    `introspect` and `call` against our test server, `varlinkctl validate-idl` on our formatter output (only for
+    inputs systemd itself accepts: not empty `()` / `[string]()`, nor the experimental-consistency shapes of §4.8), and
     our client against `/run/systemd/userdb/io.systemd.Multiplexer` (`GetUserRecord` with `more`).
   - UTM Linux VM (`~/oss/vm/README.md`, once available): a newer systemd for `--upgrade` (≥ 261),
     `exec:` against `/usr/lib/systemd/systemd-pcrextend`-style binaries, socket activation with

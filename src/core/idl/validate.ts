@@ -17,6 +17,9 @@ import { isFieldName, isInterfaceName, isMemberName } from "./names.ts";
 
 type Node = Record<string, unknown>;
 
+/** validateInterface() reports at most this many problems. */
+const MAX_ERRORS = 1000;
+
 function isNode(x: unknown): x is Node {
   return typeof x === "object" && x !== null;
 }
@@ -77,7 +80,8 @@ class Validator {
   private repeats = 0;
 
   add(code: IdlErrorCode, reason: string, position: Position | undefined): void {
-    this.errors.push(new IdlSyntaxError(code, reason, position));
+    // Bounded, so a huge hostile IDL can't make us build millions of Error objects only to throw the first.
+    if (this.errors.length < MAX_ERRORS) this.errors.push(new IdlSyntaxError(code, reason, position));
   }
 
   interface(iface: unknown): void {

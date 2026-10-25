@@ -54,10 +54,20 @@ interface InlineState {
 }
 
 function inline(type: Type, level: number, state: InlineState): string {
+  if (typeof type !== "object" || (type as unknown) === null) {
+    throw new IdlSyntaxError("invalid-ast", "type is not an object");
+  }
   if (!state.seen.has(type)) state.seen.add(type);
   else if (++state.repeats > MAX_AST_NODES) throw new IdlSyntaxError("invalid-ast", "AST too large");
   if (state.path.has(type)) throw new IdlSyntaxError("invalid-ast", "cyclic AST");
-  if (level > MAX_TYPE_DEPTH + 1) {
+  // Primitive and named leaves may sit one level below the deepest composite (as in the parser).
+  const leaf =
+    type.kind !== "struct" &&
+    type.kind !== "enum" &&
+    type.kind !== "array" &&
+    type.kind !== "map" &&
+    type.kind !== "nullable";
+  if (level > MAX_TYPE_DEPTH + (leaf ? 1 : 0)) {
     throw new IdlSyntaxError("too-deep", `types nested deeper than ${String(MAX_TYPE_DEPTH)} levels`);
   }
   state.path.add(type);

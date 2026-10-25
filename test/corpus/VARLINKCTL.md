@@ -22,5 +22,5 @@ few positives). We agree with systemd 255 on 33. The 7 differences all follow UA
 | `a: ?[]?string`                                         | accepted (grammar: `"?" "[]" type`)             | `Bad syntax`                   |
 | `interface a.b method A() -> ()` (one line)             | `expected-line-break` (UAPI `eol` after members) | accepted                       |
 | `method A() -> () method B() -> ()` (one line)          | `expected-line-break`                           | accepted                       |
-| comments inside `( … )`, after a member and at EOF (case35) | accepted (UAPI `_` allows comments between tokens) | `Bad syntax` at 7:3            |
+| comments inside `( … )`, after a member and at EOF (case35) | accepted (comments are UAPI `_`; the one after a member is lenient, §4.8) | `Bad syntax` at 7:3            |
 | `type T ()` (empty struct)                              | accepted (`struct = "(" ")"`)                   | `Bad syntax`                   |

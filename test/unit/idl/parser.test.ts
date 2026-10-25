@@ -559,3 +559,15 @@ describe("options", () => {
     assert.equal(parseError(`${H}type T (a: Missing)\n`).code, "unresolved-type");
   });
 });
+
+test("systemd markers only count inside the doc block (§4.8)", () => {
+  const detached = parseInterface("interface a.b\n\n# [Experimental]\n\ntype T (a: int)\n");
+  const m = detached.members[0];
+  assert.ok(m);
+  assert.equal(m.experimental, false);
+  assert.equal(m.doc, undefined);
+  const trailing = parseInterface("interface a.b\n\ntype T (a: int, # [Experimental]\n  b: int)\n");
+  const t = trailing.members[0];
+  assert.ok(t?.kind === "type" && t.type.kind === "struct");
+  assert.equal(t.type.fields[1]?.experimental, false);
+});

@@ -427,3 +427,23 @@ describe("formatInterface rejects invalid ASTs", () => {
     });
   }
 });
+
+test("formatType rejects non-object types and composites at depth MAX_TYPE_DEPTH + 1", () => {
+  const isCode = (code: string) => (e: unknown) => e instanceof IdlSyntaxError && e.code === code;
+  assert.throws(() => formatType({ kind: "array", element: "int" } as unknown as Type), isCode("invalid-ast"));
+  assert.throws(
+    () => formatType({ kind: "struct", fields: [{ name: "a", type: 5, experimental: false }] } as unknown as Type),
+    isCode("invalid-ast"),
+  );
+  const wrap = (inner: Type, n: number): Type => {
+    let t = inner;
+    for (let i = 0; i < n; i++) t = { kind: "array", element: t };
+    return t;
+  };
+  assert.equal(formatType(wrap({ kind: "int" }, MAX_TYPE_DEPTH)), "[]".repeat(MAX_TYPE_DEPTH) + "int");
+  assert.equal(
+    formatType(wrap({ kind: "struct", fields: [] }, MAX_TYPE_DEPTH - 1)),
+    "[]".repeat(MAX_TYPE_DEPTH - 1) + "()",
+  );
+  assert.throws(() => formatType(wrap({ kind: "struct", fields: [] }, MAX_TYPE_DEPTH)), isCode("too-deep"));
+});
