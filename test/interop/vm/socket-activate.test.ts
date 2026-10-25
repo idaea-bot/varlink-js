@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { connect, listRegistry } from "../../../src/node/index.ts";
-import { FIXTURE, needs, start, waitForPath, which, within } from "./helpers.ts";
+import { connectListening, FIXTURE, needs, start, waitForPath, which, within } from "./helpers.ts";
 
 const skip = needs("systemd-socket-activate");
 
@@ -40,7 +40,7 @@ describe("systemd-socket-activate", { skip }, () => {
       ]);
       try {
         await waitForPath(path);
-        const conn = await connect(`unix:${path}`, { timeout: 10_000 });
+        const conn = await connectListening(path);
         const reply = (await conn.call("org.example.vm.Ping")) as unknown as PingReply;
         assert.equal(reply.address, `unix:${path}`);
         assert.equal(typeof reply.pid, "number");
@@ -59,7 +59,7 @@ describe("systemd-socket-activate", { skip }, () => {
       await waitForPath(path);
       const pids = new Set<number>();
       for (let i = 0; i < 2; i++) {
-        const conn = await connect(`unix:${path}`, { timeout: 10_000 });
+        const conn = await connectListening(path);
         const reply = (await conn.call("org.example.vm.Ping")) as unknown as PingReply;
         // An accepted unix socket carries the listener's bound path in /proc/net/unix.
         assert.equal(reply.address, `unix:${path}`);
@@ -88,7 +88,7 @@ describe("systemd-socket-activate", { skip }, () => {
     ]);
     try {
       await waitForPath(path);
-      const conn = await connect(`unix:${path}`, { timeout: 10_000 });
+      const conn = await connectListening(path);
       await conn.call("org.example.vm.Ping");
       // serve() resolved before the call was answered? Not necessarily: wait for the entry.
       await waitForPath(join(reg, "org.example.vm"));

@@ -3,6 +3,8 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
 import { chmod, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
+import { connect } from "../../../src/node/index.ts";
+import type { Connection } from "../../../src/rpc/index.ts";
 
 /** Every child and wait is bounded by this (ms). */
 export const TIMEOUT: number = 10_000;
@@ -117,6 +119,24 @@ export async function waitForPath(path: string): Promise<void> {
   while (!existsSync(path)) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
     await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/**
+ * `connect(unix:<path>)` retried while it is refused: systemd-socket-activate creates the socket before it calls
+ * listen(), so a connect right after {@link waitForPath} can get ECONNREFUSED (seen on CI). A refused connect never
+ * reaches the accept queue, so retrying does not activate anything.
+ */
+export async function connectListening(path: string): Promise<Connection> {
+  const deadline = Date.now() + TIMEOUT;
+  for (;;) {
+    try {
+      return await connect(`unix:${path}`, { timeout: TIMEOUT });
+    } catch (e) {
+      const code = (e as { code?: unknown }).code;
+      if ((code !== "ECONNREFUSED" && code !== "ENOENT") || Date.now() > deadline) throw e;
+      await new Promise((r) => setTimeout(r, 20));
+    }
   }
 }
 
