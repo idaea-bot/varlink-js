@@ -351,16 +351,23 @@ class MergedListener implements Listener {
 }
 
 /**
- * A `/proc` address only if it still names a socket: /proc/net/unix shows the path a socket was *bound* to, which may
- * have been renamed or removed since (our own listen() and exec: listening mode bind under a temporary name), and a
- * dangling address would be published by `serve(listener, {registry})`. Abstract names and tcp are kept as they are.
+ * A `/proc` address only if it still names a socket (best effort): /proc/net/unix shows the path a socket was *bound*
+ * to, which may have been renamed or removed since (our own listen() and exec: listening mode bind under a temporary
+ * name), and a dangling address would be published by `serve(listener, {registry})`. A path that no longer exists
+ * (`ENOENT`/`ENOTDIR`) or is not a socket is dropped; one we cannot inspect (`EACCES`, …) is kept, since the
+ * service manager may have bound it where we cannot look. A relative bind path (relative to the binder's cwd) is
+ * dropped. That a socket is there does not prove it is ours (the sockfs inode in /proc cannot be compared with the
+ * file's). Abstract names and tcp are kept as they are.
  */
 function existingAddress(address: string | undefined): string | undefined {
-  if (address?.startsWith("unix:/") !== true) return address;
+  if (address === undefined || !address.startsWith("unix:") || address.startsWith("unix:@")) return address;
+  const path = address.slice("unix:".length);
+  if (!path.startsWith("/")) return undefined;
   try {
-    return lstatSync(address.slice("unix:".length)).isSocket() ? address : undefined;
-  } catch {
-    return undefined;
+    return lstatSync(path).isSocket() ? address : undefined;
+  } catch (e) {
+    const code = (e as { code?: unknown }).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? undefined : address;
   }
 }
 

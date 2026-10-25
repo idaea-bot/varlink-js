@@ -1615,7 +1615,9 @@ M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exit
   outcome (like `sd_listen_fds(1)`), before the options are validated, so also when those throw.
   fds 3… named `name` are used; with no `LISTEN_FDNAMES` a single fd is used. Per fd, `accept: "auto"` on Linux
   reads `/proc/self/fd/N` (`socket:[ino]`) and looks the inode up in `/proc/self/net/unix` (Flags `__SO_ACCEPTCON`
-  = listening; the Path column, the name at bind time, gives the address if a socket still exists there (else `fd:<n>`, so a renamed or removed bind path is never published), `@…` → `unix:@…`) and `tcp`/`tcp6` (st
+  = listening; the Path column, the name at bind time, gives the address, `@…` → `unix:@…`; best effort: an
+  absolute path is used only if a socket still exists there or we cannot look (`EACCES`), so a renamed, removed or
+  relative bind path gives `fd:<n>` instead of a dangling address) and `tcp`/`tcp6` (st
   `0A`). Those tables list only our network namespace: under `PrivateNetwork=yes` the sockets systemd made (an
   `Accept=yes` connection included) are in the host's, so an inode missing there is looked up in
   `/proc/1/net/{unix,tcp,tcp6}` (pid 1's namespace, where the service manager made it; read lazily, once per call).

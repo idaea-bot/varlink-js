@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync, readdirSync, readlinkSync } from "node:fs";
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { describe, test } from "node:test";
@@ -122,6 +122,36 @@ const ping = async (conn: Connection): Promise<PingReply> =>
   (await conn.call("org.example.child.Ping")) as unknown as PingReply;
 
 describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
+  test(
+    "the /proc bind path is the address while a socket is there; a non-socket there gives fd:<n>",
+    { skip: LINUX ? false : "needs Linux /proc" },
+    async () => {
+      // Bound directly at its path (no rename) and kept open until the child reported, so the path stays.
+      const path = join(dir(), "direct");
+      const server = createNetServer();
+      await listening(server, { path });
+      try {
+        const r = await report({ fds: [fdOf(server)], env: { LISTEN_FDS: "1" }, args: ["--accept=auto"] });
+        assert.equal(r.result, "listener");
+        assert.equal(r.address, `unix:${path}`);
+      } finally {
+        await closeServer(server);
+      }
+      // The bind path now holds a regular file: not our socket, so no address.
+      const other = join(dir(), "replaced");
+      const s2 = createNetServer();
+      await listening(s2, { path: other });
+      try {
+        await unlink(other);
+        await writeFile(other, "not a socket");
+        const r = await report({ fds: [fdOf(s2)], env: { LISTEN_FDS: "1" }, args: ["--accept=auto"] });
+        assert.equal(r.address, "fd:3");
+      } finally {
+        await closeServer(s2);
+      }
+    },
+  );
+
   test("a listening unix fd named varlink: served, variables unset, exits once idle", async () => {
     const s = await unixSocket("l1");
     const { child, exited } = activate({
