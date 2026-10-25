@@ -213,7 +213,7 @@ What to keep: the transport abstraction idea, typed method descriptors, async-fi
         └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-Rule: `src/core/**` and `src/rpc/**` (and the browser-facing `src/index.ts`, `src/idl`, `src/websocket`, `src/http`, plus the generated `src/interfaces`, which rpc may import for its built-in `org.varlink.service`) must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
+Rule: `src/core/**` and `src/rpc/**` (and the browser-facing `src/index.ts`, `src/idl`, `src/websocket`, `src/http`, plus the generated `src/interfaces`, which rpc and http may import for the built-in `org.varlink.service`) must not import `node:*` or read `process`/`Deno`/`Bun` globals (ESLint layer rules plus a no-`@types/node` typecheck, §8). That is what keeps
 the browser/Deno/Bun story honest.
 
 ### 4.1 ByteChannel (the transport interface)

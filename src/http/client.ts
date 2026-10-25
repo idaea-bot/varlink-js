@@ -82,7 +82,10 @@ export interface HttpClientOptions {
   validateReplies?: ValidateReplies;
   /** Default {@link jsonCodec}. */
   codec?: Codec;
-  /** Maps error replies to classes; default `createErrorRegistry()`. Descriptor error classes are added to it. */
+  /**
+   * Maps error replies to classes; default `createErrorRegistry()`. Descriptor error classes are added to it; the
+   * built-ins' core classes only under names that have no class in it yet (existing entries are kept).
+   */
   errors?: ErrorRegistry;
   /** Interfaces registered for validation at construction (descriptors or IDL text). */
   interfaces?: readonly (InterfaceDescriptor | string)[];
@@ -417,7 +420,7 @@ export class HttpClient {
    * and codec; a descriptor binds through `bindDescriptor` (DESIGN §4.9: one without `int` binds in either `ints`
    * mode) and its error classes are added to the error registry. The same name again: no-op for the same IDL text,
    * TypeError for a different one. The built-ins (`org.varlink.service` and the internal error interface) are
-   * registered at construction (their error classes fill the gaps of a user-supplied registry) and accept another IDL text if it is compatible: the built-in definition stays in
+   * registered at construction and accept another IDL text if it is compatible: the built-in definition stays in
    * charge of validation, and their error classes are added only under names that have no class yet.
    *
    * @throws {TypeError} on a different IDL under a taken name (for a built-in: an incompatible one), a descriptor

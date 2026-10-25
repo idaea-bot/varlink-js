@@ -10,10 +10,12 @@ import {
   ConnectionClosedError,
   ErrorRegistry,
   IntegerRangeError,
+  INTERNAL_ERROR_INTERFACE_IDL,
   type InterfaceDescriptor,
   InterfaceNotFoundError,
   InvalidParameterError,
   isVarlinkLocalError,
+  jsonCodec,
   MessageTooLargeError,
   MethodNotFoundError,
   OperationNotSupportedError,
@@ -363,6 +365,19 @@ describe("HTTP client: calls", () => {
         client.addInterface(other + "\nmethod Ping() -> ()\n");
       },
       (e) => e instanceof TypeError && /method Ping is not in the built-in definition/.test(e.message),
+    );
+    // The same through the interfaces option, and for the internal error interface.
+    assert.throws(() => createHttpClient(bridge.base, { interfaces: [other + "\nmethod Ping() -> ()\n"] }), TypeError);
+    const internal = INTERNAL_ERROR_INTERFACE_IDL.replace("interface ", "# Doc.\ninterface ");
+    createHttpClient(bridge.base, { interfaces: [internal] });
+    assert.throws(
+      () => createHttpClient(bridge.base, { interfaces: [INTERNAL_ERROR_INTERFACE_IDL + "\nerror Other ()\n"] }),
+      /error Other is not in the built-in definition/,
+    );
+    // A codec without lossless ints still cannot back a bigint client.
+    assert.throws(
+      () => createHttpClient(bridge.base, { ints: "bigint", codec: { ...jsonCodec, losslessInts: false } }),
+      OperationNotSupportedError,
     );
     // A user registry with its own class for a built-in error keeps it; the generated built-in fills only gaps.
     class MyNotFound extends VarlinkError<{ interface: string }> {
