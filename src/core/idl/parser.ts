@@ -226,7 +226,7 @@ class Parser {
         const type = this.parseType(level + 1);
         fields.push({ name: nameTok.text, type, ...info, span: this.span(nameTok.start), nameSpan });
       } else {
-        values.push({ name: nameTok.text, ...info, span: nameSpan });
+        values.push({ name: nameTok.text, ...info, span: nameSpan, nameSpan: { ...nameSpan } });
       }
       if (this.peek() === ")") break;
       this.expect(",", '"," or ")"');

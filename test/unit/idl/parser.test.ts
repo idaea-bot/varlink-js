@@ -111,6 +111,12 @@ describe("structure", () => {
       end: { offset: 28, line: 2, column: 15 },
     });
     assert.deepEqual(ast.span, { start: { offset: 0, line: 1, column: 1 }, end: { offset: 29, line: 2, column: 16 } });
+
+    const e = typeMember(parseInterface(`${H}type E (x, yy)\n`), "E");
+    const value = e.type.kind === "enum" ? e.type.values[1] : undefined;
+    const yy = { start: { offset: 25, line: 2, column: 12 }, end: { offset: 27, line: 2, column: 14 } };
+    assert.deepEqual(value?.span, yy);
+    assert.deepEqual(value.nameSpan, yy);
   });
 
   test("empty interface (zero members, deliberate leniency)", () => {

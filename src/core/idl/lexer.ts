@@ -1,6 +1,7 @@
-// Tokenizer for the varlink IDL. Lexes lazily (one token per next() call) so errors come out in source
-// order, and records per token the trivia that the parser needs: whitespace, line breaks, comments and
-// the doc block directly above the token.
+// Tokenizer for the varlink IDL. Lexes lazily (one token per next() call, the parser keeping one token of
+// lookahead), so a lexical error after the first syntax error is never reached; but the token after a name
+// is lexed before the parser checks that name, so a bad character right after a bad name wins. Records per
+// token the trivia that the parser needs: whitespace, line breaks, comments and the doc block above it.
 
 import type { Position, Span } from "./ast.ts";
 import { IdlSyntaxError } from "./errors.ts";

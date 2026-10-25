@@ -5,10 +5,12 @@ import {
   formatInterface,
   formatType,
   IdlSyntaxError,
+  MAX_TYPE_DEPTH,
   parseInterface,
   type Interface,
   type Type,
 } from "../../../src/core/idl/index.ts";
+import { stripSpans } from "./helpers.ts";
 
 const H = "interface a.b\n";
 
@@ -303,15 +305,79 @@ describe("formatType", () => {
     for (const [type, expected] of cases) assert.equal(formatType(type), expected);
   });
 
-  test("throws on unknown kinds and runaway nesting", () => {
+  test("throws on unknown kinds, empty enums and runaway nesting", () => {
     assert.throws(() => formatType({ kind: "uint" } as unknown as Type), IdlSyntaxError);
+    assert.throws(
+      () => formatType({ kind: "enum", values: [] }),
+      (e: unknown) => e instanceof IdlSyntaxError && e.code === "invalid-ast",
+    );
     let deep: Type = { kind: "int" };
     for (let i = 0; i < 10_000; i++) deep = { kind: "array", element: deep };
     assert.throws(
       () => formatType(deep),
-      (e: unknown) => e instanceof IdlSyntaxError && e.code === "invalid-ast",
+      (e: unknown) => e instanceof IdlSyntaxError && e.code === "too-deep",
     );
   });
+});
+
+describe("hand-built ASTs", () => {
+  test("an enum value with a stray type key is still an enum value", () => {
+    for (const stray of [undefined, { kind: "int" }]) {
+      const iface = {
+        kind: "interface",
+        name: "a.b",
+        experimental: false,
+        members: [
+          {
+            kind: "type",
+            name: "E",
+            experimental: false,
+            type: {
+              kind: "enum",
+              values: [
+                { name: "x", experimental: false, type: stray },
+                { name: "y", experimental: false },
+              ],
+            },
+          },
+        ],
+      } as Interface;
+      const out = formatInterface(iface);
+      assert.equal(out, "interface a.b\n\ntype E (x, y)\n", JSON.stringify(stray));
+      assert.equal(formatInterface(parseInterface(out)), out);
+    }
+  });
+});
+
+describe("round trip at the depth limit", () => {
+  const shapes: [string, (n: number) => string][] = [
+    ["nested structs", (n) => `${H}type A ${"(a: ".repeat(n)}int${")".repeat(n)}\n`],
+    ["prefix chain", (n) => `${H}type A (a: ${"[]".repeat(n)}int)\n`],
+  ];
+  const parses = (text: string): boolean => {
+    try {
+      parseInterface(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (const [what, make] of shapes) {
+    test(what, () => {
+      assert.ok(parses(make(1)));
+      let n = 1;
+      while (n < 1000 && parses(make(n + 1))) n++;
+      assert.ok(n >= MAX_TYPE_DEPTH - 1, String(n));
+      assert.throws(
+        () => parseInterface(make(n + 1)),
+        (e: unknown) => e instanceof IdlSyntaxError && e.code === "too-deep",
+      );
+      const ast = parseInterface(make(n));
+      const out = formatInterface(ast);
+      assert.deepEqual(stripSpans(parseInterface(out)), stripSpans(ast));
+      assert.equal(formatInterface(parseInterface(out)), out, "not a fixpoint");
+    });
+  }
 });
 
 describe("formatInterface rejects invalid ASTs", () => {

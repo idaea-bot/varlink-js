@@ -2,8 +2,11 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  formatInterface,
+  formatType,
   IdlSyntaxError,
   MAX_TYPE_DEPTH,
+  parseInterface,
   validateInterface,
   type IdlErrorCode,
   type Interface,
@@ -338,11 +341,37 @@ describe("validateInterface on hand-built ASTs", () => {
     }
   });
 
+  test("more/upgrade only on methods", () => {
+    const typeWith = (fieldExtra: Record<string, unknown>, valueExtra: Record<string, unknown>): Interface =>
+      ok([
+        {
+          kind: "type",
+          name: "T",
+          experimental: false,
+          type: struct([
+            field("a", { kind: "enum", values: [{ name: "x", experimental: false, ...valueExtra }] }, fieldExtra),
+          ]),
+        },
+      ]);
+    assert.deepEqual(codes(ok([], { more: "supports" })), ["invalid-ast"]);
+    assert.deepEqual(codes(ok([], { upgrade: "requires" })), ["invalid-ast"]);
+    assert.deepEqual(codes(typeWith({ more: "supports" }, {})), ["invalid-ast"]);
+    assert.deepEqual(codes(typeWith({}, { upgrade: "requires" })), ["invalid-ast"]);
+    assert.deepEqual(codes(typeWith({}, {})), []);
+  });
+
+  test("docs must be well-formed UTF-16", () => {
+    for (const bad of ["\u{D800}", "a\u{DC00}b", "x\n\u{DBFF}"]) {
+      assert.deepEqual(codes(ok([], { doc: bad })), ["invalid-doc"], JSON.stringify(bad));
+    }
+    assert.deepEqual(codes(ok([], { doc: "\u{1F600}" })), []);
+  });
+
   test("deep and cyclic types stop at MAX_TYPE_DEPTH", () => {
     let deep: Type = { kind: "int" };
     for (let i = 0; i < 100_000; i++) deep = { kind: "array", element: deep };
     const iface = ok([{ kind: "type", name: "T", experimental: false, type: struct([field("a", deep)]) }]);
-    assert.deepEqual(codes(iface), ["invalid-ast"]);
+    assert.deepEqual(codes(iface), ["too-deep"]);
 
     const cyclic: Record<string, unknown> = { kind: "struct", fields: [] };
     (cyclic.fields as unknown[]).push(field("self", cyclic));
@@ -357,8 +386,75 @@ describe("validateInterface on hand-built ASTs", () => {
     );
     chain = { kind: "array", element: chain };
     assert.deepEqual(codes(ok([{ kind: "type", name: "T", experimental: false, type: struct([field("a", chain)]) }])), [
-      "invalid-ast",
+      "too-deep",
     ]);
+  });
+
+  const isInvalidAst =
+    (reason: RegExp) =>
+    (e: unknown): boolean =>
+      e instanceof IdlSyntaxError && e.code === "invalid-ast" && reason.test(e.reason);
+
+  test("a cycle is invalid-ast, in validateInterface and formatType", () => {
+    const self: Record<string, unknown> = { kind: "struct", fields: [] };
+    self.fields = [field("a", self), field("b", self)];
+    const started = performance.now();
+    const errors = validateInterface(ok([{ kind: "type", name: "T", experimental: false, type: self }]));
+    assert.deepEqual(
+      errors.map((e) => [e.code, e.reason]),
+      [
+        ["invalid-ast", "cyclic AST"],
+        ["invalid-ast", "cyclic AST"],
+      ],
+    );
+    assert.throws(() => formatType(self as unknown as Type), isInvalidAst(/^cyclic AST$/));
+    assert.ok(performance.now() - started < 2_000);
+  });
+
+  test("a heavily shared AST is invalid-ast (too large), quickly", () => {
+    // 40 levels, each with two fields pointing at the same next level: 2^40 paths, 41 objects.
+    let level: unknown = { kind: "int" };
+    for (let i = 0; i < 40; i++) level = struct([field("a", level), field("b", level)]);
+    const started = performance.now();
+    const errors = validateInterface(ok([{ kind: "type", name: "T", experimental: false, type: level }]));
+    assert.deepEqual(
+      errors.map((e) => [e.code, e.reason]),
+      [["invalid-ast", "AST too large"]],
+    );
+    assert.throws(() => formatType(level as Type), isInvalidAst(/^AST too large$/));
+    assert.throws(
+      () => formatInterface(ok([{ kind: "type", name: "T", experimental: false, type: level }])),
+      isInvalidAst(/^AST too large$/),
+    );
+    assert.ok(performance.now() - started < 2_000, String(performance.now() - started));
+  });
+
+  test("shared, non-cyclic subtrees are valid", () => {
+    const int = { kind: "int" };
+    const shared = struct([field("x", int), field("y", int)]);
+    const iface = ok([
+      { kind: "type", name: "T", experimental: false, type: struct([field("a", int), field("b", int)]) },
+      { kind: "type", name: "U", experimental: false, type: shared },
+      { kind: "error", name: "E", experimental: false, type: shared },
+      { kind: "method", name: "M", experimental: false, input: shared, output: struct([field("s", shared)]) },
+    ]);
+    assert.deepEqual(codes(iface), []);
+    assert.equal(
+      formatInterface(iface),
+      `interface a.b
+
+type T (a: int, b: int)
+
+type U (x: int, y: int)
+
+error E (x: int, y: int)
+
+method M(x: int, y: int) -> (
+  s: (x: int, y: int)
+)
+`,
+    );
+    assert.equal(formatType(shared as Type), "(x: int, y: int)");
   });
 
   test("sorted by position when known", () => {
@@ -386,4 +482,11 @@ describe("validateInterface on hand-built ASTs", () => {
       ],
     );
   });
+});
+
+test("a large parsed interface never hits the shared-node budget", () => {
+  // MAX_AST_NODES only counts repeat visits of shared nodes, which the parser never produces.
+  const fields = Array.from({ length: 400_000 }, (_, i) => `a${String(i)}: ?[]int`).join(", ");
+  const iface = parseInterface(`interface a.b\ntype A (${fields})\n`);
+  assert.deepEqual(validateInterface(iface), []);
 });

@@ -138,6 +138,8 @@ export interface EnumValue {
   doc?: string;
   experimental: boolean;
   span?: Span;
+  /** Same range as `span` (a value is just its name); present for symmetry with {@link Field}. */
+  nameSpan?: Span;
 }
 
 /** The primitive type keywords. */
@@ -145,6 +147,13 @@ export const PRIMITIVE_KINDS: readonly PrimitiveType["kind"][] = ["bool", "int",
 
 /** Maximum nesting of parenthesised types and `?`/`[]`/`[string]` prefixes (a member's own struct is level 1). */
 export const MAX_TYPE_DEPTH: number = 64;
+
+/**
+ * Most repeat visits of an already-visited type node that validateInterface() and formatType() allow, so
+ * hand-built ASTs with heavily shared subtrees cannot make them exponential. Parsed ASTs never share nodes,
+ * so they never count against it, whatever their size. Not re-exported by index.ts.
+ */
+export const MAX_AST_NODES: number = 1_000_000;
 
 /** systemd annotation comment lines (sd-varlink-idl.c), part of systemd's API. */
 export const EXPERIMENTAL_MARKER = "[Experimental]";

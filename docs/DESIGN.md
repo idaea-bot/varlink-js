@@ -419,15 +419,23 @@ systemd before shipping M8.*
 `map` (`[string]T`) and `nullable` (`?T`). Interfaces, members, fields and enum values carry `doc?` (lines
 joined by `\n`) and `experimental`; parsed nodes carry optional `span`/`nameSpan` (UTF-16 offset, 1-based
 line/column) so ASTs can also be built by hand, and `validateInterface` checks those like untrusted input.
-- **Doc comments** (libvarlink): the block of full-line comments on the lines directly above an item whose
-  token is first on its line; `#` and one space are stripped. Blank lines detach; trailing comments and
-  comments elsewhere are not doc and are **dropped** (the formatter cannot keep them).
+- **Doc comments** (libvarlink-like): the block of full-line comments on the lines directly above an item
+  whose token is first on its line; `#` and one space are stripped. Blank lines detach; trailing comments and
+  comments elsewhere are not doc and are **dropped** (the formatter cannot keep them). Unlike libvarlink, a
+  whitespace-only line detaches too (libvarlink only detaches on a truly empty line), and a trailing comment
+  never starts a doc block (libvarlink would prepend it).
 - **systemd markers** (sd-varlink-idl.c, "part of the API"): doc lines `[Experimental]` (any item) and, on
   methods, `[Supports|Requires 'more' flag]` / `[Supports|Requires 'upgrade' flag]` become flags and leave
-  `doc`; "requires" wins. Validation rejects doc lines that would read back as markers.
+  `doc`; "requires" wins. Validation rejects doc lines that would read back as markers. systemd also carries
+  `[Experimental]` across blank lines and from trailing comments; we only read markers inside the doc block
+  (real systemd output never relies on that).
+- **Not enforced** (systemd-only rules; UAPI has none): `validate-idl`'s experimental consistency
+  (`varlink_idl_field_consistent`: an experimental field in a non-experimental symbol must be nullable, no
+  experimental values in a non-experimental enum, a non-experimental field must not reference an experimental
+  type), and systemd's rejection of empty `()` (`type T ()`, `[string]()`), which UAPI allows.
 - **Lenient** vs the UAPI grammar: zero-member interfaces (libvarlink and systemd accept them); whitespace,
-  line breaks and comments before `,` and `)` (the PEG has no `_` there); a final comment or member without
-  a trailing newline.
+  line breaks and comments before `,` (the PEG has no `_` there; it does allow `_*` before `)`); a final
+  comment without a trailing newline (PEG `comment` must end in `eol_r`; a final member without one is legal).
 - **Strict**: nothing between `?`/`[]`/`[string]` and their element (the PEG has no `_` there); every member
   keyword must follow a line break; `?any` parses (it is grammatical); nesting is capped at 64 levels
   (`too-deep`), so neither parser nor validator can overflow the stack.

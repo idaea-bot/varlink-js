@@ -4,6 +4,7 @@
 
 import {
   EXPERIMENTAL_MARKER,
+  MAX_AST_NODES,
   MAX_TYPE_DEPTH,
   MORE_MARKERS,
   UPGRADE_MARKERS,
@@ -38,16 +39,34 @@ export function formatInterface(iface: Interface): string {
 /**
  * Formats a type on a single line without comments, e.g. `?[](a: int, b: string)`. Names are not checked.
  *
- * @throws {IdlSyntaxError} (`invalid-ast`) for an unknown kind or nesting deeper than {@link MAX_TYPE_DEPTH}.
+ * @throws {IdlSyntaxError} `invalid-ast` for an unknown kind, an empty enum, a cycle or a hugely shared
+ * subtree; `too-deep` for nesting deeper than {@link MAX_TYPE_DEPTH}.
  */
 export function formatType(type: Type): string {
-  return inline(type, 1);
+  return inline(type, 1, { path: new Set(), seen: new WeakSet(), repeats: 0 });
 }
 
-function inline(type: Type, level: number): string {
+/** Nodes on the current path, nodes visited and repeat visits of shared nodes, as in validateInterface(). */
+interface InlineState {
+  readonly path: Set<Type>;
+  readonly seen: WeakSet<Type>;
+  repeats: number;
+}
+
+function inline(type: Type, level: number, state: InlineState): string {
+  if (!state.seen.has(type)) state.seen.add(type);
+  else if (++state.repeats > MAX_AST_NODES) throw new IdlSyntaxError("invalid-ast", "AST too large");
+  if (state.path.has(type)) throw new IdlSyntaxError("invalid-ast", "cyclic AST");
   if (level > MAX_TYPE_DEPTH + 1) {
-    throw new IdlSyntaxError("invalid-ast", `types nested deeper than ${String(MAX_TYPE_DEPTH)} levels`);
+    throw new IdlSyntaxError("too-deep", `types nested deeper than ${String(MAX_TYPE_DEPTH)} levels`);
   }
+  state.path.add(type);
+  const out = inlineNode(type, level, state);
+  state.path.delete(type);
+  return out;
+}
+
+function inlineNode(type: Type, level: number, state: InlineState): string {
   switch (type.kind) {
     case "bool":
     case "int":
@@ -59,14 +78,15 @@ function inline(type: Type, level: number): string {
     case "named":
       return type.name;
     case "array":
-      return "[]" + inline(type.element, level + 1);
+      return "[]" + inline(type.element, level + 1, state);
     case "map":
-      return "[string]" + inline(type.element, level + 1);
+      return "[string]" + inline(type.element, level + 1, state);
     case "nullable":
-      return "?" + inline(type.element, level + 1);
+      return "?" + inline(type.element, level + 1, state);
     case "struct":
-      return "(" + type.fields.map((f) => `${f.name}: ${inline(f.type, level + 1)}`).join(", ") + ")";
+      return "(" + type.fields.map((f) => `${f.name}: ${inline(f.type, level + 1, state)}`).join(", ") + ")";
     case "enum":
+      if (type.values.length === 0) throw new IdlSyntaxError("invalid-ast", "an enum needs at least one value");
       return "(" + type.values.map((v) => v.name).join(", ") + ")";
     default:
       throw new IdlSyntaxError("invalid-ast", `unknown type kind ${describeValue((type as { kind: unknown }).kind)}`);
@@ -103,6 +123,12 @@ function formatMember(member: Member): string {
       return `${comments}method ${member.name}${parens(member.input, 0)} -> ${parens(member.output, 0)}`;
     case "error":
       return `${comments}error ${member.name} ${parens(member.type, 0)}`;
+    default:
+      // Unreachable after validation, unless the AST changed in between.
+      throw new IdlSyntaxError(
+        "invalid-ast",
+        `unknown member kind ${describeValue((member as { kind: unknown }).kind)}`,
+      );
   }
 }
 
@@ -140,7 +166,9 @@ function nested(type: Type, level: number): string {
  */
 function parens(type: StructType | EnumType, level: number): string {
   const items: readonly (Field | EnumValue)[] = type.kind === "struct" ? type.fields : type.values;
-  const item = (i: Field | EnumValue): string => ("type" in i ? `${i.name}: ${nested(i.type, level + 1)}` : i.name);
+  // Decided by the parent's kind, so an enum value with a stray `type` key still prints as an enum value.
+  const item = (i: Field | EnumValue): string =>
+    type.kind === "struct" ? `${i.name}: ${nested((i as Field).type, level + 1)}` : i.name;
   if (!isMultiline(type)) return "(" + items.map(item).join(", ") + ")";
   const indent = INDENT.repeat(level + 1);
   let out = "(";

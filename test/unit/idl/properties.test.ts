@@ -216,10 +216,12 @@ describe("whitespace and comment insertion", () => {
           const anchors = tokenize(text)
             .filter((t) => t.kind !== "eof" && !PREFIXES.has(t.kind))
             .map((t) => t.end.offset);
+          // At most one insertion per anchor (the first): concatenating two could put a trailing comment
+          // after a line break, where it becomes a full-line comment and so a doc (see the test below).
           const byOffset = new Map<number, string>();
           for (const [n, s] of inserts) {
             const offset = anchors[n % anchors.length];
-            if (offset !== undefined) byOffset.set(offset, (byOffset.get(offset) ?? "") + s);
+            if (offset !== undefined && !byOffset.has(offset)) byOffset.set(offset, s);
           }
           let mutated = "";
           let last = 0;
@@ -233,6 +235,23 @@ describe("whitespace and comment insertion", () => {
       ),
       params(400),
     );
+  });
+
+  test("a trailing comment after a line break becomes a doc (why insertions are not concatenated)", () => {
+    const text = "interface a.b\ntype T (a: int, b: int)\n";
+    const comma = text.indexOf(",") + 1;
+    const insert = (s: string): string => text.slice(0, comma) + s + text.slice(comma);
+    const fieldB = (source: string): unknown => {
+      const t = parseInterface(source).members[0];
+      return t?.kind === "type" && t.type.kind === "struct" ? stripSpans(t.type.fields[1]) : undefined;
+    };
+    assert.deepEqual(fieldB(insert(" #k\n")), { name: "b", type: { kind: "int" }, experimental: false });
+    assert.deepEqual(fieldB(insert("\n" + " #k\n")), {
+      name: "b",
+      type: { kind: "int" },
+      doc: "k",
+      experimental: false,
+    });
   });
 });
 

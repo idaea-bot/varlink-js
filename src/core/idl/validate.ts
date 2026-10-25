@@ -1,8 +1,10 @@
 // Semantic checks on an AST, parsed or hand-built. Hand-built ASTs are treated as untrusted input
-// (any shape), so everything is checked through `unknown` and recursion stops at MAX_TYPE_DEPTH.
+// (any shape, cycles, shared subtrees), so everything is checked through `unknown`, recursion stops at
+// MAX_TYPE_DEPTH or at a node already on the path, and shared nodes are revisited at most MAX_AST_NODES times.
 
 import {
   EXPERIMENTAL_MARKER,
+  MAX_AST_NODES,
   MAX_TYPE_DEPTH,
   MORE_MARKERS,
   PRIMITIVE_KINDS,
@@ -45,8 +47,8 @@ const COMMENT_BREAKING = new RegExp(`[\r${String.fromCharCode(0x2028, 0x2029)}]`
 
 /**
  * Checks what the AST types cannot express: name grammars, unique names, resolvable type references,
- * no `??T`, non-empty enums, structs where the grammar needs them, nesting depth, and doc strings that
- * survive a format/parse round trip. Never throws.
+ * no `??T`, non-empty enums, structs where the grammar needs them, nesting depth, no cycles, a bounded
+ * size, and doc strings that survive a format/parse round trip. Never throws.
  *
  * @returns all problems, sorted by position where known (errors without a position come last); `[]` if valid.
  */
@@ -68,6 +70,11 @@ class Validator {
   readonly errors: IdlSyntaxError[] = [];
   /** Member name → kind of its first declaration. */
   private readonly members = new Map<string, unknown>();
+  /** Composite type nodes on the current recursion path. */
+  private readonly path = new Set<Node>();
+  /** Type nodes visited so far, and how often an already-visited (shared) node was visited again. */
+  private readonly seen = new WeakSet<object>();
+  private repeats = 0;
 
   add(code: IdlErrorCode, reason: string, position: Position | undefined): void {
     this.errors.push(new IdlSyntaxError(code, reason, position));
@@ -134,9 +141,6 @@ class Validator {
       default:
         this.add("invalid-ast", `unknown member kind ${describeValue(member.kind)}`, position);
     }
-    if (!method && (member.more !== undefined || member.upgrade !== undefined)) {
-      this.add("invalid-ast", "more/upgrade are only allowed on methods", position);
-    }
   }
 
   private struct(type: unknown, what: string, position: Position | undefined): void {
@@ -144,16 +148,20 @@ class Validator {
     else this.type(type, 1);
   }
 
-  /** `doc` and `experimental` of interfaces, members, fields and enum values. */
+  /** `doc`, `experimental` and (methods only) `more`/`upgrade` of interfaces, members, fields and enum values. */
   private common(node: Node, method: boolean): void {
     const position = spanStart(node, "span") ?? namePosition(node);
     if (typeof node.experimental !== "boolean") this.add("invalid-ast", "experimental is not a boolean", position);
+    if (!method && (node.more !== undefined || node.upgrade !== undefined)) {
+      this.add("invalid-ast", "more/upgrade are only allowed on methods", position);
+    }
     const { doc } = node;
     if (doc === undefined) return;
     if (typeof doc !== "string") {
       this.add("invalid-ast", "doc is not a string", position);
       return;
     }
+    if (!doc.isWellFormed()) this.add("invalid-doc", "doc contains a lone surrogate", position);
     if (COMMENT_BREAKING.test(doc)) {
       this.add("invalid-doc", "doc contains a line break other than \\n", position);
     }
@@ -165,6 +173,14 @@ class Validator {
   }
 
   private type(type: unknown, level: number): void {
+    if (this.repeats > MAX_AST_NODES) return;
+    if (isNode(type)) {
+      if (!this.seen.has(type)) this.seen.add(type);
+      else if (++this.repeats > MAX_AST_NODES) {
+        this.add("invalid-ast", "AST too large", undefined);
+        return;
+      }
+    }
     if (!isNode(type)) {
       this.add("invalid-ast", "type is not an object", undefined);
       return;
@@ -180,10 +196,15 @@ class Validator {
       this.add("invalid-ast", `unknown type kind ${describeValue(kind)}`, position);
       return;
     }
-    if (level > MAX_TYPE_DEPTH) {
-      this.add("invalid-ast", `types nested deeper than ${String(MAX_TYPE_DEPTH)} levels`, position);
+    if (this.path.has(type)) {
+      this.add("invalid-ast", "cyclic AST", position);
       return;
     }
+    if (level > MAX_TYPE_DEPTH) {
+      this.add("too-deep", `types nested deeper than ${String(MAX_TYPE_DEPTH)} levels`, position);
+      return;
+    }
+    this.path.add(type);
     if (kind === "struct") {
       this.items(type.fields, "fields", true, level, position);
     } else if (kind === "enum") {
@@ -195,6 +216,7 @@ class Validator {
       }
       this.type(element, level + 1);
     }
+    this.path.delete(type);
   }
 
   private named(type: Node, position: Position | undefined): void {
