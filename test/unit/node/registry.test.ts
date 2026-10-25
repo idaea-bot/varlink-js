@@ -2,7 +2,7 @@
 // serve(listen(unix), {registry}) end to end. Filesystem only: runs on Linux and macOS.
 import assert from "node:assert/strict";
 import { lstatSync, readdirSync, readlinkSync } from "node:fs";
-import { mkdir, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readlink, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { join, relative } from "node:path";
 import { describe, test } from "node:test";
@@ -18,7 +18,7 @@ import {
   resolveInterface,
 } from "../../../src/node/index.ts";
 import { createServer } from "../../../src/rpc/index.ts";
-import { closeServer, listening, tempDir } from "./helpers.ts";
+import { closeServer, listening, realpathOf, tempDir } from "./helpers.ts";
 
 const dir = tempDir();
 let seq = 0;
@@ -105,7 +105,7 @@ describe("listRegistry", () => {
         {
           interface: "org.example.zeta",
           address: `unix:${join(reg, "org.example.zeta")}`,
-          target: await realpath(target),
+          target: await realpathOf(target),
         },
       ]);
     } finally {
@@ -120,7 +120,7 @@ describe("listRegistry", () => {
     const live = await liveSocket(target);
     try {
       await symlink(target, join(reg, "org.example.long"));
-      const real = await realpath(target);
+      const real = await realpathOf(target);
       const [entry] = await listRegistry({ directory: reg });
       assert.equal(entry?.address, `unix:${real}`);
       const address = await resolveInterface("org.example.long", { directory: reg, resolver: false });
@@ -308,8 +308,8 @@ describe("serve(listen(unix), {registry}) end to end", () => {
     assert.deepEqual(
       entries.map((e) => [e.interface, e.target]),
       [
-        ["org.example.rega", await realpath(path)],
-        ["org.example.regb", await realpath(path)],
+        ["org.example.rega", await realpathOf(path)],
+        ["org.example.regb", await realpathOf(path)],
       ],
     );
     const address = await resolveInterface("org.example.rega", { directory: reg, resolver: false });

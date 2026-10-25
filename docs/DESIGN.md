@@ -465,6 +465,12 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
   the compiled-dist consumer fixture (Node only). Browsers: the websocket/http subpaths are lint- and
   typecheck-guarded (no `node:`, no runtime globals, `.d.ts` without DOM types) but no browser runs them yet
   (Playwright smoke test not done; M10 leftover).
+  M8 on Bun/Deno: the registry, resolver, `mergeListeners`, `/proc` parser, stdio and `listen({fd}, {address})` tests
+  run on both (Bun on macOS refuses `realpath()` of a socket with `EOPNOTSUPP`; the registry resolves such paths by
+  hand). The spawned-child paths — `exec:`, `connectBridge`, the ssh kinds and the activated-child fixtures — fail
+  in both runtimes' `node:child_process` compat (Bun: the child's fd-3 socketpair connection closes at once; Deno:
+  child fixtures and `exec:` children) and are skipped there (`SPAWN_SKIP` in `test/unit/node/helpers.ts`): Node
+  only for now, tracked by an M8 follow-up card.
 - **Browser**: `varlink-js/websocket` (WebSocket mode against systemd's `varlink-http-bridge` or any
   UAPI bridge). It's standardised now, so it is worth doing. No fds, as the spec says.
 - **fd passing / peer credentials**: no JS runtime exposes `SCM_RIGHTS` or `SO_PEERCRED`. Plan: a

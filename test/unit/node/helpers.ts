@@ -1,8 +1,8 @@
 // Shared helpers for the Node adapter tests: temp dirs and connected socket pairs.
-import { mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readlink, realpath, rm } from "node:fs/promises";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { after, before } from "node:test";
 
 /** A fresh `vj-` temp dir for the current file, removed in `after`. Call at module level. */
@@ -77,3 +77,30 @@ export async function tcpPair(): Promise<{ client: Socket; server: Socket; close
 export async function turns(n: number): Promise<void> {
   for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve));
 }
+
+/**
+ * `realpath()` that also works for a socket where the runtime refuses it (Bun on macOS: EOPNOTSUPP): the directory is
+ * made real and the last name kept (after following a final symlink chain).
+ */
+export async function realpathOf(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    let current = resolve(path);
+    for (let hops = 0; hops < 40 && (await lstat(current)).isSymbolicLink(); hops++)
+      current = resolve(dirname(current), await readlink(current));
+    return join(await realpath(dirname(current)), basename(current));
+  }
+}
+
+/**
+ * Why the spawn/activation tests skip on this runtime, or false on Node. Under Bun and Deno the spawned-child paths
+ * (exec: socketpair at fd 3, child fixtures, stdio bridges) fail in their node:child_process compat (M8; follow-up
+ * card for Bun/Deno support).
+ */
+export const SPAWN_SKIP: string | false =
+  process.versions.bun !== undefined
+    ? "Bun: spawned-child transports and activation are Node-only for now (M8 follow-up)"
+    : "Deno" in globalThis
+      ? "Deno: spawned-child transports and activation are Node-only for now (M8 follow-up)"
+      : false;

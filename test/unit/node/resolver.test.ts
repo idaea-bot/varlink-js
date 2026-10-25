@@ -1,7 +1,7 @@
 // org.varlink.resolver client and resolveInterface (DESIGN.md §4.6), against a JS resolver on a temp unix socket.
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdir, realpath, symlink } from "node:fs/promises";
+import { mkdir, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import {
@@ -20,7 +20,7 @@ import {
   type NodeListener,
 } from "../../../src/node/index.ts";
 import { createServer, type Server } from "../../../src/rpc/index.ts";
-import { tempDir } from "./helpers.ts";
+import { realpathOf, tempDir } from "./helpers.ts";
 
 const dir = tempDir();
 // Unique names: on a Linux host /run/varlink/registry may exist and is searched by the "auto" scope.
@@ -242,7 +242,7 @@ describe("org.varlink.resolver", () => {
         // Through the entry, unless its path does not fit in sun_path (macOS temp dirs are long): then the target.
         const entry = join(runtime, "varlink", "registry", name);
         const fits = Buffer.byteLength(entry) <= (process.platform === "linux" ? 107 : 103);
-        const target = await realpath(good.listener.address.slice("unix:".length));
+        const target = await realpathOf(good.listener.address.slice("unix:".length));
         const expected = `unix:${fits ? entry : target}`;
         assert.equal(await resolveInterface(name, { scope: "user", resolver: false }), expected);
         assert.equal(await resolveInterface(name, { resolver: false }), expected);

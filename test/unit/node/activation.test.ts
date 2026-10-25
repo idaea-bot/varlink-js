@@ -12,7 +12,7 @@ import { procLookup, procSockets } from "../../../src/node/activation.ts";
 import { connect, fromNodeSocket, listen, listenStdio, mergeListeners } from "../../../src/node/index.ts";
 import { createConnection, createServer, type Connection } from "../../../src/rpc/index.ts";
 import { pair } from "../../../src/testing/index.ts";
-import { closeServer, listening, tempDir, turns } from "./helpers.ts";
+import { closeServer, listening, tempDir, turns, SPAWN_SKIP } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "activation-child.ts");
@@ -121,7 +121,7 @@ interface PingReply {
 const ping = async (conn: Connection): Promise<PingReply> =>
   (await conn.call("org.example.child.Ping")) as unknown as PingReply;
 
-describe("listenFromEnv in an activated child", () => {
+describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
   test("a listening unix fd named varlink: served, variables unset, exits once idle", async () => {
     const s = await unixSocket("l1");
     const { child, exited } = activate({

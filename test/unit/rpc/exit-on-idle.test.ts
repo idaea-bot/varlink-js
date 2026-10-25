@@ -88,17 +88,24 @@ describe("exitOnIdle", () => {
     await s.closed;
   });
 
-  test("no timers once shut down (shutdown before expiry)", async () => {
-    const timeouts = (): number => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
-    const baseline = timeouts();
-    // Long enough that only clearing it (not its expiry) can make it go away within the test.
-    const s = server(60_000);
-    s.serve(new MemoryListener());
-    assert.equal(timeouts(), baseline + 1, "the idle timer is armed");
-    await s.shutdown();
-    await s.closed;
-    assert.equal(timeouts(), baseline, "and cleared by the shutdown");
-  });
+  test(
+    "no timers once shut down (shutdown before expiry)",
+    // process.getActiveResourcesInfo() is Node's; Bun and Deno do not report Timeouts through it.
+    {
+      skip: process.versions.bun !== undefined || "Deno" in globalThis ? "needs Node's getActiveResourcesInfo" : false,
+    },
+    async () => {
+      const timeouts = (): number => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+      const baseline = timeouts();
+      // Long enough that only clearing it (not its expiry) can make it go away within the test.
+      const s = server(60_000);
+      s.serve(new MemoryListener());
+      assert.equal(timeouts(), baseline + 1, "the idle timer is armed");
+      await s.shutdown();
+      await s.closed;
+      assert.equal(timeouts(), baseline, "and cleared by the shutdown");
+    },
+  );
 });
 
 describe("Server.closed", () => {

@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, stat, symlink, unlink } from "node:fs/promises";
 import { connect as netConnect } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { formatAddress, parseAddress } from "../core/address/parse.ts";
 import { safeQuote, ValidationError } from "../core/errors/local.ts";
 import { InterfaceNotFoundError } from "../core/errors/standard.ts";
@@ -135,10 +135,28 @@ async function socketOf(entry: string): Promise<string | undefined> {
     const st = await lstat(entry);
     if (st.isSocket()) return entry;
     if (!st.isSymbolicLink() || !(await stat(entry)).isSocket()) return undefined;
-    return await realpath(entry);
+    return await realpathOf(entry);
   } catch {
     return undefined;
   }
+}
+
+/**
+ * `realpath(path)`, by hand where the runtime refuses it for a socket (Bun on macOS answers EOPNOTSUPP): the
+ * symlinks are followed (at most 40, like the kernel), then the directory is made real and the last name kept.
+ */
+async function realpathOf(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (e) {
+    if (codeOf(e) !== "EOPNOTSUPP" && codeOf(e) !== "ENOTSUP") throw e;
+  }
+  let current = resolve(path);
+  for (let hops = 0; hops < 40; hops++) {
+    if (!(await lstat(current)).isSymbolicLink()) return join(await realpath(dirname(current)), basename(current));
+    current = resolve(dirname(current), await readlink(current));
+  }
+  throw Object.assign(new Error(`too many symbolic links: ${path}`), { code: "ELOOP", path });
 }
 
 /**
@@ -307,13 +325,14 @@ async function isStaleSocket(path: string): Promise<boolean> {
 /** What is at a registry entry, from our point of view. */
 type EntryState = "gone" | "ours" | "stale" | { conflict: string };
 
-/** Whether the symlink `entry` leads to `target`: spelled the same, or resolving to the same file (`realpath`). */
+/** Whether the symlink `entry` leads to `target`: spelled the same, or resolving to the same file (dev + inode). */
 async function linksTo(entry: string, target: string): Promise<boolean> {
   const link = await readlinkOf(entry);
   if (link === undefined) return false;
   if (link === target) return true;
   try {
-    return (await realpath(entry)) === (await realpath(target));
+    const [a, b] = await Promise.all([stat(entry), stat(target)]);
+    return a.dev === b.dev && a.ino === b.ino;
   } catch {
     return false; // dangling, or the target is gone
   }

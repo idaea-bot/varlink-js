@@ -11,7 +11,7 @@ import { CallTimeoutError } from "../../../src/core/errors/index.ts";
 import { connect, connectBridge, connectExec, listen } from "../../../src/node/index.ts";
 import { openBridge, openSpawned, splitCommandLine } from "../../../src/node/spawn.ts";
 import { createServer, type Connection } from "../../../src/rpc/index.ts";
-import { tempDir } from "./helpers.ts";
+import { tempDir, SPAWN_SKIP } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "activation-child.ts");
@@ -54,7 +54,7 @@ const exitOf = (child: { once(ev: "exit", cb: (code: number | null, signal: stri
     });
   });
 
-describe("exec:", () => {
+describe("exec:", { skip: SPAWN_SKIP }, () => {
   // The child runs listenAuto() with the default accept: "auto" everywhere (off Linux the hint says "connected").
   test("connected (default): LISTEN_* for the child, unset by listenAuto; the child is gone after close", async () => {
     const cmd = await wrapper();
@@ -252,7 +252,7 @@ async function withSpawnHook(
   }
 }
 
-describe("bridge", () => {
+describe("bridge", { skip: SPAWN_SKIP }, () => {
   test("varlink over the child's stdio (SYSTEMD_VARLINK_LISTEN=- via env(1))", async () => {
     const conn = await connectBridge(["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", process.execPath, CHILD], {
       env: { ...process.env, SYSTEMD_VARLINK_LISTEN: "/nonexistent/x", LISTEN_PID: "1" },
@@ -306,7 +306,7 @@ describe("bridge", () => {
   });
 });
 
-describe("ssh (fake ssh binary)", () => {
+describe("ssh (fake ssh binary)", { skip: SPAWN_SKIP }, () => {
   /** A fake ssh: logs its argv as a JSON line, then `-W path host` → pipes stdio to the unix socket, else runs the
    *  words after the host. */
   async function fakeSsh(): Promise<{ ssh: string; log: string; env: Record<string, string | undefined> }> {
