@@ -67,9 +67,12 @@ function resetError(): ConnectionClosedError {
 }
 
 /**
- * Wraps `channel` with the faults in `plan`. `closed`, `end`, `close` and `capabilities` delegate to the inner
- * channel. fds of a split chunk go with its first piece. Concurrent writes are serialized: each starts after the
- * previous one settled, so they arrive in call order and never interleave.
+ * Wraps `channel` with the faults in `plan`. `closed`, `close` and `capabilities` delegate to the inner channel;
+ * `end` too, but only after the writes before it settled (a real socket flushes them before its FIN). fds of a
+ * split chunk go with its first piece. Concurrent writes are serialized: each starts after the previous one
+ * settled, so they arrive in call order and never interleave. `close()` is immediate: from then on `read()` gives
+ * `null` (also a read waiting for its delay; split pieces not yet delivered are dropped) and every write still
+ * queued or made later rejects, also a zero-length one.
  */
 export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
   checkSplit(plan.splitReads, "splitReads");
@@ -82,9 +85,17 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
   let readReset = false;
   /** A write hit resetAfterWriteBytes: every later write rejects (also zero-length ones). */
   let writeReset = false;
+  /** close() was called (with this reason). */
+  let closed = false;
+  let closeReason: unknown;
 
   async function read(): Promise<ReadChunk | null> {
-    if (plan.delay !== undefined) await plan.delay();
+    if (closed) return null;
+    if (plan.delay !== undefined) {
+      await plan.delay();
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- close() may run during the await
+      if (closed) return null;
+    }
     const limit = plan.resetAfterReadBytes;
     if (readReset || (limit !== undefined && readBytes >= limit)) {
       readReset = true;
@@ -127,6 +138,8 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
 
   async function writeNow(chunk: Uint8Array, fds?: readonly FdHandle[]): Promise<void> {
     if (plan.delay !== undefined) await plan.delay();
+    if (closed)
+      throw new ConnectionClosedError("channel closed", closeReason === undefined ? undefined : { cause: closeReason });
     if (writeReset) throw resetError();
     const limit = plan.resetAfterWriteBytes;
     const pieces = split(chunk, plan.splitWrites);
@@ -153,8 +166,14 @@ export function faulty(channel: ByteChannel, plan: FaultPlan): ByteChannel {
   return {
     read,
     write,
-    end: () => channel.end(),
+    // After the writes before it settled; their failures do not prevent end().
+    end: () => writeChain.then(() => channel.end()),
     close: (reason?: unknown) => {
+      if (!closed) {
+        closed = true;
+        closeReason = reason;
+        pending.length = 0;
+      }
       channel.close(reason);
     },
     get closed() {

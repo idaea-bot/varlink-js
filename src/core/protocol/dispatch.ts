@@ -1,7 +1,7 @@
 // Runs one call's handler and produces its replies through a ServerSession (DESIGN.md §5.4, §4.10): the
 // dispatch table, the streaming handler contract, error mapping and reply validation. No timers, no I/O except
 // through `send`.
-import { isVarlinkLocalError } from "../errors/local.ts";
+import { ConnectionClosedError, isVarlinkLocalError } from "../errors/local.ts";
 import {
   ExpectedMoreError,
   ExpectedUpgradeError,
@@ -31,7 +31,14 @@ export interface CallContext {
   /**
    * Sends a `continues` reply from a plain async handler (sd_varlink_notify style). With `more`: resolves when the
    * reply was written. Without `more`: the first value becomes the single final reply and later values (and the
-   * handler's return value) are dropped. Oneway: a no-op. After the call's final reply: resolves without sending.
+   * handler's return value) are dropped. Oneway: a no-op. After the call's final reply on a live connection:
+   * resolves without sending.
+   *
+   * Rejects with a `ConnectionClosedError` (`cause`: the send failure, or `signal.reason`) once the connection is
+   * gone: a send of this call failed (also this notify's own), or the session is closed. So
+   * `for (;;) await ctx.notify(x)` ends when the client disconnects. Also rejects when the value is invalid in
+   * `validateReplies: "throw"` mode (the call then ends with InternalError), and when called re-entrantly from a
+   * reply's `toJSON` or getter. A fire-and-forget call never becomes an unhandled rejection.
    */
   notify(parameters: Record<string, unknown>): Promise<void>;
 }
@@ -44,7 +51,9 @@ export type HandlerResult = Record<string, unknown> | undefined | void;
 
 /**
  * A method implementation. An async iterator (async generator) result streams: each yielded value is a
- * `continues` reply, the return value the final one (§5.4).
+ * `continues` reply, the return value the final one (§5.4). For a oneway call (no reply wanted) a generator runs
+ * only up to its first `yield` and is then closed with `return()`, so an endless monitor cannot run forever; side
+ * effects after the first `yield` do not happen.
  */
 export type Handler<In = Record<string, unknown>, Out extends Record<string, unknown> = Record<string, unknown>> = (
   parameters: In,
@@ -158,6 +167,12 @@ function describe(v: unknown): string {
   return `a ${typeof v}`;
 }
 
+/** `p` with a no-op rejection handler attached: never an unhandled rejection; callers that await still see it. */
+function quiet(p: Promise<void>): Promise<void> {
+  p.catch(() => undefined);
+  return p;
+}
+
 /** Outcome of producing a reply: written to the session, dropped (call over), or unusable (end with InternalError). */
 type Outcome = "sent" | "dropped" | "invalid";
 
@@ -180,6 +195,8 @@ class Dispatch {
   #chain: Promise<void> = Promise.resolve();
   /** The validation or encoding error behind the last "invalid" outcome (notify rejects with it). */
   #lastProblem: unknown;
+  /** #produce is running the session's encoder (which may call back into user code: toJSON, getters). */
+  #producing = false;
 
   constructor(
     session: ServerSession,
@@ -304,7 +321,7 @@ class Dispatch {
   async #runIterator(it: AsyncIterator<unknown, unknown, undefined>): Promise<void> {
     const streaming = this.#call.more;
     for (;;) {
-      let step: IteratorResult<unknown, unknown>;
+      let step: unknown;
       try {
         step = await it.next();
       } catch (e) {
@@ -312,25 +329,41 @@ class Dispatch {
         this.#handleThrow(e);
         return;
       }
+      // A hand-written iterator may resolve to anything, with throwing getters: like a throw (rule 9), but the
+      // iterator is closed since it did not fail itself.
+      let done: boolean;
+      let value: unknown;
+      try {
+        if (typeof step !== "object" || step === null)
+          throw new TypeError(`${this.#call.method}: iterator result is ${describe(step)}, not an object`);
+        const result = step as IteratorResult<unknown, unknown>;
+        done = result.done === true;
+        value = result.value;
+      } catch (e) {
+        await this.#closeIterator(it);
+        this.#settled = true;
+        this.#handleThrow(e);
+        return;
+      }
       if (this.#call.oneway) {
         this.#settled = true;
-        if (step.done !== true) await this.#closeIterator(it);
+        if (!done) await this.#closeIterator(it);
         return;
       }
       if (this.#done) {
         // The call ended meanwhile (a notify without more, a failed write, a closed session).
-        if (step.done !== true) await this.#closeIterator(it);
+        if (!done) await this.#closeIterator(it);
         this.#settled = true;
         return;
       }
-      if (step.done === true || !streaming) {
-        const outcome = this.#reply(step.value, false);
-        if (step.done !== true) await this.#closeIterator(it);
+      if (done || !streaming) {
+        const outcome = this.#reply(value, false);
+        if (!done) await this.#closeIterator(it);
         this.#settled = true;
         if (outcome === "invalid") this.#sendError(InternalError.errorName, {});
         return;
       }
-      const outcome = this.#reply(step.value, true);
+      const outcome = this.#reply(value, true);
       if (outcome === "invalid") {
         await this.#closeIterator(it);
         this.#settled = true;
@@ -373,22 +406,46 @@ class Dispatch {
 
   #notify(parameters: unknown): Promise<void> {
     if (this.#call.oneway) return Promise.resolve();
+    if (this.#gone()) return quiet(Promise.reject(this.#goneError()));
     if (this.#done) {
       if (this.#settled)
         this.#report("late-notify", new Error(`${this.#call.method}: notify() after the call's final reply`));
       return Promise.resolve();
     }
-    const outcome = this.#reply(parameters, this.#call.more);
+    let outcome: Outcome;
+    try {
+      outcome = this.#reply(parameters, this.#call.more);
+    } catch (e) {
+      // A re-entrant notify() from a reply's toJSON or getter (#produce refuses it); the outer reply goes on.
+      this.#report("invalid-reply", e);
+      return quiet(Promise.reject(e instanceof Error ? e : new TypeError("re-entrant notify()")));
+    }
     if (outcome === "invalid") {
       const problem = this.#lastProblem;
       this.#sendError(InternalError.errorName, {});
-      const rejected = Promise.reject(problem instanceof Error ? problem : new TypeError("invalid notify() value"));
-      // Already reported through onError: a fire-and-forget notify() must not become an unhandled rejection.
-      // Callers that await still see it.
-      rejected.catch(() => undefined);
-      return rejected;
+      // Already reported through onError. Callers that await still see it.
+      return quiet(Promise.reject(problem instanceof Error ? problem : new TypeError("invalid notify() value")));
     }
-    return this.#chain;
+    if (outcome === "dropped") return this.#gone() ? quiet(Promise.reject(this.#goneError())) : Promise.resolve();
+    // This reply's send is the last link of the chain: reject if it (or one before it) failed.
+    return quiet(
+      this.#chain.then(() => {
+        if (this.#dead) throw this.#goneError();
+      }),
+    );
+  }
+
+  /** The connection is gone: a send failed or the session was closed. */
+  #gone(): boolean {
+    return this.#dead || this.#session.state === "closed";
+  }
+
+  #goneError(): ConnectionClosedError {
+    const signal = this.#controller.signal;
+    return new ConnectionClosedError(
+      `${this.#call.method}: the connection is closed`,
+      signal.aborted ? { cause: signal.reason } : undefined,
+    );
   }
 
   /**
@@ -488,10 +545,18 @@ class Dispatch {
     }
   }
 
-  /** Runs a session reply/error call and queues its bytes for writing, in order. */
+  /**
+   * Runs a session reply/error call and queues its bytes for writing, in order.
+   *
+   * @throws {TypeError} when called while another reply is being produced (a `toJSON` or getter of the reply
+   *   calling `ctx.notify()`): dispatch never queues a reply from inside another one, so never two final replies.
+   */
   #produce(make: () => Uint8Array | null, final: boolean, reason: DispatchErrorReason = "invalid-reply"): Outcome {
+    if (this.#producing)
+      throw new TypeError(`${this.#call.method}: re-entrant reply (a reply's toJSON or getter called notify())`);
     if (this.#done || this.#dead) return "dropped";
     let bytes: Uint8Array | null;
+    this.#producing = true;
     try {
       bytes = make();
     } catch (e) {
@@ -503,6 +568,8 @@ class Dispatch {
       this.#lastProblem = e;
       this.#report(reason, e);
       return "invalid";
+    } finally {
+      this.#producing = false;
     }
     if (final) this.#done = true;
     if (bytes !== null) {

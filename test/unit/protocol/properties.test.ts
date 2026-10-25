@@ -23,16 +23,25 @@ const SEED = Number(process.env.VARLINK_FC_SEED ?? 20261025);
 const RUNS = Number(process.env.VARLINK_FC_RUNS ?? 200);
 const params = (numRuns: number): fc.Parameters<unknown> => ({ seed: SEED, numRuns });
 
-const stepArb: fc.Arbitrary<Step> = fc.oneof(
-  fc.constant<Step>({ kind: "single" }),
-  fc.integer({ min: 0, max: 4 }).map((n): Step => ({ kind: "more", n })),
-  fc.constant<Step>({ kind: "oneway" }),
-  fc.constant<Step>({ kind: "error" }),
+/** The server's maxMessageSize in the split script runs. */
+const SCRIPT_MAX_MESSAGE_SIZE = 512;
+/** Some calls carry a padding parameter of random size, so a few calls reach the byte bound. */
+const padded = (arb: fc.Arbitrary<Step>): fc.Arbitrary<Step> =>
+  fc
+    .tuple(arb, fc.option(fc.integer({ min: 0, max: 200 })))
+    .map(([step, pad]): Step => (pad === null ? step : { ...step, pad: "p".repeat(pad) }));
+const stepArb: fc.Arbitrary<Step> = padded(
+  fc.oneof(
+    fc.constant<Step>({ kind: "single" }),
+    fc.integer({ min: 0, max: 4 }).map((n): Step => ({ kind: "more", n })),
+    fc.constant<Step>({ kind: "oneway" }),
+    fc.constant<Step>({ kind: "error" }),
+  ),
 );
 /** Random raw bytes (NULs and invalid UTF-8 included): they must never reach the decoder. */
-const upgradeArb: fc.Arbitrary<Step> = fc
-  .array(fc.integer({ min: 0, max: 255 }), { maxLength: 40 })
-  .map((rest): Step => ({ kind: "upgrade", rest }));
+const upgradeArb: fc.Arbitrary<Step> = padded(
+  fc.array(fc.integer({ min: 0, max: 255 }), { maxLength: 40 }).map((rest): Step => ({ kind: "upgrade", rest })),
+);
 /** Steps, optionally ending with an upgrade (only the last call can be one: the client refuses calls after it). */
 const stepsArb: fc.Arbitrary<Step[]> = fc
   .tuple(fc.array(stepArb, { maxLength: 12 }), fc.option(upgradeArb))
@@ -131,7 +140,8 @@ describe("protocol properties", () => {
     fc.assert(
       fc.property(stepsArb, scheduleArb, fc.integer({ min: 1, max: 4 }), (steps, schedule, maxQueuedCalls) => {
         const reference = runScript(steps);
-        const split = runScript(steps, schedule, maxQueuedCalls);
+        // A small maxMessageSize (every call fits: ≤ ~470 bytes) exercises wantsInput's byte bound.
+        const split = runScript(steps, schedule, { maxQueuedCalls, maxMessageSize: SCRIPT_MAX_MESSAGE_SIZE });
         assert.deepEqual(split.clientEvents, reference.clientEvents);
         assert.deepEqual(split.serverEvents, reference.serverEvents);
         const last = steps.at(-1);

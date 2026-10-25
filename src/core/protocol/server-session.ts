@@ -49,7 +49,10 @@ export class ServerSession {
   #nextId = 1;
   #eof = false;
   #paused = false;
+  /** The close event nextEvent() returns next (once). */
   #closeEvent: ServerEvent | null = null;
+  /** nextEvent() returned a close event: there is never another one. */
+  #closeDelivered = false;
   #remainder: Uint8Array[] | null = null;
 
   constructor(options?: ServerSessionOptions) {
@@ -72,7 +75,8 @@ export class ServerSession {
    * or when not open: the driver stops reading (backpressure). The byte bound is like sd-varlink's 16 MiB input
    * buffer cap (json-stream.c:1240), with room for one partial message: without a complete message the driver
    * keeps reading (the partial message needs it; the framer caps it at maxMessageSize). So a connection buffers at
-   * most about 2 × maxMessageSize + one read chunk.
+   * most about 2 × maxMessageSize + one read chunk; as the framer's buffer doubles, its capacity is about
+   * 4 × maxMessageSize in the worst case while reading, and drops back once the messages are consumed.
    */
   get wantsInput(): boolean {
     const complete = this.#framer.completeMessages;
@@ -101,11 +105,17 @@ export class ServerSession {
     this.#eof = true;
   }
 
-  /** Next event, or null if nothing is ready. Returns a call only when no call is active. */
+  /**
+   * Next event, or null if nothing is ready. Returns a call only when no call is active. There is at most one
+   * close event (a local {@link close} produces one too if none was delivered yet); null after it.
+   */
   nextEvent(): ServerEvent | null {
     if (this.#state !== "open") {
       const event = this.#closeEvent;
-      this.#closeEvent = null;
+      if (event !== null) {
+        this.#closeEvent = null;
+        this.#closeDelivered = true;
+      }
       return event;
     }
     if (this.#active !== null) return null;
@@ -115,11 +125,13 @@ export class ServerSession {
       if (text === null) {
         if (!this.#eof) return null;
         this.#state = "closed";
+        this.#closeDelivered = true;
         return { type: "close" };
       }
       call = decodeCall(this.#codec.decode(text));
     } catch (e) {
       this.#state = "closed";
+      this.#closeDelivered = true;
       const error = e instanceof ProtocolError ? e : new ProtocolError("malformed message", { cause: e });
       return { type: "close", error };
     }
@@ -137,7 +149,9 @@ export class ServerSession {
    * (except oneway: see {@link finish}).
    *
    * @throws {TypeError} if `id` is not the active call, its final reply was produced, the session is not open,
-   *   `continues` is set without `more`, or the reply cannot be encoded (the call then stays active).
+   *   `continues` is set without `more`, or the reply cannot be encoded (the call then stays active); also if the
+   *   call ended or the session closed during encoding (a re-entrant reply from a `toJSON` or getter): nothing is
+   *   produced for the outer reply then.
    */
   reply(
     id: number,
@@ -154,6 +168,7 @@ export class ServerSession {
     if (continues) init.continues = true;
     if (options?.ext !== undefined) init.ext = options.ext;
     const bytes = frameMessage(encodeReply(init, this.#codec));
+    this.#checkReentrancy(active);
     if (!continues && !this.#finishActive(false)) return null;
     return bytes;
   }
@@ -167,6 +182,7 @@ export class ServerSession {
     const active = this.#activeCall(id);
     if (active.call.oneway) return null;
     const bytes = frameMessage(encodeReply({ error, parameters: parameters ?? {} }, this.#codec));
+    this.#checkReentrancy(active);
     this.#finishActive(true);
     return bytes;
   }
@@ -199,11 +215,25 @@ export class ServerSession {
     return concat(chunks);
   }
 
-  /** Local close: nothing more is produced, replies after it are TypeErrors. Idempotent. */
+  /**
+   * Local close: nothing more is produced, replies after it are TypeErrors. Idempotent. If no close event was
+   * delivered yet, the next {@link nextEvent} returns one (exactly once): the pending one with its error if there
+   * is one (e.g. a lost upgrade remainder), else `{type: "close"}`. So a driver whose session was closed by
+   * `dispatchCall` (a failed send) still gets its final event.
+   */
   close(): void {
     this.#state = "closed";
     this.#active = null;
-    this.#closeEvent = null;
+    if (!this.#closeDelivered && this.#closeEvent === null) this.#closeEvent = { type: "close" };
+  }
+
+  /**
+   * After encoding: a `toJSON` or getter in the reply may have produced a reply itself (ending the call or closing
+   * the session). The outer reply then produces nothing, so a call never gets two final replies.
+   */
+  #checkReentrancy(active: Active): void {
+    if (this.#active !== active || this.#state !== "open")
+      throw new TypeError("re-entrant reply: the call ended while its reply was being encoded");
   }
 
   #activeCall(id: number): Active {

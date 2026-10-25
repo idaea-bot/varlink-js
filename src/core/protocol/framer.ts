@@ -12,7 +12,10 @@ export interface FramerOptions {
 }
 
 const INITIAL_CAPACITY = 4096;
-/** A buffer larger than this is dropped when it empties (next() consumed everything). */
+/**
+ * A buffer larger than this is dropped when it empties (next() consumed everything), and shrunk when next() leaves
+ * less than a quarter of it buffered.
+ */
 const SHRINK_THRESHOLD = 64 * 1024;
 const NUL = 0;
 
@@ -26,7 +29,9 @@ export function checkMaxMessageSize(value: unknown): number {
 
 /**
  * Splits a byte stream into NUL-terminated UTF-8 messages. Amortised O(n) over the stream: bytes are copied into
- * one growable buffer (doubling, compacted as it is consumed) and each byte is scanned for NUL once on push.
+ * one growable buffer (doubling, compacted as it is consumed, shrunk once mostly consumed) and each byte is scanned
+ * for NUL twice: once on push (counting complete messages, checking the size limit) and once more when next()
+ * returns its message.
  *
  * Problems in the peer's data (a message over `maxMessageSize`, invalid UTF-8) never throw from push(): they are
  * thrown by next() when the stream reaches them, after every complete message before them. From then on the
@@ -118,6 +123,12 @@ export class Framer {
       // Give a large buffer back once it is empty (re-allocated lazily on the next push): one big message must
       // not pin its memory for the rest of the connection.
       if (this.#buf.length > SHRINK_THRESHOLD) this.#buf = new Uint8Array(0);
+    } else if (this.#buf.length > SHRINK_THRESHOLD && this.#buf.length > 4 * this.buffered) {
+      // Mostly consumed (e.g. a big message followed by the first bytes of the next one): shrink so the rest does
+      // not pin the big buffer. It copies < 1/4 of the capacity and the new capacity is < 4 × buffered, so each
+      // shrink at least roughly halves the capacity: a run of shrinks copies less than the capacity the buffer had
+      // grown to, which growing already paid for. Copying stays amortised O(n).
+      this.#shrink();
     } else if (this.#start > this.#buf.length / 2) {
       this.#compact();
     }
@@ -179,6 +190,19 @@ export class Framer {
     const grown = new Uint8Array(Math.max(INITIAL_CAPACITY, this.#buf.length * 2, need));
     grown.set(this.#buf.subarray(shift, this.#end));
     this.#buf = grown;
+    this.#end -= shift;
+    this.#msgStart -= shift;
+    this.#start = 0;
+  }
+
+  /** Moves the unconsumed bytes to the front of a new buffer: the smallest INITIAL_CAPACITY × 2^k ≥ 2 × buffered. */
+  #shrink(): void {
+    const shift = this.#start;
+    let size = INITIAL_CAPACITY;
+    while (size < 2 * (this.#end - shift)) size *= 2;
+    const shrunk = new Uint8Array(size);
+    shrunk.set(this.#buf.subarray(shift, this.#end));
+    this.#buf = shrunk;
     this.#end -= shift;
     this.#msgStart -= shift;
     this.#start = 0;

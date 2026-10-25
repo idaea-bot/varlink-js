@@ -166,14 +166,15 @@ export async function serve(
 /**
  * One pipelined call of a script; the server's responder reads `kind`/`n`/`rest` from the parameters. `upgrade`
  * may only be the last step: after it the client sends `rest` as raw upgraded bytes, and the server answers the
- * confirmation followed by `rest` reversed as its own raw bytes.
+ * confirmation followed by `rest` reversed as its own raw bytes. `pad` only makes the call bigger.
  */
-export type Step =
+export type Step = (
   | { kind: "single" }
   | { kind: "more"; n: number }
   | { kind: "oneway" }
   | { kind: "error" }
-  | { kind: "upgrade"; rest: readonly number[] };
+  | { kind: "upgrade"; rest: readonly number[] }
+) & { pad?: string };
 
 /**
  * Delivery plan, cycled: each step feeds `size` bytes client→server (`toServer`, only while the server wants
@@ -223,9 +224,13 @@ const MAX_ITERATIONS = 100_000;
  * in both directions per `schedule` (cycled), honouring `wantsInput`; without a schedule everything is delivered
  * unsplit and answered at once.
  */
-export function runScript(steps: readonly Step[], schedule?: Schedule, maxQueuedCalls?: number): ScriptResult {
+export function runScript(
+  steps: readonly Step[],
+  schedule?: Schedule,
+  limits: { maxQueuedCalls?: number; maxMessageSize?: number } = {},
+): ScriptResult {
   const client = new ClientSession();
-  const server = new ServerSession(maxQueuedCalls === undefined ? {} : { maxQueuedCalls });
+  const server = new ServerSession(limits);
   const clientEvents: ClientEvent[] = [];
   const serverEvents: ServerEvent[] = [];
   const serverRest: Uint8Array[] = [];

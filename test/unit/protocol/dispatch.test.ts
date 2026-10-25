@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  ConnectionClosedError,
   InvalidParameterError,
   MessageTooLargeError,
   PermissionDeniedError,
@@ -554,6 +555,57 @@ describe("streaming handler contract", () => {
     assert.deepEqual(p.replies, [internal]);
   });
 
+  for (const [name, result] of [
+    ["null", null],
+    ["5", 5],
+  ] as const) {
+    test(`an iterator result that is not an object (${name}) → handler-threw, InternalError, return() called`, async () => {
+      for (const more of [true, false]) {
+        let returned = 0;
+        const iterator = {
+          next: () => Promise.resolve(result),
+          return: () => {
+            returned++;
+            return Promise.resolve({ done: true, value: undefined });
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+        const r = await run({ List: () => iterator }, { method: `${I}.List`, more });
+        assert.deepEqual(r.replies, [internal]);
+        assert.deepEqual(reasons(r), ["handler-threw"]);
+        assert.ok(r.reported[0]?.error instanceof TypeError);
+        assert.equal(returned, 1);
+      }
+    });
+  }
+
+  test("an iterator result whose done getter throws → handler-threw, InternalError, return() called", async () => {
+    let returned = 0;
+    const boom = new Error("getter");
+    const iterator = {
+      next: () =>
+        Promise.resolve({
+          get done(): boolean {
+            throw boom;
+          },
+          value: {},
+        }),
+      return: () => {
+        returned++;
+        return Promise.resolve({ done: true, value: undefined });
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+    const r = await run({ List: () => iterator }, { method: `${I}.List`, more: true });
+    assert.deepEqual(r.replies, [internal]);
+    assert.deepEqual(r.reported, [{ reason: "handler-threw", error: boom, method: `${I}.List` }]);
+    assert.equal(returned, 1);
+  });
+
   test("backpressure: the next value is pulled only after send resolved", async () => {
     const session = new ServerSession();
     session.receive(msg({ method: `${I}.List`, more: true }));
@@ -647,8 +699,9 @@ describe("ctx.notify (rule 15)", () => {
     assert.deepEqual(r.replies, []);
   });
 
-  test("after the final reply: resolves without sending, late-notify", async () => {
+  test("after the final reply on a live connection: resolves without sending, late-notify", async () => {
     let saved: CallContext | undefined;
+    const session = new ServerSession();
     const r = await run(
       {
         Plain: (_p: unknown, ctx: CallContext) => {
@@ -657,11 +710,106 @@ describe("ctx.notify (rule 15)", () => {
         },
       },
       { method: `${I}.Plain`, more: true },
+      { session, eof: false },
     );
     assert.ok(saved !== undefined);
     await saved.notify({ n: 2 });
     assert.deepEqual(r.replies, [{ parameters: { n: 1 } }]);
     assert.deepEqual(reasons(r), ["late-notify"]);
+    // Once the session is closed (here: EOF delivered), the connection is gone: notify rejects.
+    session.close();
+    await assert.rejects(saved.notify({ n: 3 }), ConnectionClosedError);
+    assert.deepEqual(reasons(r), ["late-notify"]);
+  });
+
+  test("a send failure: notify rejects with ConnectionClosedError, so a notify loop ends", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Plain`, more: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    const broken = new Error("EPIPE");
+    let sends = 0;
+    let iterations = 0;
+    let rejection: unknown;
+    const table = tableOf([FTL], {
+      [`${I}.Plain`]: async (_p: unknown, ctx: CallContext) => {
+        try {
+          // Bounded only so that a regression fails instead of hanging the test run.
+          for (; iterations < 10_000; iterations++) await ctx.notify({ n: iterations });
+        } catch (e) {
+          rejection = e;
+        }
+        return { n: -1 };
+      },
+    });
+    const reported: DispatchErrorReason[] = [];
+    await dispatchCall(
+      session,
+      ev.id,
+      ev.call,
+      table,
+      () => (++sends <= 2 ? Promise.resolve() : Promise.reject(broken)),
+      { onError: (_e, info) => reported.push(info.reason) },
+    );
+    assert.ok(rejection instanceof ConnectionClosedError);
+    assert.equal(rejection.cause, broken);
+    assert.equal(iterations, 2); // the third notify's own send failed
+    assert.equal(sends, 3);
+    assert.deepEqual(reported, ["send-failed"]);
+    assert.deepEqual(session.nextEvent(), { type: "close" }); // the driver still gets its final event
+  });
+
+  test("a notify after the session was closed by the driver rejects; its cause is ctx.signal.reason", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Plain`, more: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    const controller = new AbortController();
+    let release: () => void = () => undefined;
+    let rejection: unknown;
+    const table = tableOf([FTL], {
+      [`${I}.Plain`]: async (_p: unknown, ctx: CallContext) => {
+        await new Promise<void>((r) => {
+          release = r;
+        });
+        void ctx.notify({ n: 0 }); // fire and forget: never an unhandled rejection
+        rejection = await ctx.notify({ n: 1 }).then(
+          () => null,
+          (e: unknown) => e,
+        );
+      },
+    });
+    const done = dispatchCall(session, ev.id, ev.call, table, () => Promise.resolve(), {
+      signal: controller.signal,
+    });
+    await Promise.resolve();
+    controller.abort("shutdown");
+    session.close();
+    release();
+    await done;
+    assert.ok(rejection instanceof ConnectionClosedError);
+    assert.equal(rejection.cause, "shutdown");
+  });
+
+  test("a notify from a reply's toJSON (non-more call): rejected, exactly one final reply on the wire", async () => {
+    let inner: unknown;
+    const entry: MethodEntry = {
+      handler: (_p: unknown, ctx: CallContext) => ({
+        v: {
+          toJSON() {
+            inner = ctx.notify({ inner: true }).then(
+              () => null,
+              (e: unknown) => e,
+            );
+            return 1;
+          },
+        },
+      }),
+    };
+    const r = await run({}, { method: `${I}.Hand` }, { extra: { [`${I}.Hand`]: entry }, eof: false });
+    assert.deepEqual(r.replies, [{ parameters: { v: 1 } }]);
+    assert.ok((await inner) instanceof TypeError);
+    assert.deepEqual(reasons(r), ["invalid-reply"]);
   });
 
   test('validateReplies "throw": an invalid notify ends the call with InternalError and rejects', async () => {
@@ -923,7 +1071,8 @@ describe("encode failures (rule 11)", () => {
     assert.deepEqual(r.replies, []);
     assert.deepEqual(reasons(r), ["invalid-reply", "invalid-reply"]);
     assert.ok(r.reported.every((x) => x.error === broken));
-    assert.equal(session.state, "closed"); // the driver sees it and drops the connection instead of hanging
+    assert.equal(session.state, "closed");
+    assert.deepEqual(r.close, { type: "close" }); // the driver gets a final event instead of hanging
     assert.equal(session.wantsInput, false);
     assert.equal(signal?.aborted, true);
   });

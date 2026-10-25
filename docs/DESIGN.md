@@ -570,9 +570,12 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
 `faulty()`.
 - **Framer**: one growable `Uint8Array` (doubling, compacted with `copyWithin` once the read offset passes half the
   buffer, or when it needs room and the read offset is at least a quarter of the buffer; otherwise it grows and
-  copies only the unconsumed bytes); each byte is scanned for NUL once, on push, so 1-byte pushes stay O(n). When
-  `next()` empties a buffer larger than 64 KiB it is dropped and re-allocated lazily (4 KiB) on the next push, so
-  one big message does not pin its memory; `capacity` (tests/diagnostics) is the buffer's size. Size = bytes
+  copies only the unconsumed bytes); each byte is scanned for NUL twice, once on push (counting complete messages,
+  checking the limit, so 1-byte pushes stay O(n)) and once more when `next()` returns its message. When `next()`
+  empties a buffer larger than 64 KiB it is dropped and re-allocated lazily (4 KiB) on the next push; when it
+  leaves less than a quarter of such a buffer buffered, the rest moves to a new buffer of the smallest 4 KiB × 2ᵏ
+  ≥ 2 × buffered (copies < ¼ of the capacity, so still amortised O(n)). So one big message, also one followed by
+  the first bytes of the next, does not pin its memory; `capacity` (tests/diagnostics) is the buffer's size. Size = bytes
   before the NUL; `> maxMessageSize` (default 16 MiB, a positive safe integer) is an error, exactly the limit is
   fine. As soon as the incomplete message is over the limit, a `MessageTooLargeError` is recorded and later pushes
   are dropped (memory ≤ limit + one chunk + complete messages); `next()` still returns the complete messages before
@@ -606,7 +609,9 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   null). `wantsInput` is false while `maxQueuedCalls` (default 64) complete messages are buffered, while at least
   one complete message is buffered and the buffered bytes reach `maxMessageSize` (like sd-varlink's 16 MiB input
   buffer cap, json-stream.c:1240, with room for one partial message: without a complete message reading goes on,
-  the framer caps the partial one; so at most about 2 × `maxMessageSize` + one chunk per connection), while paused
+  the framer caps the partial one; so at most about 2 × `maxMessageSize` + one chunk buffered, and since the buffer
+  doubles, a framer capacity of about 4 × `maxMessageSize` per connection in the worst case while reading, which
+  drops back once the messages are consumed), while paused
   after an upgrade call, after EOF or a framing error, and when not open. A malformed message, when reached, is
   `{type: "close", error}` (calls before it are answered first, nothing is written for it). An upgrade call pauses
   splitting until it ends: an error reply resumes, a final non-error reply makes the state `upgraded` and every
@@ -615,8 +620,13 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   returns null instead of bytes and the session closes (`{type: "close", error}` with the `MessageTooLargeError`):
   the peer never sees a confirmation. A second final reply, a wrong
   id, `continues` without `more` or any reply when not open is a `TypeError` with no state change; an encode
-  failure rethrows and leaves the call active. After EOF the buffered calls are still delivered, then `{type:
-  "close"}`. `close()` is local: nothing more is produced.
+  failure rethrows and leaves the call active. If the call ended or the session closed while the reply was being
+  encoded (a re-entrant reply from a `toJSON` or getter), the outer `reply()`/`error()` throws `TypeError("re-entrant
+  reply …")` and produces nothing, so a call never gets two final replies. After EOF the buffered calls are still
+  delivered, then `{type: "close"}`. `close()` is local: nothing more is produced. There is at most one close
+  event, and the driver always gets it: a `close()` before one was delivered (by the driver, or by dispatch after a
+  failed send or an unencodable `InternalError`) makes the next `nextEvent()` return one, keeping a pending error
+  (e.g. the lost upgrade remainder's `MessageTooLargeError`), else `{type: "close"}`; then null.
 - **Dispatch** (`dispatchCall(session, id, call, table, send, options)`, never rejects, resolves when the call is
   finished): checks in order 1. `parseMethodName` (last dot; interface and member grammar) → `InvalidParameter
   {parameter: "method"}`; 2. `InterfaceNotFound {interface}` / `MethodNotFound {method}`; 3. `requires` more →
@@ -626,7 +636,11 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   `InvalidParameter {parameter}`, anything else → `InternalError`. Then the handler runs (a sync throw counts as a
   rejection). An async-iterator result streams (each yield a `continues` reply, awaiting `send` first; the return
   value, or `{}`, is final); without `more` the first yield (or the return value) is the single reply and
-  `return()` closes the iterator (a throw there is `cleanup-threw`). Other results: a plain object or `undefined`
+  `return()` closes the iterator (a throw there is `cleanup-threw`). Oneway: a generator runs only up to its first
+  `yield`, then `return()` (intended: no reply is wanted, and an endless monitor must not run forever; side effects
+  after the first `yield` do not happen). An iterator result that is not an object (`null`, `5`), or whose
+  `done`/`value` getter throws, counts as a throw (rule 9: `InternalError` + `handler-threw`) and the iterator is
+  closed with `return()`. Other results: a plain object or `undefined`
   (→ `{}`); anything else (also a value whose prototype cannot be read, e.g. a throwing Proxy) is `bad-result` and
   `InternalError`. Thrown values: a `VarlinkError` with a valid name is checked with `table.errorValidator`
   (unknown interface: sent as is; known interface without that error, or parameters that do not validate or that
@@ -636,7 +650,10 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   `"throw"` ends the call with `InternalError` (stopping a generator first). A reply the session cannot encode is
   `invalid-reply` and `InternalError`; if even the `InternalError` cannot be produced (a broken codec) while the
   session is open, the session is closed (`ctx.signal` aborted), so the connection never hangs on a call that
-  cannot end. A generator is never resumed once the call ended while its reply was being written. A rejected `send` aborts `ctx.signal`, stops the generator, reports
+  cannot end. Dispatch never produces a reply from inside another one (a reply's `toJSON` or getter calling
+  `ctx.notify()`: that notify rejects with a `TypeError` and `invalid-reply`, the outer reply goes on), so it never
+  queues two final replies. A generator is never resumed once the call ended while its reply was being written. A
+  rejected `send` aborts `ctx.signal`, stops the generator, reports
   `send-failed` and closes the session; `options.signal` aborts `ctx.signal` and replies after the session closed
   are dropped silently. Oneway: nothing is sent, non-`VarlinkError` throws are still `handler-threw`, then
   `finish(id)`. A confirmed upgrade with nobody to take the stream is `upgrade-unclaimed` (M9 adds
@@ -647,7 +664,11 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   the first notify is the single final reply and later notify calls and the return value are dropped (a later
   throw goes to `onError` only). sd_varlink_notify answers `ExpectedMore` there instead; we follow the generator
   rule ("Monitor without more = current state") so a handler does not need two code paths. Oneway: a no-op. After
-  the handler settled and the call ended: resolves without sending, `late-notify`.
+  the call's final reply on a live connection: resolves without sending (`late-notify` once the handler settled).
+  Once the connection is gone it rejects with a `ConnectionClosedError` (`cause`: the send failure, or
+  `ctx.signal.reason`): a send of the call failed (also this notify's own), or the session is closed. So
+  `for (;;) await ctx.notify(x)` ends when the client disconnects (like sd_varlink_notify returning an error).
+  Every rejected notify promise has the no-op handler attached.
 - **Testing channels**: `pair({highWaterMark})` (default 64 KiB): chunks arrive in order as written (copied, never
   merged); `write()` resolves once the peer's unread bytes are ≤ `highWaterMark` and rejects after this side's
   `end()`/`close()` or the peer's `close()`; `read()` gives `null` after the peer's `end()` once drained and after
@@ -656,7 +677,10 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   and/or writes (`"every-byte"`, a max size, or cut offsets), simulates a reset after N bytes read or written
   (`ConnectionClosedError("connection reset (faulty)")`, inner channel closed; after a write reset every later
   write rejects, also a zero-length one) and awaits `delay()` before every read and write. Writes are serialized
-  (each starts after the previous one settled), so concurrent writes arrive in order and never interleave.
+  (each starts after the previous one settled), so concurrent writes arrive in order and never interleave; `end()`
+  runs after the queued writes settled (like a socket flushing before its FIN; their failures do not prevent it).
+  `close()` is immediate: `read()` gives `null` from then on (also a read waiting for its delay; undelivered split
+  pieces are dropped), and queued or later writes reject, also a zero-length one.
 - **Leftovers**: `JSON.parse` keeps the last of duplicate keys while sd-varlink rejects duplicates; not detectable
   without a custom parser. sd-varlink rejects `null` flags; we accept them per UAPI (null ≡ absent). Upgraded data
   pipelined behind an upgrade call that is not yet processed counts against `maxMessageSize`; if it overflows, the
@@ -822,7 +846,8 @@ comment survives as UAPI requires), or `InterfaceNotFound` (fixes F9).
   value) is sent as the single reply and the generator is closed with `.return()` (Monitor without `more` =
   "current state").
 - Plain async handlers can stream too: `ctx.notify(v)` sends a `continues` reply when `ctx.more` is true
-  (sd-varlink's `sd_varlink_notify` style), and the returned value is final.
+  (sd-varlink's `sd_varlink_notify` style), and the returned value is final. `notify` rejects with a
+  `ConnectionClosedError` once the connection is gone, so a `for (;;) await ctx.notify(x)` loop ends (§4.10).
 
 Handler context `ctx`: `signal` (aborts when the client disconnects or the server shuts down),
 `more`/`oneway`/`upgrade` flags, `method`, `peer` (M11), `fds` (M11), `notify(partial)` (send a

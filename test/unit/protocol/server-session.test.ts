@@ -70,9 +70,75 @@ describe("ServerSession ordering", () => {
     const next = callOf(s.nextEvent());
     s.close();
     assert.throws(() => s.reply(next.id, {}), TypeError);
+    s.close();
+    assert.deepEqual(s.nextEvent(), { type: "close" }); // the driver's final event
     assert.equal(s.nextEvent(), null);
     s.close();
+    assert.equal(s.nextEvent(), null);
     assert.equal(s.state, "closed");
+  });
+
+  test("close() after the close event was delivered produces no second one", () => {
+    const s = new ServerSession();
+    s.receiveEnd();
+    assert.deepEqual(s.nextEvent(), { type: "close" });
+    s.close();
+    assert.equal(s.nextEvent(), null);
+  });
+
+  test("close() keeps a pending close event with its error", () => {
+    const s = new ServerSession({ maxMessageSize: 64 });
+    s.receive(concat([msg({ method: M, upgrade: true }), utf8("x".repeat(100))]));
+    s.receive(utf8("dropped"));
+    const { id } = callOf(s.nextEvent());
+    assert.equal(s.reply(id, {}), null); // the upgrade remainder was lost: closed, error event pending
+    s.close();
+    const close = s.nextEvent();
+    assert.ok(close?.type === "close" && close.error instanceof MessageTooLargeError);
+    assert.equal(s.nextEvent(), null);
+  });
+
+  test("a re-entrant reply from toJSON during encoding: the outer reply throws and produces nothing", () => {
+    const s = new ServerSession();
+    s.receive(concat([msg({ method: M }), msg({ method: M })]));
+    const { id } = callOf(s.nextEvent());
+    const inner: (Uint8Array | null)[] = [];
+    const value = {
+      toJSON(): number {
+        inner.push(s.reply(id, { inner: true }));
+        return 1;
+      },
+    };
+    assert.throws(() => s.reply(id, { v: value }), /re-entrant reply/);
+    assert.deepEqual(messages(inner[0] ?? new Uint8Array(0)), [{ parameters: { inner: true } }]);
+    assert.equal(callOf(s.nextEvent()).id, id + 1); // exactly one final reply ended call 1
+  });
+
+  test("a close() from toJSON during encoding: the reply throws and produces nothing", () => {
+    const s = new ServerSession();
+    s.receive(msg({ method: M }));
+    const { id } = callOf(s.nextEvent());
+    const value = {
+      toJSON(): number {
+        s.close();
+        return 1;
+      },
+    };
+    assert.throws(() => s.error(id, "a.b.C", { v: value }), /re-entrant reply/);
+    assert.deepEqual(s.nextEvent(), { type: "close" });
+  });
+
+  test("a re-entrant error reply from a getter during encoding throws too", () => {
+    const s = new ServerSession();
+    s.receive(msg({ method: M }));
+    const { id } = callOf(s.nextEvent());
+    const parameters = {
+      get v(): number {
+        s.error(id, "a.b.Inner");
+        return 1;
+      },
+    };
+    assert.throws(() => s.error(id, "a.b.Outer", parameters), /re-entrant reply/);
   });
 
   test("an encode failure rethrows and keeps the call active", () => {

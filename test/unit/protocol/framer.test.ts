@@ -132,13 +132,68 @@ describe("Framer splitting", () => {
     assert.equal(framer.capacity, 4096); // small buffers are kept (no churn)
   });
 
-  test("a large buffer is kept while unconsumed bytes remain", () => {
+  test("a large buffer is kept while at least a quarter of it is still buffered", () => {
     const framer = new Framer();
-    framer.push(concat([frame("x".repeat(100_000)), utf8("partial")]));
+    framer.push(concat([frame("x".repeat(100_000)), utf8("y".repeat(40_000))]));
     const capacity = framer.capacity;
     assert.equal(framer.next()?.length, 100_000);
     assert.equal(framer.capacity, capacity);
-    assert.equal(framer.buffered, 7);
+    assert.equal(framer.buffered, 40_000);
+    framer.push(new Uint8Array([0]));
+    assert.equal(framer.next(), "y".repeat(40_000));
+  });
+
+  test("a 16 MiB call followed by one byte of the next one: the buffer shrinks once the big one is consumed", () => {
+    const framer = new Framer();
+    const mib = new Uint8Array(1024 * 1024).fill(0x20);
+    for (let i = 0; i < 15; i++) framer.push(mib);
+    framer.push(mib.subarray(2));
+    framer.push(utf8("{}\0{")); // the big call, then the first byte of the next call
+    assert.ok(framer.capacity >= DEFAULT_MAX_MESSAGE_SIZE);
+    assert.equal(framer.next()?.length, DEFAULT_MAX_MESSAGE_SIZE);
+    assert.equal(framer.buffered, 1);
+    assert.equal(framer.capacity, 4096); // an idle client does not pin 16+ MiB
+    framer.push(utf8("}\0"));
+    assert.equal(framer.next(), "{}");
+  });
+
+  test("shrinking keeps the unconsumed bytes and the scan state (partial and complete messages)", () => {
+    const framer = new Framer();
+    framer.push(concat([frame("x".repeat(200_000)), frame("next"), utf8("part")]));
+    assert.equal(framer.next()?.length, 200_000);
+    assert.equal(framer.capacity, 4096);
+    assert.equal(framer.completeMessages, 1);
+    assert.equal(framer.buffered, 9);
+    framer.push(utf8("ial\0"));
+    assert.equal(framer.next(), "next");
+    assert.equal(framer.next(), "partial");
+    assert.equal(framer.buffered, 0);
+  });
+
+  test("pipelined ~1 MiB messages read with the server's byte bound: capacity stays ≤ 4 MiB + one chunk", () => {
+    // Mirrors ServerSession.wantsInput: push while no complete message is buffered or buffered < max; otherwise
+    // the consumer takes one message.
+    const max = 1024 * 1024;
+    const chunk = 64 * 1024;
+    const framer = new Framer({ maxMessageSize: max });
+    const one = frame(`{"x":"${"x".repeat(max - 100)}"}`);
+    const count = 64;
+    const stream = concat(Array.from({ length: count }, () => one));
+    let sent = 0;
+    let taken = 0;
+    let maxCapacity = 0;
+    while (taken < count) {
+      if ((framer.completeMessages === 0 || framer.buffered < max) && sent < stream.length) {
+        framer.push(stream.subarray(sent, sent + chunk));
+        sent = Math.min(stream.length, sent + chunk);
+      } else {
+        assert.equal(framer.next()?.length, one.length - 1);
+        taken++;
+      }
+      maxCapacity = Math.max(maxCapacity, framer.capacity);
+      assert.ok(framer.capacity <= 4 * max + chunk, `capacity ${String(framer.capacity)} after ${String(sent)} bytes`);
+    }
+    assert.ok(maxCapacity > max); // the buffer did hold more than one message
   });
 
   test("needing room with less than a quarter consumed grows instead of compacting", () => {
