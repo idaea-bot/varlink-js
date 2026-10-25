@@ -52,7 +52,7 @@ describe("built-in interfaces", () => {
     for (const name of BUILTIN_INTERFACES) assert.ok(existsSync(outputPath(name)), outputPath(name));
   });
 
-  test("contain no int, so overriding the descriptor's ints is sound", () => {
+  test("contain no int, so they bind in either ints mode (bindDescriptor)", () => {
     for (const idl of [ORG_VARLINK_SERVICE_IDL, INTERNAL_ERROR_INTERFACE_IDL]) {
       const iface = parseInterface(idl);
       for (const m of iface.members) {

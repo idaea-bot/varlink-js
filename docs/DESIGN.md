@@ -1137,7 +1137,7 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
 - **Docs**: TSDoc on the IDL const and descriptor const (interface doc), types, fields, classes and the
   descriptor's method entries (type and const); `*/` → `*\/`; doc text from the IDL has every `@` followed by an ASCII
   letter, `_` or `$` written as the text `\u0040` (the generated comments contain no `@internal`/`@deprecated`/
-  `@__PURE__`/… substring, so a peer's doc adds no tag or bundler hint and `stripInternal`, which matches `@internal` by substring, cannot drop declarations;
+  `@__PURE__`/… substring, so a peer's doc adds no `@` tag or `@`-form bundler hint (`#__PURE__` is kept, but doc comments only precede declarations and object keys, never a call) and `stripInternal`, which matches `@internal` by substring, cannot drop declarations;
   tested with `ts.transpileDeclaration`), and every C0 control
   (TAB too), DEL, C1 and Bidi_Control character and ESLint's irregular whitespace as `\uXXXX` text (no raw control
   bytes, no "Trojan Source" reordering); enum-value docs become a ``- `v`: doc`` list in the owning type's or

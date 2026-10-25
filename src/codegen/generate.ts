@@ -126,7 +126,8 @@ function templateLiteral(text: string): string {
 
 /**
  * Doc text from the IDL for a TSDoc comment: an `@` before an ASCII letter, `_` or `$` is written as the text
- * `\u0040`, so a peer's doc cannot add tags or bundler hints (`@__PURE__`), nor contain `@internal` (which
+ * `\u0040`, so a peer's doc cannot add tags or `@`-form bundler hints (`@__PURE__`; `#__PURE__` stays, harmless because doc
+ * comments never precede a call), nor contain `@internal` (which
  * `stripInternal` finds by substring).
  */
 function docText(text: string): string {
