@@ -362,3 +362,23 @@ describe("ServerSession upgrade", () => {
     assert.ok(close?.type === "close" && close.error instanceof MessageTooLargeError);
   });
 });
+
+describe("closedSignal", () => {
+  test("aborts when the session becomes closed: local close, EOF, protocol error", () => {
+    const a = new ServerSession();
+    assert.equal(a.closedSignal.aborted, false);
+    a.close();
+    assert.equal(a.closedSignal.aborted, true);
+
+    const b = new ServerSession();
+    b.receiveEnd();
+    assert.equal(b.closedSignal.aborted, false);
+    assert.deepEqual(b.nextEvent(), { type: "close" });
+    assert.equal(b.closedSignal.aborted, true);
+
+    const c = new ServerSession();
+    c.receive(utf8("not json\0"));
+    assert.equal(c.nextEvent()?.type, "close");
+    assert.equal(c.closedSignal.aborted, true);
+  });
+});

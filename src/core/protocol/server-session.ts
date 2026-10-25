@@ -49,6 +49,7 @@ export class ServerSession {
   readonly #maxQueued: number;
   readonly #maxMessageSize: number;
   #state: "open" | "upgraded" | "closed" = "open";
+  readonly #closedController = new AbortController();
   #active: Active | null = null;
   #lastFinished = 0;
   #nextId = 1;
@@ -129,13 +130,13 @@ export class ServerSession {
       const text = this.#framer.next();
       if (text === null) {
         if (!this.#eof) return null;
-        this.#state = "closed";
+        this.#setClosed();
         this.#closeDelivered = true;
         return { type: "close" };
       }
       call = decodeCall(this.#codec.decode(text));
     } catch (e) {
-      this.#state = "closed";
+      this.#setClosed();
       this.#closeDelivered = true;
       const error = e instanceof ProtocolError ? e : new ProtocolError("malformed message", { cause: e });
       return { type: "close", error };
@@ -221,6 +222,19 @@ export class ServerSession {
   }
 
   /**
+   * Aborts when the session becomes `closed` (peer EOF, protocol error, a lost upgrade remainder, or {@link close}),
+   * so code running a call (dispatch) learns at once that its replies can no longer be written.
+   */
+  get closedSignal(): AbortSignal {
+    return this.#closedController.signal;
+  }
+
+  #setClosed(): void {
+    this.#state = "closed";
+    if (!this.#closedController.signal.aborted) this.#closedController.abort();
+  }
+
+  /**
    * Local close: nothing more is produced, replies after it are TypeErrors. Idempotent. If no close event was
    * delivered yet, the next {@link nextEvent} returns one (exactly once): the pending one with its error if there
    * is one (e.g. a lost upgrade remainder), else `{type: "close"}` if the session was `open`. So a driver whose
@@ -231,7 +245,7 @@ export class ServerSession {
    */
   close(): void {
     const wasOpen = this.#state === "open";
-    this.#state = "closed";
+    this.#setClosed();
     this.#active = null;
     if (wasOpen && !this.#closeDelivered && this.#closeEvent === null) this.#closeEvent = { type: "close" };
   }
@@ -268,7 +282,7 @@ export class ServerSession {
       return true;
     } catch (e) {
       // Upgraded bytes were dropped by the size limit: the stream cannot be handed over intact.
-      this.#state = "closed";
+      this.#setClosed();
       this.#closeEvent = {
         type: "close",
         error: e instanceof ProtocolError ? e : new ProtocolError("upgrade remainder lost", { cause: e }),

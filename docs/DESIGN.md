@@ -669,7 +669,8 @@ handler-facing part (`streamOf`, `Handler`, `CallContext`, `HandlerResult`, the 
   `invalid-reply` in `"throw"` mode ends the call with `InternalError` and rejects with that problem. Once the
   connection is gone it rejects with a `ConnectionClosedError` (`cause`: `ctx.signal.reason`), for every kind of
   call, oneway included: gone means a send of the call failed (also this notify's own) or the session was closed
-  while the call was still unanswered (by the driver or by dispatch); either also aborts `ctx.signal`. An aborted
+  while the call was still unanswered (by the driver or by dispatch); either also aborts `ctx.signal` at once
+  (dispatch listens to `session.closedSignal`, which aborts whenever the session becomes `closed`). An aborted
   `ctx.signal` alone is not gone (a graceful shutdown aborts it and still writes replies, so a notify-style reply
   goes out like a returned one), and neither is a session closed by a clean peer EOF after the final reply (a UAPI
   client may half-close after sending its calls and still read the replies). Because
@@ -883,7 +884,7 @@ Handler context `ctx`: `signal` (aborts when the client disconnects or the serve
 | Handler throws `VarlinkError` | that error (name + params) |
 | Handler throws anything else | `onError` hook, then the internal error reply (see Q2); no details leak |
 | Generator throws after yielding | error reply ends the stream (an error is always final) |
-| Client disconnects mid-call | `ctx.signal` aborts; pending replies are discarded |
+| Client disconnects mid-call | the driver aborts the call's signal and closes the session: `ctx.signal` aborts, later replies are discarded, `notify` rejects |
 
 Output validation uses the same option as the client, `validateReplies: "off" | "warn" | "throw"`, but the
 server default is `"warn"`: an invalid reply is still sent, and the mismatch is reported to `onError`.

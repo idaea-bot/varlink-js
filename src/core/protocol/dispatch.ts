@@ -118,7 +118,12 @@ export interface DispatchOptions {
   validateReplies?: ValidateReplies;
   /** Handler bugs and invalid replies. Must not throw (exceptions from it are swallowed). */
   onError?: (error: unknown, info: { method: string; reason: DispatchErrorReason }) => void;
-  /** Driver: client disconnected / server shutting down. Aborts `ctx.signal`. */
+  /**
+   * Driver: client disconnected / server shutting down. Aborts `ctx.signal`, which tells the handler to stop; it
+   * does not by itself discard replies or make `notify` reject (a graceful shutdown still writes replies). On a
+   * disconnect, and at a shutdown deadline, the driver also calls `session.close()`: that makes the call gone
+   * (later replies are dropped, `notify` rejects, `ctx.signal` aborts at once via `session.closedSignal`).
+   */
   signal?: AbortSignal;
 }
 
@@ -238,6 +243,14 @@ class Dispatch {
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
     }
+    // A session closed under the unanswered call (driver close(), protocol error) aborts ctx.signal at once, even
+    // if the driver does not abort its own signal.
+    const closedSignal = this.#session.closedSignal;
+    const onClosed = (): void => {
+      if (!this.#done) this.#markClosedUnder();
+    };
+    if (closedSignal.aborted) onClosed();
+    else closedSignal.addEventListener("abort", onClosed, { once: true });
     try {
       await this.#dispatch();
     } catch (e) {
@@ -252,10 +265,13 @@ class Dispatch {
       } catch (e) {
         this.#report("handler-threw", e);
       }
+      // The oneway call is over: a later session close must not touch it (a detached notify still resolves).
+      this.#done = true;
     } else if (!this.#done) {
       this.#sendError(InternalError.errorName, {});
     }
     await this.#chain;
+    closedSignal.removeEventListener("abort", onClosed);
     if (this.#call.upgrade && this.#session.state === "upgraded")
       this.#report(
         "upgrade-unclaimed",

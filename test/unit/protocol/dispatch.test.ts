@@ -809,6 +809,101 @@ describe("ctx.notify (rule 15)", () => {
     assert.equal(sent.length, 0);
   });
 
+  test("session.close() under an unanswered call aborts ctx.signal at once (no notify needed)", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Monitor`, more: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let saved: CallContext | undefined;
+    let returned = false;
+    const table = tableOf([FTL], {
+      [`${I}.Monitor`]: async function* (_p: unknown, ctx: CallContext) {
+        saved = ctx;
+        try {
+          // Parked until the signal aborts, like `for await (const c of changes({signal: ctx.signal}))`.
+          await new Promise<void>((res) => {
+            ctx.signal.addEventListener("abort", () => {
+              res();
+            });
+          });
+          yield { n: 1 }; // after the close: dropped, the generator is closed
+          yield { n: 2 };
+        } finally {
+          returned = true;
+        }
+      },
+    });
+    const sent: Uint8Array[] = [];
+    const done = dispatchCall(session, ev.id, ev.call, table, (b) => {
+      sent.push(b);
+      return Promise.resolve();
+    });
+    await Promise.resolve();
+    assert.ok(saved !== undefined);
+    assert.equal(saved.signal.aborted, false);
+    session.close();
+    assert.equal(saved.signal.aborted, true); // synchronously, via session.closedSignal
+    assert.ok(saved.signal.reason instanceof ConnectionClosedError);
+    await done;
+    assert.equal(returned, true);
+    assert.equal(sent.length, 0);
+  });
+
+  test("a generator yielding after session.close() (no signal listener involved): dropped, return() runs", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Monitor`, more: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let release: () => void = () => undefined;
+    let returned = false;
+    let aborted = false;
+    const table = tableOf([FTL], {
+      [`${I}.Monitor`]: async function* (_p: unknown, ctx: CallContext) {
+        try {
+          await new Promise<void>((res) => {
+            release = res;
+          });
+          aborted = ctx.signal.aborted;
+          yield { n: 1 };
+          yield { n: 2 };
+        } finally {
+          returned = true;
+        }
+      },
+    });
+    const sent: Uint8Array[] = [];
+    const done = dispatchCall(session, ev.id, ev.call, table, (b) => {
+      sent.push(b);
+      return Promise.resolve();
+    });
+    await Promise.resolve();
+    session.close();
+    release();
+    await done;
+    assert.equal(aborted, true);
+    assert.equal(returned, true);
+    assert.equal(sent.length, 0);
+  });
+
+  test("oneway: a detached notify after the call ended and the session closed cleanly resolves", async () => {
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Plain`, oneway: true }));
+    session.receiveEnd();
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    let saved: CallContext | undefined;
+    const table = tableOf([FTL], {
+      [`${I}.Plain`]: (_p: unknown, ctx: CallContext) => {
+        saved = ctx;
+      },
+    });
+    await dispatchCall(session, ev.id, ev.call, table, () => Promise.resolve());
+    assert.deepEqual(session.nextEvent(), { type: "close" });
+    assert.ok(saved !== undefined);
+    await saved.notify({ n: 1 }); // resolves
+    assert.equal(saved.signal.aborted, false);
+  });
+
   test("after the final reply: resolves without sending, late-notify (also after a clean close or a later abort)", async () => {
     let saved: CallContext | undefined;
     const session = new ServerSession();
