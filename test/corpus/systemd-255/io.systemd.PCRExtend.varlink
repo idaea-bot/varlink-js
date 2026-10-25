@@ -1,0 +1,7 @@
+interface io.systemd.PCRExtend
+
+method Extend(
+	pcr: int,
+	text: ?string,
+	data: ?string
+) -> ()

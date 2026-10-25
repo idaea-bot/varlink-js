@@ -1,0 +1,54 @@
+interface io.systemd.sysext
+
+type ImageClass(
+	sysext,
+	confext
+)
+
+type ImageType(
+	directory,
+	subvolume,
+	raw,
+	block
+)
+
+method Merge(
+	class: ?ImageClass,
+	force: ?bool,
+	noReload: ?bool,
+	noexec: ?bool
+) -> ()
+
+method Unmerge(
+	class: ?ImageClass,
+	noReload: ?bool
+) -> ()
+
+method Refresh(
+	class: ?ImageClass,
+	force: ?bool,
+	noReload: ?bool,
+	noexec: ?bool
+) -> ()
+
+method List(
+	class: ?ImageClass
+) -> (
+	Class: ImageClass,
+	Type: ImageType,
+	Name: string,
+	Path: ?string,
+	ReadOnly: bool,
+	CreationTimestamp: ?int,
+	ModificationTimestamp: ?int,
+	Usage: ?int,
+	UsageExclusive: ?int,
+	Limit: ?int,
+	LimitExclusive: ?int
+)
+
+error NoImagesFound()
+
+error AlreadyMerged(
+	hierarchy: string
+)

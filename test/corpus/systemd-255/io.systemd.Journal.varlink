@@ -1,0 +1,11 @@
+interface io.systemd.Journal
+
+method Synchronize() -> ()
+
+method Rotate() -> ()
+
+method FlushToVar() -> ()
+
+method RelinquishVar() -> ()
+
+error NotSupportedByNamespaces()

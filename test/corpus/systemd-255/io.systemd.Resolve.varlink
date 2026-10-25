@@ -1,0 +1,67 @@
+interface io.systemd.Resolve
+
+type ResolvedAddress(
+	ifindex: ?int,
+	family: int,
+	address: []int
+)
+
+type ResolvedName(
+	ifindex: ?int,
+	name: string
+)
+
+method ResolveHostname(
+	ifindex: ?int,
+	name: string,
+	family: ?int,
+	flags: ?int
+) -> (
+	addresses: []ResolvedAddress,
+	name: string,
+	flags: int
+)
+
+method ResolveAddress(
+	ifindex: ?int,
+	family: int,
+	address: []int,
+	flags: ?int
+) -> (
+	names: []ResolvedName,
+	flags: int
+)
+
+error NoNameServers()
+
+error NoSuchResourceRecord()
+
+error QueryTimedOut()
+
+error MaxAttemptsReached()
+
+error InvalidReply()
+
+error QueryAborted()
+
+error DNSSECValidationFailed(
+	result: string
+)
+
+error NoTrustAnchor()
+
+error ResourceRecordTypeUnsupported()
+
+error NetworkDown()
+
+error NoSource()
+
+error StubLoop()
+
+error DNSError(
+	rcode: int
+)
+
+error CNAMELoop()
+
+error BadAddressSize()
