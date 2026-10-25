@@ -38,6 +38,18 @@ const CONNECTING = 0;
 const OPEN = 1;
 const CLOSED = 3;
 
+/** `href` without user and password, for error messages (they get logged). */
+function redactUrl(href: string): string {
+  try {
+    const url = new URL(href);
+    url.username = "";
+    url.password = "";
+    return url.href;
+  } catch {
+    return "(invalid URL)";
+  }
+}
+
 /** The ws(s):// URL to dial for a WebSocket-mode address (`http(s)://…/ws/services/<svc>` becomes ws(s)://). */
 function dialUrl(spec: AddressSpec): string {
   switch (spec.kind) {
@@ -45,7 +57,7 @@ function dialUrl(spec: AddressSpec): string {
       return spec.url.replace(/^http/i, "ws");
     case "http":
       throw new TypeError(
-        `${safeQuote(spec.url)} is a simple HTTP mode bridge URL, not a WebSocket endpoint (…/ws/services/<service>): ` +
+        `${safeQuote(redactUrl(spec.url))} is a simple HTTP mode bridge URL, not a WebSocket endpoint (…/ws/services/<service>): ` +
           "use createHttpClient() from varlink-js/http",
       );
     default:

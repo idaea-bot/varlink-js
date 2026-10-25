@@ -427,7 +427,7 @@ describe("HTTP client: streams", () => {
     const req = request(0);
     assert.equal(req.path, "/waldo/call/org.example.ws.Count");
     assert.equal(req.query, "?more=true");
-    assert.equal(req.headers.accept, "application/json-seq");
+    assert.equal(req.headers.accept, "application/json-seq, application/json;q=0.9");
     assert.deepEqual(await client.collect("org.example.ws.Count", { n: 3 }), [{ i: 0 }, { i: 1 }, { i: 2 }]);
     await assert.rejects(client.collect("org.example.ws.Count", { n: 5 }, { max: 3 }), RangeError);
   });
@@ -688,5 +688,15 @@ describe("HTTP client: base URL", () => {
     assert.throws(() => createHttpClient("unix:/run/x"), TypeError);
     assert.throws(() => createHttpClient("https://u:p@h/"), TypeError);
     assert.throws(() => createHttpClient("nonsense"), TypeError);
+  });
+});
+
+describe("createHttpClient(): address errors never quote credentials", () => {
+  test("a WebSocket-mode URL with user:password is a TypeError without the password", () => {
+    assert.throws(
+      () => createHttpClient("wss://user:s3cret@bridge.example/ws/services/org.example.ws"),
+      (e: unknown) =>
+        e instanceof TypeError && /varlink-js\/websocket/.test(e.message) && !e.message.includes("s3cret"),
+    );
   });
 });

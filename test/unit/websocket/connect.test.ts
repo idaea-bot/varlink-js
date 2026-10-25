@@ -292,3 +292,12 @@ describe("WebSocket mode: connecting", () => {
     }
   });
 });
+
+describe("connect(): address errors never quote credentials", () => {
+  test("a simple-mode URL with user:password is a TypeError without the password", async () => {
+    await assert.rejects(
+      connect("https://user:s3cret@bridge.example/waldo/"),
+      (e: unknown) => e instanceof TypeError && /createHttpClient/.test(e.message) && !e.message.includes("s3cret"),
+    );
+  });
+});

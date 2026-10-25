@@ -226,6 +226,37 @@ describe("HTTP client: request lifecycle", () => {
     assert.equal(req.init.signal.aborted, false);
   });
 
+  test(
+    "idleTimeout bounds the gap between records, not between body chunks (a trickling peer times out)",
+    { timeout: 5000 },
+    async () => {
+      timers.restore();
+      const f = scriptedFetch();
+      const client = createHttpClient("http://bridge/", { fetch: f.fetch });
+      const it = client.stream("org.example.ws.Monitor", {}, { idleTimeout: 100 });
+      const req = await f.next();
+      req.respond(200);
+      req.body.push('\x1e{"i":0}\n');
+      assert.deepEqual(await it.next(), { value: { i: 0 }, done: false });
+      const second = it.next();
+      // Whitespace, then an unfinished record, one byte every 30 ms: each chunk would reset a per-chunk timer.
+      const trickle = setInterval(() => {
+        if (req.body.cancelled === undefined) req.body.push(" ");
+      }, 30);
+      req.body.push("\x1e{");
+      try {
+        await assert.rejects(
+          second,
+          (e: unknown) => e instanceof CallTimeoutError && /no reply for 100 ms/.test(e.message),
+        );
+      } finally {
+        clearInterval(trickle);
+      }
+      assert.ok(req.body.cancelled !== undefined);
+      assert.ok(req.init.signal.aborted);
+    },
+  );
+
   test("return() while next() waits: the body is cancelled, the request aborted, next() is done", async () => {
     const f = scriptedFetch();
     const client = createHttpClient("http://bridge/", { fetch: f.fetch });

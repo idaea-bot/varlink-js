@@ -152,6 +152,9 @@ const HEADER_VALUE_FORBIDDEN = /[\r\n\0]/;
 /** Header names the client sets itself (they replace the user's). */
 const OWN_HEADERS = new Set(["content-type", "accept"]);
 
+/** Streams take json-seq, or one JSON reply (a single-reply method; bridge error bodies are JSON too). */
+const STREAM_ACCEPT = "application/json-seq, application/json;q=0.9";
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -201,11 +204,25 @@ function checkService(service: unknown): string | undefined {
   return service;
 }
 
+/** `href` without user and password, for error messages (they get logged). */
+function redactUrl(href: string): string {
+  try {
+    const url = new URL(href);
+    url.username = "";
+    url.password = "";
+    return url.href;
+  } catch {
+    return "(invalid URL)";
+  }
+}
+
 /** The bridge base URL: an `http` address, fragment and query dropped, with a trailing `/`. */
 function baseUrl(base: string | AddressSpec): string {
   const spec = typeof base === "string" ? parseAddress(base) : base;
   if (spec.kind === "websocket")
-    throw new TypeError(`${safeQuote(spec.url)} is a WebSocket mode address: use connect() from varlink-js/websocket`);
+    throw new TypeError(
+      `${safeQuote(redactUrl(spec.url))} is a WebSocket mode address: use connect() from varlink-js/websocket`,
+    );
   if (spec.kind !== "http")
     throw new TypeError(`createHttpClient() needs an http(s):// bridge base URL, not a ${spec.kind} address`);
   const url = new URL(spec.url);
@@ -617,7 +634,7 @@ export class HttpClient {
     return {
       fetch: () => this.#fetchFn(),
       max: this.#max,
-      post: (body) => this.#post(body, "application/json-seq"),
+      post: (body) => this.#post(body, STREAM_ACCEPT),
       readAll: (ex) => this.#readAll(ex),
       decodeRecord: (bytes, method) => this.#decodeJson(bytes, method),
       reply: (value, spec, method) => this.#reply(value, spec, method),
@@ -824,6 +841,8 @@ class RecordSource {
   /** An error-shaped record held back until the next record or the end of the body. */
   #held: { value: Record<string, unknown>; record: ErrorRecord } | undefined;
   #records = 0;
+  /** The idle timer is running: armed once per wait for the next record, never re-armed per body chunk. */
+  #idleArmed = false;
   #ended = false;
   #done = false;
 
@@ -873,6 +892,12 @@ class RecordSource {
           this.#ex.finish();
           return { value: undefined, done: true };
         }
+        if (!this.#whole && this.#records > 0 && !this.#idleArmed) {
+          // Armed per record, not per chunk: a peer trickling whitespace or a partial record must not reset it.
+          const idle = this.#idle;
+          this.#idleArmed = true;
+          this.#ex.arm(idle, () => new CallTimeoutError(`${this.#p.method}: no reply for ${String(idle)} ms`));
+        }
         await this.#pull();
       }
     } catch (e) {
@@ -895,10 +920,6 @@ class RecordSource {
 
   /** Reads one body chunk and parses the records it completes. */
   async #pull(): Promise<void> {
-    if (!this.#whole && this.#records > 0) {
-      const idle = this.#idle;
-      this.#ex.arm(idle, () => new CallTimeoutError(`${this.#p.method}: no reply for ${String(idle)} ms`));
-    }
     const chunk = await this.#ex.read();
     if (chunk === null) {
       this.#ended = true;
@@ -928,7 +949,10 @@ class RecordSource {
   #record(bytes: Uint8Array, single = false): void {
     const value = this.#ctx.decodeRecord(bytes, this.#p.method);
     this.#records++;
-    if (!this.#whole) this.#ex.disarm();
+    if (!this.#whole) {
+      this.#ex.disarm();
+      this.#idleArmed = false;
+    }
     const held = this.#held;
     if (held !== undefined) {
       // Another record followed: the held one was a reply after all.

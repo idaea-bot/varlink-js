@@ -934,15 +934,17 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   later reads `null`. `write(chunk)`: non-empty `fds` → `OperationNotSupportedError`; not OPEN, or after
   `end()`/`close()`/a failure → `ConnectionClosedError`; `send()` throwing → `ConnectionClosedError(cause)`; resolves
   once `bufferedAmount <= writeHighWaterMark` (default 1 MiB; polled with `setTimeout`, 1 ms doubling to 50 ms); a
-  waiting write resolves on a clean close (the closing handshake follows the queued data) and rejects on an unclean
-  one. `end()` (WebSocket has no half-close) is `close(1000)` after the queued data and resolves on the `close` event;
+  waiting write resolves on a clean close that we started (`end()`/`close()`/our own failure: the closing handshake
+  follows the queued data) and rejects on an unclean one or a clean one the peer started (RFC 6455 lets the peer
+  discard data frames arriving after its Close). `end()` (WebSocket has no half-close) is `close(1000)` after the queued data and resolves on the `close` event;
   reads go on until then. `close(reason?)` is an idempotent hard close: queue dropped, a pending read gives `null`,
   pending and later writes reject, `ws.close(1000)` if CONNECTING/OPEN. `closed` never rejects and settles once the
   `close` event arrived and the end of the stream was read (or after a local `close()`), one microtask after that
   read settled: a read that settles inside its executor has no reaction yet, and the Connection, which closes when
   `channel.closed` settles, must see the end of the stream (and its error) first. A 5 s guard after
-  `close()`/`end()` settles `closed` and `end()` (rejecting waiting writes) if the peer never answers the closing
-  handshake; the `close` event clears it. Every listener is removed on the `close` event (the socket's last event).
+  `close()`/`end()` settles `closed` and `end()` if the peer never answers the closing handshake: waiting writes
+  reject, a pending or later read rejects once with `ConnectionClosedError("the websocket did not close in time")`
+  (after `end()` reads were still allowed), then `null`, and the listeners are removed; the `close` event clears it. Every listener is removed on the `close` event (the socket's last event).
   `capabilities: {}`.
 - **`connect(address, options)`**: kind `websocket` (`http(s)` URLs dialled as `ws(s)`); `http` → `TypeError` naming
   `createHttpClient` from `varlink-js/http`; other kinds → `OperationNotSupportedError` naming `varlink-js/node`.
@@ -975,7 +977,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   (`TypeError` before any request); parameters are `input.encode`d for registered interfaces (a `ValidationError`
   rejects before any request), must be an object and are `codec.encode`d (`{}` when none). `POST {base}call/{enc(method)}`
   or `call/{enc(service)}/{enc(method)}` (`enc` = `encodeURIComponent`), streams add `?more=true`; `Content-Type:
-  application/json`, `Accept: application/json` (calls, GETs) or `application/json-seq` (streams). Bodies are read
+  application/json`, `Accept: application/json` (calls, GETs) or `application/json-seq, application/json;q=0.9`
+  (streams, which also take one JSON reply; bridge error bodies are JSON). Bodies are read
   with the body's reader, bounded by `maxMessageSize` (exceeded → `MessageTooLargeError`, body cancelled, request
   aborted), decoded as strict UTF-8 and with `codec.decode` (lossless ints). One `AbortController` per request,
   linked to `signal` and the timer; after an abort every later rejection (fetch, a body read, or a cancelled reader's
@@ -1005,7 +1008,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   spec's transport-failure record `{"error": "<message>"}`). Every other record is yielded at once. Records are pulled
   from the body reader on demand (natural backpressure); concurrent `next()` calls are served in order. `timeout`
   counts from the call to the first record (also while nobody calls `next()`), `idleTimeout` (default none) runs only
-  while a `next()` waits for the network. Expiry → `CallTimeoutError`, abort → `signal.reason`; a validation failure
+  while a `next()` waits for the network, armed once per wait and reset only by a complete record (never by a body
+  chunk, so a peer trickling whitespace or a partial record times out). Expiry → `CallTimeoutError`, abort → `signal.reason`; a validation failure
   rejects too; each ends the request (body cancelled, request aborted), after which the iterator is done. `return()`
   cancels the body and aborts the request (a pending `next()` resolves done). `collect()` rejects with `RangeError`
   past `max` (1024) and aborts.
@@ -1029,7 +1033,9 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   the browser's TLS client certificate; in Node pass a `WebSocket` constructor that can); the json-seq error-record
   ambiguity: a reply whose only fields are a string `error` and optionally `parameters` is taken for an error record
   when it is the last record of the body, and is held back by one record otherwise; simple mode has no oneway, no
-  upgrade and no pipelining, and concurrent calls are unordered; neither mode carries fds.
+  upgrade and no pipelining, and concurrent calls are unordered; neither mode carries fds. `connect()` checks the
+  channel options and `timeout` before dialling but the other `ConnectionOptions` (`ints`, `interfaces`, …) only in
+  `createConnection`, after the handshake. Error messages quote addresses without their user/password.
 
 ---
 

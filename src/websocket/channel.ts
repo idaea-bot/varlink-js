@@ -142,6 +142,8 @@ class WebSocketChannel implements ByteChannel {
   #writeShut = false;
   /** The `close` event arrived. */
   #sawClose = false;
+  /** We started the closing handshake (`end()`, `close()`, our own failure). */
+  #closeInitiated = false;
   #closedResolved = false;
   #guard: ReturnType<typeof setTimeout> | undefined;
   #resolveClosed: () => void = () => undefined;
@@ -211,6 +213,7 @@ class WebSocketChannel implements ByteChannel {
     const done = new Promise<void>((resolve) => {
       this.#endWaiters.push(resolve);
     });
+    this.#closeInitiated = true;
     closeSocket(this.#ws, 1000);
     this.#armGuard();
     return done;
@@ -224,6 +227,7 @@ class WebSocketChannel implements ByteChannel {
     this.#buffered = 0;
     this.#rejectWrites(new ConnectionClosedError("the channel was closed"));
     this.#wake();
+    this.#closeInitiated = true;
     closeSocket(this.#ws, 1000);
     if (this.#sawClose) this.#maybeResolveClosed();
     else this.#armGuard();
@@ -289,6 +293,7 @@ class WebSocketChannel implements ByteChannel {
     this.#outcome = { error, fromErrorEvent: false };
     this.#writeShut = true;
     this.#rejectWrites(new ConnectionClosedError("the websocket is closed", { cause: error }));
+    this.#closeInitiated = true;
     closeSocket(this.#ws, code, reason);
     this.#armGuard();
     this.#wake();
@@ -313,8 +318,11 @@ class WebSocketChannel implements ByteChannel {
       this.#guard = undefined;
     }
     const clean = isCleanClose(event);
-    // A clean close means the closing handshake completed, which happens after everything sent was transmitted.
-    if (clean) this.#resolveWrites();
+    // A clean close we started means the closing handshake completed after everything we sent was transmitted. One
+    // the peer started may have discarded data frames that arrived after its Close (RFC 6455 §5.5.1): reject then.
+    if (clean && this.#closeInitiated) this.#resolveWrites();
+    else if (clean)
+      this.#rejectWrites(new ConnectionClosedError("the peer closed the websocket before the write was sent"));
     else this.#rejectWrites(new ConnectionClosedError(closeMessage(event)));
     if (!this.#localClose) {
       if (this.#outcome === undefined) {
@@ -354,6 +362,7 @@ class WebSocketChannel implements ByteChannel {
         this.#outcome = null;
         this.#outcomeDelivered = true;
         reader.reject(slot.error);
+        this.#closeInitiated = true;
         closeSocket(this.#ws, 1011, "unreadable message");
         this.#armGuard();
         this.#maybeResolveClosed();
@@ -412,6 +421,15 @@ class WebSocketChannel implements ByteChannel {
       this.#writeShut = true;
       this.#rejectWrites(new ConnectionClosedError("the websocket did not close in time"));
       for (const resolve of this.#endWaiters.splice(0)) resolve();
+      // The close event may never come: end the stream for a reader too (after end(), reads were still allowed),
+      // and stop listening, as the close event would have.
+      for (const [type, listener] of this.#listeners) this.#ws.removeEventListener(type, listener);
+      if (this.#outcome === undefined && !this.#localClose)
+        this.#outcome = {
+          error: new ConnectionClosedError("the websocket did not close in time"),
+          fromErrorEvent: false,
+        };
+      this.#wake();
       this.#finishClosed();
     }, CLOSE_GUARD_MS);
   }

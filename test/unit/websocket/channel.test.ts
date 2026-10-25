@@ -271,7 +271,8 @@ describe("fromWebSocket: writing", () => {
     }
   });
 
-  test("a write waiting for the buffer rejects on an unclean close and resolves on a clean one", async () => {
+  test("a waiting write: rejects on an unclean close or a peer-started clean close, resolves after our end()", async () => {
+    // Unclean, and clean but started by the peer (RFC 6455 lets it discard frames that arrive after its Close).
     for (const [code, clean] of [
       [1006, false],
       [1000, true],
@@ -281,11 +282,22 @@ describe("fromWebSocket: writing", () => {
       ws.bufferedAmount = 1;
       const p = ch.write(enc("x"));
       ws.closed(code, "", clean);
-      if (clean) await p;
-      else await assert.rejects(p, ConnectionClosedError);
+      await assert.rejects(p, ConnectionClosedError);
       ch.close();
       await ch.closed;
     }
+    // Our end(): the clean close completes the handshake after everything queued was sent.
+    const ws = new FakeWebSocket();
+    ws.holdClose = true;
+    const ch = fromWebSocket(ws, { writeHighWaterMark: 0 });
+    ws.bufferedAmount = 1;
+    const p = ch.write(enc("x"));
+    const ended = ch.end();
+    ws.closed(1000);
+    await p;
+    await ended;
+    ch.close();
+    await ch.closed;
   });
 
   test("write rejects unless OPEN, after end()/close(), when send throws, and with fds", async () => {
@@ -434,18 +446,45 @@ describe("fromWebSocket: end, close, closed", () => {
   });
 
   test("the guard timer is cleared when the close event arrives (no handle left)", async () => {
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const timers = trackTimers();
     try {
       const ws = new FakeWebSocket();
+      ws.holdClose = true;
       const ch = fromWebSocket(ws);
       ch.close();
+      assert.equal(timers.live(), 1, "the guard");
       ws.closed(1000);
       await ch.closed;
-      // A timer still armed would fire here; nothing observable must change.
-      mock.timers.tick(10_000);
+      assert.equal(timers.live(), 0, "the close event cleared the guard");
       assert.equal(ws.listenerCount(), 0);
     } finally {
-      mock.timers.reset();
+      timers.restore();
     }
   });
+
+  test(
+    "end() unanswered: the guard also ends a pending read and removes the listeners (mocked clock)",
+    { timeout: 5000 },
+    async () => {
+      mock.timers.enable({ apis: ["setTimeout"] });
+      try {
+        const ws = new FakeWebSocket();
+        ws.holdClose = true;
+        const ch = fromWebSocket(ws);
+        const ended = ch.end();
+        const read = ch.read();
+        mock.timers.tick(5000);
+        await ended;
+        await assert.rejects(
+          read,
+          (e: unknown) => e instanceof ConnectionClosedError && /did not close in time/.test(e.message),
+        );
+        assert.equal(await ch.read(), null);
+        await ch.closed;
+        assert.equal(ws.listenerCount(), 0);
+      } finally {
+        mock.timers.reset();
+      }
+    },
+  );
 });
