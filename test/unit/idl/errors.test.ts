@@ -87,8 +87,8 @@ const CASES: [string, string, IdlErrorCode, string][] = [
   ["primitive as error payload", `${H}error E string\n`, "unexpected-token", "2:9"],
 
   // structs and enums
-  ["trailing comma in struct", `${H}type T (a: int, )\n`, "unexpected-token", "2:17"],
-  ["trailing comma in enum", `${H}type T (a, )\n`, "unexpected-token", "2:12"],
+  ["trailing comma in struct", `${H}type T (a: int, )\n`, "unexpected-token", "2:15"],
+  ["trailing comma in enum", `${H}type T (a, )\n`, "unexpected-token", "2:10"],
   ["leading comma", `${H}type T (, a)\n`, "unexpected-token", "2:9"],
   ["double comma", `${H}type T (a,, b)\n`, "unexpected-token", "2:11"],
   ["missing comma", `${H}type T (a: int b: int)\n`, "unexpected-token", "2:16"],
@@ -489,4 +489,10 @@ test("a large parsed interface never hits the shared-node budget", () => {
   const fields = Array.from({ length: 400_000 }, (_, i) => `a${String(i)}: ?[]int`).join(", ");
   const iface = parseInterface(`interface a.b\ntype A (${fields})\n`);
   assert.deepEqual(validateInterface(iface), []);
+});
+
+test("parseInterface rejects non-string input with a TypeError", () => {
+  for (const bad of [new Uint8Array([105]), undefined, 42]) {
+    assert.throws(() => parseInterface(bad as unknown as string), TypeError);
+  }
 });

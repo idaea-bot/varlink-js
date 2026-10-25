@@ -34,8 +34,10 @@ export interface ParseOptions {
  * Parses a varlink interface definition. Comments that are not doc comments are dropped.
  *
  * @throws {IdlSyntaxError} on any syntax error, or (unless `validate: false`) the first validation error.
+ * @throws {TypeError} if `text` is not a string (e.g. a Uint8Array: decode it first).
  */
 export function parseInterface(text: string, options?: ParseOptions): Interface {
+  if (typeof text !== "string") throw new TypeError("parseInterface: text must be a string");
   const iface = new Parser(text).parseInterface();
   if (options?.validate !== false) {
     const [first] = validateInterface(iface);
@@ -229,8 +231,8 @@ class Parser {
         values.push({ name: nameTok.text, ...info, span: nameSpan, nameSpan: { ...nameSpan } });
       }
       if (this.peek() === ")") break;
-      this.expect(",", '"," or ")"');
-      if (this.peek() === ")") this.fail("unexpected-token", 'trailing "," is not allowed');
+      const comma = this.expect(",", '"," or ")"');
+      if (this.peek() === ")") this.fail("unexpected-token", 'trailing "," is not allowed', comma.start);
     }
     this.advance();
     const span = this.span(open.start);
