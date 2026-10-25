@@ -381,17 +381,16 @@ describe("closedSignal", () => {
     assert.equal(c.nextEvent()?.type, "close");
     assert.equal(c.closedSignal.aborted, true);
   });
-});
-
-test("closedSignal listeners see a consistent session: the pending close event is already queued", () => {
-  const s = new ServerSession();
-  s.receive(msg({ method: M }));
-  assert.equal(s.nextEvent()?.type, "call");
-  let seen: ServerEvent | null | undefined;
-  s.closedSignal.addEventListener("abort", () => {
-    seen = s.nextEvent();
+  test("closedSignal listeners see a consistent session: the pending close event is already queued", () => {
+    const s = new ServerSession();
+    s.receive(msg({ method: M }));
+    assert.equal(s.nextEvent()?.type, "call");
+    let seen: ServerEvent | null | undefined;
+    s.closedSignal.addEventListener("abort", () => {
+      seen = s.nextEvent();
+    });
+    s.close();
+    assert.deepEqual(seen, { type: "close" });
+    assert.equal(s.nextEvent(), null);
   });
-  s.close();
-  assert.deepEqual(seen, { type: "close" });
-  assert.equal(s.nextEvent(), null);
 });
