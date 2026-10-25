@@ -108,7 +108,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Start systemd-userdbd (io.systemd.Multiplexer)
-        continue-on-error: true
         run: |
           sudo apt-get update
           sudo apt-get install -y systemd-userdbd
@@ -120,12 +119,13 @@ jobs:
           if [ -S /run/systemd/userdb/io.systemd.Multiplexer ]; then
             echo "Multiplexer socket: present" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Multiplexer socket: missing (the Multiplexer tests skip)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Multiplexer socket: missing" >> "$GITHUB_STEP_SUMMARY"
           fi
       - run: npm ci
-      # VARLINK_REQUIRE_INTEROP makes a missing varlinkctl fatal; a missing Multiplexer socket still skips.
+      # VARLINK_REQUIRE_INTEROP makes a missing varlinkctl fatal, VARLINK_REQUIRE_MULTIPLEXER a missing userdb socket.
       - name: varlinkctl against the JS server, validate-idl, Multiplexer
         env:
           VARLINK_VARLINKCTL: "1"
           VARLINK_REQUIRE_INTEROP: "1"
+          VARLINK_REQUIRE_MULTIPLEXER: "1"
         run: node --test --test-reporter=spec test/interop/varlinkctl.test.ts

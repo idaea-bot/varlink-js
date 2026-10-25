@@ -9,7 +9,8 @@
 
 Without their variable the optional suites skip with a reason. `VARLINK_REQUIRE_INTEROP=1` (set by the
 `Interop` workflow) turns a skip for a missing python, rust binary or `varlinkctl` into a failure; a missing
-`/run/systemd/userdb/io.systemd.Multiplexer` still skips.
+`/run/systemd/userdb/io.systemd.Multiplexer` skips unless `VARLINK_REQUIRE_MULTIPLEXER=1` (set by the workflow's
+varlinkctl job, which installs and starts `systemd-userdbd.socket`).
 
 ```sh
 VARLINK_PYTHON=python3 VARLINK_RUST_CERT=…/target/release/varlink-certification npm run test:interop
@@ -26,6 +27,12 @@ in its output is the pass. Children are killed in `after`; their output goes to 
 `varlinkctl.test.ts` serves [`org.example.interop`](org.example.interop.varlink) (only constructs systemd 255
 accepts) in-process on a unix socket and runs `varlinkctl info`, `list-interfaces`, `introspect` (compared with
 `validate-idl`'s re-print of the registered text), `call` (plain, `--more`, `--oneway`, an error reply, an unknown
-method), then `validate-idl` on every corpus file systemd 255 accepts (see `test/corpus/VARLINKCTL.md`) and on
-our `formatInterface(parseInterface(x))` of it (the re-prints must be equal), and our client against the userdb
-Multiplexer (`GetUserRecord` with and without `more`).
+method; systemd 255 prints `org.varlink.service.MethodNotFound`, systemd 259 maps it to ENXIO "No such device or
+address" and prints the parameters), then `validate-idl` on every corpus file and on our
+`formatInterface(parseInterface(x))` of it (the re-prints must be equal; the three files with `[string]()` that
+systemd 255 rejects, see `test/corpus/VARLINKCTL.md`, must then be rejected in both forms), `introspect` + `call
+Start` against the certification server, and our client against the userdb Multiplexer (`GetUserRecord` with and
+without `more`; the record count must match `varlinkctl call --more`).
+
+The workflow runs the varlinkctl job on `ubuntu-24.04` (systemd 255) and `ubuntu-latest` (Ubuntu 26.04 since
+2026-10, systemd 259).
