@@ -2,6 +2,9 @@
 // runner checking that every connection replies or closes. Not a test file itself.
 /* eslint-disable @typescript-eslint/require-await -- streaming handlers are async generators without awaits */
 import fc from "fast-check";
+import { Framer } from "../../src/core/protocol/framer.ts";
+import { decodeCall } from "../../src/core/protocol/messages.ts";
+import { jsonCodec } from "../../src/core/types/codec.ts";
 import { createServer, type Server } from "../../src/rpc/index.ts";
 import { pair } from "../../src/testing/index.ts";
 import { resettable } from "../regression/harness.ts";
@@ -28,11 +31,13 @@ method Later() -> ()
 error Failed (why: string)
 `;
 
+const FUZZ_MAX_MESSAGE_SIZE = 256 * 1024;
+
 /** A server with handlers for every method of {@link FUZZ_IDL}; onError counts reports. */
 export function fuzzServer(): { server: Server; reports: { count: number } } {
   const reports = { count: 0 };
   const server = createServer({
-    maxMessageSize: 256 * 1024,
+    maxMessageSize: FUZZ_MAX_MESSAGE_SIZE,
     onError: () => {
       reports.count++;
     },
@@ -139,55 +144,125 @@ export const caseArb: fc.Arbitrary<FuzzCase> = fc.record({
   finish: fc.constantFrom("end", "reset", "reset-early"),
 });
 
+/** What the server must answer for the bytes written: the server's own framing and call decoding, replayed. */
+function expectedReplies(written: readonly Uint8Array[]): { max: number; exact: boolean } {
+  const framer = new Framer({ maxMessageSize: FUZZ_MAX_MESSAGE_SIZE });
+  for (const piece of written) framer.push(piece);
+  let max = 0;
+  // Exact only if every message is a well-formed non-upgrade call and nothing partial is left: then the server
+  // answers each non-oneway call once and never closes early.
+  let exact = true;
+  for (;;) {
+    let text: string | null;
+    try {
+      text = framer.next();
+    } catch {
+      exact = false;
+      break;
+    }
+    if (text === null) break;
+    let call;
+    try {
+      call = decodeCall(jsonCodec.decode(text));
+    } catch {
+      exact = false;
+      continue;
+    }
+    if (call.upgrade) exact = false;
+    if (!call.oneway) max++;
+  }
+  if (framer.buffered > 0) exact = false;
+  return { max, exact };
+}
+
+/** Final replies (no `continues: true`) in what the server sent. */
+function finalReplies(received: readonly Uint8Array[]): number {
+  const text = new TextDecoder().decode(concatBytes(received));
+  let n = 0;
+  for (const message of text.split("\0").slice(0, -1)) {
+    const reply = JSON.parse(message) as { continues?: unknown };
+    if (reply.continues !== true) n++;
+  }
+  return n;
+}
+
+function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
 /**
- * Runs one case against `server` over a fresh pair. Resolves once the server's handle() resolved; rejects if that
- * takes longer than `deadlineMs` (a hang). The client side reads everything (no backpressure stall).
+ * Runs one case against `server` over a fresh pair. Resolves once the server's handle() resolved; rejects if the
+ * whole case (writing included) takes longer than `deadlineMs` (a hang). The client side reads everything (no
+ * backpressure stall). Checks the replies: at most one final reply per non-oneway call written, none for oneway
+ * calls, and exactly one per non-oneway call when the input was all valid calls, fully written and ended.
  */
 export async function runCase(server: Server, c: FuzzCase, deadlineMs: number): Promise<void> {
-  const [client, inner] = pair({ highWaterMark: 32 * 1024 });
-  const side = resettable(inner);
-  const handled = server.handle(side);
-  const drained = (async () => {
-    while ((await client.read()) !== null) {
-      // discard replies
-    }
-  })();
-  let bytes = 0;
-  const total = c.frames.reduce((s, f) => s + f.length, 0) * c.repeat;
-  // Tiny chunks only for small inputs (byte-by-byte delivery of a 300 KB frame adds time, not coverage).
-  const step = total > 64 * 1024 ? Math.max(c.chunk, 4096) : c.chunk;
-  write: for (let r = 0; r < c.repeat; r++) {
-    for (const f of c.frames) {
-      for (let off = 0; off < f.length; off += step) {
-        const piece = f.subarray(off, off + step);
-        try {
-          await client.write(piece);
-        } catch {
-          break write; // the server closed the connection
-        }
-        bytes += piece.length;
-        if (c.finish === "reset-early" && bytes >= total / 2) break write;
-      }
-    }
-  }
-  if (c.finish === "end") await client.end();
-  else {
-    side.reset();
-    client.close();
-  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       reject(new Error(`connection neither replied nor closed within ${String(deadlineMs)} ms`));
     }, deadlineMs);
   });
+  const [client, inner] = pair({ highWaterMark: 32 * 1024 });
+  const side = resettable(inner);
+  const handled = server.handle(side);
+  const received: Uint8Array[] = [];
+  const drained = (async () => {
+    for (let chunk = await client.read(); chunk !== null; chunk = await client.read()) received.push(chunk.bytes);
+  })();
+  const written: Uint8Array[] = [];
+  /** Everything was written (no early close, no early reset). */
+  const state = { complete: true };
+  const run = async (): Promise<void> => {
+    let bytes = 0;
+    const total = c.frames.reduce((s, f) => s + f.length, 0) * c.repeat;
+    // Tiny chunks only for small inputs (byte-by-byte delivery of a 300 KB frame adds time, not coverage).
+    const step = total > 64 * 1024 ? Math.max(c.chunk, 4096) : c.chunk;
+    write: for (let r = 0; r < c.repeat; r++) {
+      for (const f of c.frames) {
+        for (let off = 0; off < f.length; off += step) {
+          const piece = f.subarray(off, off + step);
+          try {
+            await client.write(piece);
+          } catch {
+            state.complete = false;
+            break write; // the server closed the connection
+          }
+          written.push(piece);
+          bytes += piece.length;
+          if (c.finish === "reset-early" && bytes >= total / 2) {
+            state.complete = false;
+            break write;
+          }
+        }
+      }
+    }
+    if (c.finish === "end") await client.end();
+    else {
+      side.reset();
+      client.close();
+    }
+    await handled;
+  };
   try {
-    await Promise.race([handled, deadline]);
+    await Promise.race([run(), deadline]);
   } finally {
     clearTimeout(timer);
     client.close();
   }
   await drained;
+  const expected = expectedReplies(written);
+  const finals = finalReplies(received);
+  if (finals > expected.max)
+    throw new Error(`${String(finals)} final replies for ${String(expected.max)} non-oneway calls`);
+  if (c.finish === "end" && state.complete && expected.exact && finals !== expected.max)
+    throw new Error(`${String(finals)} final replies, expected exactly ${String(expected.max)}`);
 }
 
 /** A fresh connection still gets a Ping answer. */

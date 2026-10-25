@@ -29,7 +29,7 @@ import {
   type ServerOptions,
 } from "../../../src/rpc/index.ts";
 import { faulty, pair } from "../../../src/testing/index.ts";
-import { controllable, isPending, MemoryListener, MessageReader, msg, settle, sleep, utf8 } from "./helpers.ts";
+import { concat, controllable, isPending, MemoryListener, MessageReader, msg, settle, sleep, utf8 } from "./helpers.ts";
 
 const IDL = `# A test interface. Comments are served verbatim.
 interface org.example.s
@@ -431,6 +431,42 @@ describe("Server: connection errors and limits", () => {
     await handled;
   });
 
+  test("a full call queue: taking a call wakes the reader, so a failing read (reset) aborts the handler", async () => {
+    const { server, reported } = makeServer();
+    let ctxSignal: AbortSignal | undefined;
+    server.addInterface(IDL, {
+      Wait: (_p, ctx: CallContext) =>
+        new Promise((resolve) => {
+          ctxSignal = ctx.signal;
+          ctx.signal.addEventListener("abort", () => {
+            resolve({});
+          });
+        }),
+      Echo: (p) => p,
+    });
+    const [a, b] = pair();
+    // Only read() reports the reset (as on a socket whose RST is seen by the next read); `closed` stays pending.
+    const side = controllable(b);
+    const handled = server.handle(side);
+    // Exactly maxQueuedCalls (64) calls in one write: the reader stops on a full queue; the dispatcher taking Wait
+    // makes room for one more, and must wake the reader.
+    const calls = [msg({ method: "org.example.s.Wait" })];
+    for (let i = 0; i < 63; i++) calls.push(msg({ method: "org.example.s.Echo", parameters: { text: "x" } }));
+    await a.write(concat(calls));
+    while (ctxSignal === undefined) await settle(1);
+    await settle();
+    side.failRead(new Error("ECONNRESET"));
+    await settle();
+    assert.equal(ctxSignal.aborted, true);
+    assert.ok(ctxSignal.reason instanceof ConnectionClosedError);
+    assert.deepEqual(
+      reported.map((r) => r.reason),
+      ["transport-error"],
+    );
+    await handled;
+    a.close();
+  });
+
   test("handle() never rejects with faulty() resets at every byte offset", async () => {
     const { server } = makeServer();
     server.addInterface(IDL, {
@@ -502,6 +538,40 @@ describe("Server: serve and shutdown", () => {
     await settle();
     assert.equal(reported[0]?.reason, "accept-failed");
     await server.shutdown();
+  });
+
+  test("an accept loop that ends with an error closes its listener (close errors swallowed)", async () => {
+    const { server, reported } = makeServer();
+    let closeCalls = 0;
+    const broken = {
+      [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(new Error("boom")) }),
+      close: () => {
+        closeCalls++;
+        return Promise.reject(new Error("close failed too"));
+      },
+    };
+    server.serve(broken);
+    await settle();
+    assert.equal(closeCalls, 1);
+    assert.deepEqual(
+      reported.map((r) => r.reason),
+      ["accept-failed"],
+    );
+    // shutdown() has nothing left to close.
+    await server.shutdown();
+    assert.equal(closeCalls, 1);
+  });
+
+  test("shutdown() checks its options synchronously; an invalid call stops nothing", async () => {
+    const { server } = makeServer();
+    server.addInterface(IDL, { Echo: (p) => p });
+    assert.throws(() => server.shutdown({ timeout: -1 }), RangeError);
+    assert.throws(() => server.shutdown({ graceful: "yes" as never }), TypeError);
+    const { conn, handled } = connect(server);
+    assert.deepEqual(await conn.call("org.example.s.Echo", { text: "still serving" }), { text: "still serving" });
+    await server.shutdown({ timeout: 100 });
+    await conn.closed;
+    await handled;
   });
 
   test("graceful: active call's signal aborts, its reply is still written, buffered calls dropped", async () => {

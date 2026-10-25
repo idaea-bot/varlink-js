@@ -4,9 +4,14 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { InterfaceNotFoundError, isVarlinkError, ValidationError, VarlinkError } from "../../../src/index.ts";
-import { createConnection, createServer, type Server } from "../../../src/rpc/index.ts";
+import type { Interface } from "../../../src/idl/index.ts";
+import { createConnection, createServer, type ProxyMethod, type Server } from "../../../src/rpc/index.ts";
 import { pair } from "../../../src/testing/index.ts";
 import { connectRaw } from "./helpers.ts";
+
+/** Exact type equality (compile time). */
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- the standard type-equality idiom
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
 const IDL = `interface org.example.px
 
@@ -52,7 +57,7 @@ describe("proxy", () => {
     assert.equal(px.interface.name, "org.example.px");
     assert.ok(Object.isFrozen(px));
     assert.equal(px.Nope, undefined);
-    assert.equal(Object.getPrototypeOf(px), Object.prototype);
+    assert.equal(Object.getPrototypeOf(px), null);
     const echo = px.Echo;
     assert.ok(echo !== undefined);
     assert.deepEqual(await echo({ text: "hi" }), { text: "hi" });
@@ -61,6 +66,32 @@ describe("proxy", () => {
     const got: unknown[] = [];
     for await (const r of px.Count?.stream({ n: 3 }) ?? []) got.push(r);
     assert.deepEqual(got, [{ i: 0 }, { i: 1 }, { i: 2 }]);
+    await conn.close();
+    await done;
+  });
+
+  test("Object.prototype names are undefined like any unknown method", async () => {
+    const { conn, done } = setup();
+    const px = await conn.proxy("org.example.px");
+    const loose = px as unknown as Record<string, unknown>;
+    for (const key of ["toString", "constructor", "__proto__", "hasOwnProperty", "valueOf"])
+      assert.equal(loose[key], undefined, key);
+    assert.deepEqual(Object.keys(px), ["Echo", "Count", "Bad", "Fail", "name", "interface"]);
+    await conn.close();
+    await done;
+  });
+
+  test("types: name is a string, interface the AST, methods ProxyMethod | undefined", async () => {
+    const { conn, done } = setup();
+    const px = await conn.proxy("org.example.px");
+    // Compile-time checks (npm run typecheck); the intersection type used to make `name` a `ProxyMethod & string`.
+    const checks: [
+      Equal<typeof px.name, string>,
+      Equal<typeof px.interface, Interface>,
+      Equal<typeof px.Echo, ProxyMethod | undefined>,
+    ] = [true, true, true];
+    assert.deepEqual(checks, [true, true, true]);
+    assert.equal(typeof px.name, "string");
     await conn.close();
     await done;
   });

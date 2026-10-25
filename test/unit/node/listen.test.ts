@@ -1,8 +1,8 @@
 // listen() (DESIGN.md §4.11): unix stale/live/non-socket paths, mode, unlink on close, tcp addresses, errors and
 // the iterator.
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { rename, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, connect as netConnect, type Socket } from "node:net";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -79,6 +79,54 @@ describe("listen unix", () => {
     await writeFile(path, "keep me");
     await assert.rejects(listen(`unix:${path}`), inUse);
     assert.equal(readFileSync(path, "utf8"), "keep me");
+  });
+
+  test("two concurrent listen() calls on one path: exactly one wins, the other rejects EADDRINUSE", async () => {
+    const sub = join(dir(), "race");
+    await mkdir(sub);
+    const path = join(sub, "s");
+    const results = await Promise.allSettled([listen(`unix:${path}`), listen(`unix:${path}`)]);
+    const won = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
+    const lost = results.filter((r) => r.status === "rejected").map((r) => r.reason as unknown);
+    assert.equal(won.length, 1);
+    assert.equal(lost.length, 1);
+    assert.ok(inUse(lost[0]), String(lost[0]));
+    const winner = won[0];
+    assert.ok(winner !== undefined);
+    try {
+      // The winner still owns the path and serves on it.
+      const accepted = (async () => {
+        for await (const ch of winner) return ch;
+        return undefined;
+      })();
+      const s = await dial(path);
+      const ch = await accepted;
+      assert.ok(ch !== undefined);
+      ch.close();
+      s.destroy();
+      assert.deepEqual(readdirSync(sub), ["s"]);
+    } finally {
+      await winner.close();
+    }
+    assert.deepEqual(readdirSync(sub), []);
+  });
+
+  test("no temporary names are left behind, after success or failure", async () => {
+    const sub = join(dir(), "leftovers");
+    await mkdir(sub);
+    const l = await listen(`unix:${join(sub, "ok")}`, { mode: 0o600 });
+    try {
+      assert.deepEqual(readdirSync(sub), ["ok"]);
+      await assert.rejects(listen(`unix:${join(sub, "ok")}`), inUse);
+      await writeFile(join(sub, "file"), "keep me");
+      await assert.rejects(listen(`unix:${join(sub, "file")}`), inUse);
+      // A missing directory: bind fails (ENOENT on Linux, EACCES on macOS).
+      await assert.rejects(listen(`unix:${join(sub, "nodir", "x")}`));
+      assert.deepEqual(readdirSync(sub).sort(), ["file", "ok"]);
+    } finally {
+      await l.close();
+    }
+    assert.deepEqual(readdirSync(sub), ["file"]);
   });
 
   test("mode is applied", async () => {
@@ -181,13 +229,41 @@ describe("the listener iterator", () => {
     assert.equal((await again.next()).done, true);
   });
 
-  test("a server error after listening is thrown by the iterator, not from a listener", async () => {
+  test("accept errors (EMFILE) are not fatal: onError gets them, later connections are still handed out", async () => {
+    const errors: unknown[] = [];
+    const l = await listen("tcp:127.0.0.1:0", {
+      onError: (e) => {
+        errors.push(e);
+        throw new Error("onError throws: swallowed");
+      },
+    });
+    const port = Number(l.address.split(":").at(-1));
+    const it = l[Symbol.asyncIterator]();
+    const pending = it.next();
+    const emfile = Object.assign(new Error("accept EMFILE"), { code: "EMFILE", errno: -24, syscall: "accept" });
+    l.server.emit("error", emfile);
+    assert.deepEqual(errors, [emfile]);
+    const c = netConnect({ host: "127.0.0.1", port });
+    c.on("error", () => undefined);
+    const r = await pending;
+    assert.equal(r.done, false);
+    r.value.close();
+    c.destroy();
+    // Without onError they are ignored.
+    const l2 = await listen("tcp:127.0.0.1:0");
+    l2.server.emit("error", emfile);
+    assert.ok(l2.server.listening);
+    await l2.close();
+    await l.close();
+    assert.equal((await it.next()).done, true);
+  });
+
+  test("the server closed behind our back ends the iterator", async () => {
     const l = await listen("tcp:127.0.0.1:0");
     const it = l[Symbol.asyncIterator]();
     const pending = it.next();
-    const boom = new Error("accept failed");
-    l.server.emit("error", boom);
-    await assert.rejects(pending, (e) => e === boom);
+    l.server.close();
+    assert.deepEqual(await pending, { value: undefined, done: true });
     await l.close();
   });
 });

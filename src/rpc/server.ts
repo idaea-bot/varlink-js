@@ -36,7 +36,7 @@ export type ServerErrorReason =
   | "transport-error"
   /** A channel arrived while `maxConnections` were open; it was closed at once. */
   | "connection-limit"
-  /** A served listener's iteration failed; that accept loop ended. */
+  /** A served listener's iteration failed; that accept loop ended and the listener was closed. */
   | "accept-failed";
 
 /** Options for {@link createServer}. */
@@ -176,6 +176,8 @@ class ServerConnection {
   #draining = false;
   /** The connection is being closed by the driver: no more reads, no transport-error reports. */
   #closing = false;
+  /** Graceful close in progress: the channel is being ended; the reader discards input until EOF. */
+  #finishing: Promise<void> | undefined;
 
   constructor(channel: ByteChannel, session: ServerSession, host: ConnectionHost) {
     this.#channel = channel;
@@ -211,32 +213,61 @@ class ServerConnection {
     const session = this.#session;
     try {
       for (;;) {
-        if (this.#closing || session.state !== "open") return;
+        if (this.#closing) return;
+        if (this.#finishing !== undefined) {
+          await this.#discard(this.#finishing);
+          return;
+        }
+        if (session.state !== "open") return;
         if (!session.wantsInput) {
           await this.#readerWake.wait();
           continue;
         }
         const chunk = await this.#channel.read();
+        // Closing, finishing or no longer open: the top of the loop decides (the chunk is dropped).
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
-        if (this.#closing || session.state !== "open") return;
+        if (this.#closing || this.#finishing !== undefined || session.state !== "open") continue;
         if (chunk === null) session.receiveEnd();
         else session.receive(chunk.bytes);
         this.#dispatcherWake.notify();
       }
     } catch (e) {
-      if (this.#closing) return;
+      if (this.#closing || this.#finishing !== undefined) return;
       this.#host.report(e, "transport-error");
       this.#gone(e);
     }
   }
 
+  /**
+   * Graceful close, second half: once the channel is ended (our FIN after the last reply), read and drop input
+   * until EOF or an error, then close. Unread input at close makes a TCP stack send RST, which can destroy the
+   * reply still in flight. The shutdown deadline (force()) still closes at once.
+   */
+  async #discard(ended: Promise<void>): Promise<void> {
+    await ended;
+    try {
+      while (!this.#closing && (await this.#channel.read()) !== null) {
+        // dropped
+      }
+    } catch {
+      // The peer is gone: nothing left to protect.
+    }
+    this.#close();
+  }
+
   async #dispatcher(): Promise<void> {
     const session = this.#session;
+    /** Ended by a graceful shutdown (not a protocol error, upgrade or close): the last reply must arrive. */
+    let graceful = false;
     try {
       for (;;) {
         const ev = session.nextEvent();
         if (ev === null) {
-          if (session.state !== "open" || this.#draining) break;
+          if (session.state !== "open") break;
+          if (this.#draining) {
+            graceful = true;
+            break;
+          }
           await this.#dispatcherWake.wait();
           continue;
         }
@@ -245,7 +276,12 @@ class ServerConnection {
           break;
         }
         // Graceful shutdown: buffered calls are dropped unanswered.
-        if (this.#draining) break;
+        if (this.#draining) {
+          graceful = true;
+          break;
+        }
+        // The queue just shrank: a reader parked on a full queue reads again (and so notices a reset).
+        this.#readerWake.notify();
         const ac = new AbortController();
         this.#active = ac;
         await dispatchCall(session, ev.id, ev.call, this.#host.table, (bytes) => this.#channel.write(bytes), {
@@ -255,14 +291,19 @@ class ServerConnection {
         this.#active = undefined;
         this.#readerWake.notify();
         // An upgrade nobody claimed (M3 reported upgrade-unclaimed): the stream is not varlink any more.
+        if (session.state === "upgraded") break;
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- drain() may run during the await
-        if (session.state === "upgraded" || this.#draining) break;
+        if (this.#draining) {
+          graceful = true;
+          break;
+        }
       }
     } catch (e) {
       // Not reachable by design (dispatchCall never rejects); never an unhandled rejection.
       this.#host.report(e, "transport-error");
     }
-    this.#close();
+    if (graceful) this.#finish();
+    else this.#close();
   }
 
   /** The peer is gone or the server forces a close: abort the active call and close the session and channel. */
@@ -272,6 +313,19 @@ class ServerConnection {
       new ConnectionClosedError("the connection was closed", cause === undefined ? undefined : { cause }),
     );
     this.#close();
+  }
+
+  /**
+   * Graceful close (shutdown drain): no more calls; end the channel after the replies written so far, then the
+   * reader discards input until EOF and closes (see #discard).
+   */
+  #finish(): void {
+    if (this.#closing || this.#finishing !== undefined) return;
+    this.#session.close();
+    this.#finishing = Promise.resolve()
+      .then(() => this.#channel.end())
+      .catch(() => undefined);
+    this.#readerWake.notify();
   }
 
   #close(): void {
@@ -431,8 +485,8 @@ export class Server {
 
   /**
    * Accepts channels from `listener` in the background (returns at once) and serves each with {@link handle}. An
-   * error from the iteration is reported as `accept-failed` and ends that loop. Several listeners may be served;
-   * {@link shutdown} closes them.
+   * error from the iteration is reported as `accept-failed`, ends that loop and closes the listener (its errors
+   * swallowed). Several listeners may be served; {@link shutdown} closes them.
    */
   serve(listener: ServeListener): void {
     if (this.#shutdown !== undefined) {
@@ -448,6 +502,12 @@ export class Server {
         }
       } catch (e) {
         this.#report(e, "accept-failed");
+        // Release the address: nothing accepts on it any more, and shutdown() will not see it.
+        try {
+          await listener.close?.();
+        } catch {
+          // Already reported the cause; a failing close adds nothing.
+        }
       } finally {
         this.#listeners.delete(listener);
       }
@@ -456,18 +516,24 @@ export class Server {
 
   /**
    * Stops the server (idempotent): closes the served listeners, then — graceful (default) — aborts every active
-   * call's signal (replies are still written), drops buffered calls and closes each connection once its active
-   * call finished; at the `timeout` deadline (default 5000 ms; 0 = none), or at once when not graceful, the rest
-   * is closed hard. Resolves when every connection is closed.
+   * call's signal (replies are still written), drops buffered calls and, once its active call finished, ends each
+   * connection (FIN after the last reply) and discards its input until the peer closes; at the `timeout` deadline
+   * (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves when every
+   * connection is closed.
+   *
+   * @throws {RangeError|TypeError} for invalid options (synchronously; nothing is stopped then).
    */
   shutdown(options?: ShutdownOptions): Promise<void> {
-    this.#shutdown ??= this.#stop(options);
+    if (this.#shutdown !== undefined) return this.#shutdown;
+    // Checked before anything is memoized: an invalid call throws and leaves the server running.
+    const graceful = options?.graceful ?? true;
+    if (typeof graceful !== "boolean") throw new TypeError("graceful must be a boolean");
+    const timeout = checkTimeout(options?.timeout, "timeout", 5000);
+    this.#shutdown = this.#stop(graceful, timeout);
     return this.#shutdown;
   }
 
-  async #stop(options: ShutdownOptions | undefined): Promise<void> {
-    const graceful = options?.graceful ?? true;
-    const timeout = checkTimeout(options?.timeout, "timeout", 5000);
+  async #stop(graceful: boolean, timeout: number): Promise<void> {
     await Promise.all([...this.#listeners].map((l) => this.#closeListener(l)));
     const conns = [...this.#connections];
     let timer: ReturnType<typeof setTimeout> | undefined;

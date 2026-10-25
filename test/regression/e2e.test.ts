@@ -147,19 +147,68 @@ for (const transport of transports) {
       });
 
       test("an idle client longer than any timeout is not disconnected (no server idle timeout)", async () => {
-        const conn = await ep.connect();
-        await conn.call(`${I}.Ping`);
-        // 0.1.x destroyed idle sockets after `timeout` (repro: 300 ms) and crashed. Advance a mocked clock far past
-        // that: the server has no timer to fire, so nothing happens.
-        mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+        // 0.1.x destroyed idle sockets after `timeout` (repro: 300 ms) and crashed. The clock is mocked before the
+        // server and its connections exist, so any timer they create is advanced by the tick below; Node's own
+        // socket timeout (socket.setTimeout) is not a mockable timer, so it is checked directly.
+        mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+        const fx = makeServer();
+        let ep2: Endpoint | undefined;
         try {
-          mock.timers.tick(10 * 60_000);
+          ep2 = await transport.start(fx.server);
+          const conn = await ep2.connect();
+          const raw = await ep2.raw();
+          await conn.call(`${I}.Ping`);
+          await raw.write(wire({ method: `${I}.Ping` }));
+          assert.equal(await raw.readMessage(), '{"parameters":{}}');
+          const sockets = ep2.serverSockets?.();
+          if (sockets !== undefined) {
+            assert.equal(sockets.length, 2);
+            for (const s of sockets) assert.equal(s.timeout, undefined);
+          }
+          mock.timers.tick(60 * 60_000);
+          // Let whatever the tick set off (a destroy, a close) run.
+          for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+          await raw.write(wire({ method: `${I}.Echo`, parameters: { text: "raw after idle" } }));
+          assert.equal(await raw.readMessage(), '{"parameters":{"text":"raw after idle"}}');
+          assert.deepEqual(await conn.call(`${I}.Echo`, { text: "after idle" }), { text: "after idle" });
+          assert.equal(conn.isClosed, false);
+          assert.deepEqual(fx.reported, []);
+          raw.close();
+          await conn.close();
         } finally {
           mock.timers.reset();
+          await ep2?.close();
+          await fx.server.shutdown({ graceful: false });
         }
-        assert.deepEqual(await conn.call(`${I}.Echo`, { text: "after idle" }), { text: "after idle" });
-        assert.equal(conn.isClosed, false);
-        await conn.close();
+      });
+
+      test("a reset is noticed while the call queue is full (taking a call wakes the reader)", async (t) => {
+        if (!transport.abruptReset) {
+          t.skip("unix: the harness reset is an EOF, not a disconnect");
+          return;
+        }
+        const raw = await ep.raw();
+        const before = f.holds.length;
+        // Exactly maxQueuedCalls (64) calls in one write: the queue is full, so the reader stops; the dispatcher
+        // taking Hold makes room for one more and wakes it. Here the reset also settles `channel.closed`; the case
+        // where only read() reports it is in test/unit/rpc/server.test.ts.
+        const calls = [
+          wire({ method: `${I}.Hold` }),
+          ...Array.from({ length: 63 }, () => wire({ method: `${I}.Ping` })),
+        ];
+        const all = new Uint8Array(calls.reduce((n, c) => n + c.length, 0));
+        let at = 0;
+        for (const c of calls) {
+          all.set(c, at);
+          at += c.length;
+        }
+        await raw.write(all);
+        await waitFor(() => f.holds.length > before);
+        raw.reset();
+        const signal = f.holds[before];
+        await waitFor(() => signal?.aborted === true);
+        assert.ok(signal?.reason instanceof ConnectionClosedError);
+        await alive();
       });
     });
 

@@ -741,7 +741,10 @@ over `pair()`, unix and tcp sockets.
   abort) rejects `next()` after the replies already buffered were consumed, then `done`. `return()` before the final
   reply closes the connection if the call was handed to the session, and only drops it if it was still queued; after
   the final reply it is a no-op. Read backpressure: while the head stream holds ≥ `highWaterMark` undelivered
-  replies the reader stops calling `read()`. `collect()` rejects with `RangeError` past `max` (1024).
+  replies the reader stops calling `read()`. So a stream must be consumed (or `return()`ed): with its buffer full
+  the connection stops reading, every later call on it waits, and their timeouts start only when they reach the
+  head, so awaiting a later call before draining the stream waits forever (documented on `stream()`).
+  `collect()` rejects with `RangeError` past `max` (1024).
 - **Validation** only for interfaces registered on the connection (`interfaces` option, `addInterface`; built-ins
   `org.varlink.service` and `INTERNAL_ERROR_INTERFACE` always): parameters are `input.encode`d (a ValidationError
   rejects before writing); replies per `validateReplies` (`"off"` raw, so unsafe ints may be bigints; `"warn"`
@@ -755,31 +758,48 @@ over `pair()`, unix and tcp sockets.
   for `call`, `oneway`, `stream`, `collect`. `getInfo`/`getInterfaceDescription` always validate their replies
   (`"throw"`); `getInterface` parses + validates and checks the declared name (`TypeError` otherwise).
 - **Proxy** (`conn.proxy(name, {validateReplies = "throw"})`): `getInterface` + a private `compileInterface` (not
-  registered); a frozen plain object with one frozen function per method (`.stream`/`.collect`/`.oneway`), `name`
-  and `interface`; parameters always encoded, replies per the option, errors of that interface validated against it.
-- **Pool** (`createPool(factory, {max = 8, idleTimeout = 30_000})`): a FIFO of waiters served by idle connections
+  registered); a frozen null-prototype object (so `px.toString`, `px.constructor`, `px.__proto__` are `undefined`
+  like any unknown method) with one frozen function per method (`.stream`/`.collect`/`.oneway`), `name` and
+  `interface`; parameters always encoded, replies per the option, errors of that interface validated against it.
+  `InterfaceProxy` is an interface with `name: string`, `interface: Interface` and an index signature
+  `[method: Capitalize<string>]: ProxyMethod | undefined` (varlink method names start upper-case, so it never
+  overlaps the two fields); indexing with a plain `string` needs `name as Capitalize<string>`.
+- **Pool** (`createPool(factory, {max = 8, idleTimeout = 30_000, timeout = 45_000})`): a FIFO of waiters served by idle connections
   (most recently used first; closed ones are discarded) or new ones while `idle + leased + opening < max`. A lease
   lasts until the operation settles; a stream's until its call is over for the connection (final reply, error,
   `return()`), via an internal settle hook. A factory failure (also a synchronous throw) rejects that operation and
   frees its slot; the factory's signal aborts when its waiter gives up or the pool closes (a connection that still
-  arrives goes idle). Connections are dropped when their `closed` settles. `close()` rejects waiters, closes all
-  connections, later operations reject. `size` counts open connections (not those being opened).
+  arrives goes idle). Waiting for a lease is bounded by the operation's `signal` and `timeout` (else the pool's
+  `timeout`, default 45 000 like a connection's, 0 = none): expiry removes the waiter and rejects with
+  `CallTimeoutError("timed out waiting for a pool connection")`; the operation's `timeout` then applies again to the
+  call itself. A `stream()` whose lease failed rejects its first `next()`, then is done. Connections are dropped
+  when their `closed` settles. `close()` rejects waiters, closes all connections, later operations reject. `size`
+  counts open connections (not those being opened).
 - **Server** (`createServer(options)`, `service.ts` for the built-ins behind `builtinInterfaces()`): registration
   compiles at once (verbatim text kept for GetInterfaceDescription); handlers are functions or `{handler,
   requiresMore?: true, requiresUpgrade?: true}` (raising, never lowering, the IDL flag); unknown keys, bad values,
   built-in or taken names are `TypeError`s and nothing is registered. `UntypedHandler` uses a method signature, so
   an untyped handler may annotate its parameters. The dispatch table and GetInterfaceDescription use `Map`s only.
   GetInfo lists `org.varlink.service`, user interfaces in registration order, then `INTERNAL_ERROR_INTERFACE`.
-- **Server driver**: per connection a reader task (`while wantsInput` read → receive; woken after each finished call)
-  and a dispatcher task (`nextEvent()` → `await dispatchCall(…, {signal})` → next). Clean EOF is not gone. A read
+- **Server driver**: per connection a reader task (`while wantsInput` read → receive; woken when the dispatcher takes
+  a call off the queue and after each finished call, so a reader parked on a full queue reads again — and notices a
+  reset — as soon as there is room) and a dispatcher task (`nextEvent()` → `await dispatchCall(…, {signal})` →
+  next). Clean EOF is not gone. A read
   rejection reports `transport-error`, aborts the active call's signal (`ConnectionClosedError`), closes session and
   channel; `channel.closed` settling does the same without a report. An unclaimed upgrade closes the connection.
   `handle()` resolves once the channel is closed and the reader ended (a handler that ignores its signal is not
   awaited) and never rejects; at `maxConnections` (or after shutdown) the channel is closed at once. `serve()` runs
-  `for await` over the listener in the background (`accept-failed` ends that loop). `shutdown({graceful, timeout})`
-  closes the listeners, then aborts active calls' signals and closes each connection when its call finished (buffered
-  calls dropped); at the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false` everything is
-  closed hard. No timers on server connections other than the shutdown deadline (F1).
+  `for await` over the listener in the background; an iteration error is reported as `accept-failed`, ends that
+  loop and calls `listener.close()` (its errors swallowed), so the address is released and shutdown has nothing
+  dangling. `shutdown({graceful, timeout})` checks its options synchronously (`RangeError`/`TypeError`, nothing
+  memoized, the server keeps running), closes the listeners, then aborts active calls' signals and closes each
+  connection gracefully when its call finished (buffered calls dropped; idle connections at once): `session.close()`,
+  `await channel.end()` (FIN after the last reply), then read and discard input until `read()` gives `null` or
+  rejects, then `channel.close()` — closing a TCP socket with unread input sends RST, which can destroy the reply
+  still in flight. At the deadline (`timeout`, default 5000; 0 = no deadline) or with `graceful: false` everything
+  is closed hard; so a peer that never closes its side holds a graceful shutdown until the deadline. Protocol
+  errors, unclaimed upgrades, transport errors and the clean-EOF close stay hard closes. No timers on server
+  connections other than the shutdown deadline (F1).
 - **Node channel** (`fromNodeSocket(socket)`): the socket is paused and read on demand: `read()` returns the next
   buffered chunk (a plain `Uint8Array` view of the Buffer's memory) or resumes the socket for one `data` event and
   pauses again, so Node's own buffering is the read backpressure. Order: buffered data, then a socket error (rejects
@@ -794,19 +814,29 @@ over `pair()`, unix and tcp sockets.
   `OperationNotSupportedError` naming the kind (M8/M10). All sockets `allowHalfOpen`. The connect phase is bounded by
   `timeout` (default 45 s, 0 = none → `CallTimeoutError("connect timed out")`) and `signal` (its reason); the socket
   is destroyed on either; Node errors (`ENOENT`, `ECONNREFUSED`) reject as they are. `createPool(address, options)`
-  splits `max`/`idleTimeout` off and passes the rest, plus the factory's signal, to `connect`.
-- **`listen(address | {fd}, {mode, backlog})`** → `NodeListener` (`Listener` + read-only `server: net.Server`):
-  `net.createServer({allowHalfOpen, pauseOnConnect})`; `listen()` rejects on `EADDRINUSE` and every other listen
-  error (F8); later server `error`s are stored and thrown by the iterator (→ `accept-failed`), and connections
-  arriving after that are destroyed. Unix paths: an existing path that is a socket is probed with a connect:
-  refused (or vanished) = stale and replaced, connected = `EADDRINUSE` (a live socket is never stolen), not a socket
-  = `EADDRINUSE` (never unlinked). The socket is bound on a temporary name in the same directory (`.` + random hex,
-  as long as the target's basename where possible, for sun_path), `chmod`ed to `mode`, then `rename`d into place:
-  libuv unlinks a pipe's bound name on close even if it was replaced, and the rename means that unlink hits the
-  temporary name, so `close()` unlinks the path only if it is still our inode (dev+ino). This also closes the
-  "socket briefly has the umask mode" window and makes the stale replacement atomic; the stale probe → rename step
-  is still a check-then-act race against another process binding the same path at the same moment. Consequence:
-  `listener.server.address()` names the temporary path (use `listener.address`). `unix:@name` Linux only. tcp:
+  splits `max`/`idleTimeout` off and passes the rest, plus the factory's signal, to `connect`; `timeout` goes to
+  both the pool (lease wait) and the connections.
+- **`listen(address | {fd}, {mode, backlog, onError})`** → `NodeListener` (`Listener` + read-only
+  `server: net.Server`): `net.createServer({allowHalfOpen, pauseOnConnect})`; `listen()` rejects on `EADDRINUSE`
+  and every other listen error (F8). Server `error`s after listening are accept failures (`EMFILE`, `ENFILE`,
+  `ECONNABORTED`): they go to `onError` (default: ignored; its exceptions swallowed) and the listener keeps accepting
+  (the `net.Server` stays bound and listening, and libuv's EMFILE trick drops the pending connection so the loop does
+  not spin). The iterator ends only on `close()` or the server's `close` event. Unix paths: the socket is bound on a
+  temporary name in the same directory (`.<basename>.vjs-<6 hex>`, recognizable if a crash leaves it behind; note it
+  is 12 bytes longer than the target, against sun_path's ~104), the listener's `error`/`connection` handlers are
+  attached before any further await (so nothing in the setup window is unhandled or leaked), it is `chmod`ed to
+  `mode`, then published with `link(temp, path)` + `unlink(temp)`. `link` never overwrites: on `EEXIST` the existing
+  path is inspected — a socket that refuses 3 connects ~20 ms apart (`ECONNREFUSED` each time; `ENOENT` = it
+  vanished: retry the link) is stale, so it is unlinked (only if it is still the inode that was probed) and the link
+  retried once (a second `EEXIST` → `EADDRINUSE`); a live socket (connect succeeds, or `EAGAIN`), or a non-socket →
+  `EADDRINUSE`, never touched. So of two concurrent `listen()`s on one path exactly one wins. Every error path
+  closes the server and removes the temporary name. libuv unlinks a pipe's bound name on close, which hits the
+  (already removed) temporary name, so `close()` unlinks the path only if it is still our inode (dev+ino). This also
+  closes the "socket briefly has the umask mode" window. Left: the stale probe → unlink step is still a
+  check-then-act race against another process replacing the stale socket at that moment, and on macOS/BSD a live
+  server whose listen backlog is full also refuses connects (`ECONNREFUSED`), so a server that stays saturated for
+  all 3 probes is taken for stale and replaced. Consequence: `listener.server.address()` names the temporary path
+  (use `listener.address`). `unix:@name` Linux only. tcp:
   `address` from `server.address()` (port 0 → the real port, `tcp:[::1]:p` for IPv6). `{fd}` (socket activation,
   §5.8; `listenFromEnv` in M8 builds on it): `server.listen({fd})`; `address` from `server.address()` (object →
   `tcp:…`, string with leading NUL → `unix:@…`, other string → `unix:…`), but Node returns `null` for a unix socket
@@ -822,15 +852,23 @@ over `pair()`, unix and tcp sockets.
   `tcpTransport` serve `listen()` in a `vj-` temp dir / on `127.0.0.1:0`, `restart()` closes the listener and every
   server connection and listens again on the same address; `transports` is the list the suite runs over),
   `e2e.test.ts` (one `describe` per F-id, every case over every transport), `sockets.test.ts` (F8, F3 with both
-  socket buffers full), `tooling.test.ts` (F10–F14, F16), `test/fuzz/server.test.ts` (fast-check, seeded,
-  `VARLINK_FUZZ_RUNS` default 200). Soak: `VARLINK_SOAK_SECONDS=600 node test/fuzz/soak.ts` runs the same generator
+  socket buffers full, accept errors, graceful shutdown over tcp keeping the last reply), `tooling.test.ts`
+  (F10–F14, F16), `test/fuzz/server.test.ts` (fast-check, seeded, `VARLINK_FUZZ_RUNS` default 200; each case's
+  deadline covers the writes too, and the replies are counted against the server's own framing/decoding of what was
+  written: at most one final reply per non-oneway call, none for oneway calls, exactly one each when the input was
+  all valid non-upgrade calls, fully written and ended). The F1 idle test mocks `setTimeout`/`setInterval`/`Date`
+  before the server and connections exist, ticks an hour, and checks the accepted `net.Socket`s have no timeout. Soak: `VARLINK_SOAK_SECONDS=600 node test/fuzz/soak.ts` runs the same generator
   against one server, prints RSS every 10 s and exits non-zero on an unhandled rejection, uncaught exception, hang
   or a server that stops answering (`VARLINK_FC_SEED` fixes the seed).
 - **Known limits**: a `pair()` peer's `close()` looks like a clean EOF to the server (only a socket RST or the
   harness reset is a disconnect), so over `pair()` a handler waiting on its signal is not aborted by a client
-  `close()`; it is when its reply's write fails. Unix sockets have no RST either: a destroyed unix peer is a clean
-  EOF to the server, so F1's "reset aborts `ctx.signal`" holds for pair and tcp only (`Transport.abruptReset`); over
-  unix the test checks that the server survives and keeps serving. F15's memory bound is 4 × `maxMessageSize` over
+  `close()`; it is when its reply's write fails. Over unix sockets the harness reset is a plain `destroy()` of a
+  peer with nothing unread, which the server reads as a clean EOF (a unix socket closed with unread data does give
+  its peer `ECONNRESET` on Linux, but that is not what the harness does), so F1's "reset aborts `ctx.signal`" is
+  tested for pair and tcp only (`Transport.abruptReset`); over unix the test checks that the server survives and
+  keeps serving. A reset is noticed by reading: with more than `maxQueuedCalls` calls buffered behind a long
+  handler (and Node's own read buffer full), the reader stays parked, so the handler's signal aborts only when its
+  write fails, it finishes, or the socket's `close` arrives. F15's memory bound is 4 × `maxMessageSize` over
   pair and 16 × over sockets (a fresh Buffer per read, garbage until the next GC, plus kernel buffers), still a
   quarter of the 64 MiB input.
 

@@ -3,7 +3,7 @@
 /* eslint-disable @typescript-eslint/require-await -- streaming handlers are async generators without awaits */
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { ConnectionClosedError, type CallContext } from "../../../src/index.ts";
+import { CallTimeoutError, ConnectionClosedError, type CallContext } from "../../../src/index.ts";
 import { createConnection, createPool, createServer, type Connection, type Server } from "../../../src/rpc/index.ts";
 import { pair } from "../../../src/testing/index.ts";
 import { isPending, settle, sleep, trackTimers } from "./helpers.ts";
@@ -235,9 +235,44 @@ describe("Pool", () => {
     await pool.close();
   });
 
+  test("waiting for a lease is bounded by the operation's timeout, else the pool's", async () => {
+    const f = fixture();
+    const pool = createPool(f.factory, { max: 1, idleTimeout: 0, timeout: 30 });
+    const held = pool.call("org.example.p.Hold", {});
+    await settle();
+    const waitTimeout = (e: unknown): boolean =>
+      e instanceof CallTimeoutError && e.message === "timed out waiting for a pool connection";
+    await assert.rejects(pool.call("org.example.p.Echo", { text: "x" }, { timeout: 10 }), waitTimeout);
+    await assert.rejects(pool.call("org.example.p.Echo", { text: "y" }), waitTimeout);
+    const st = pool.stream("org.example.p.Count", { n: 2 }, { timeout: 10 });
+    await assert.rejects(st.next(), waitTimeout);
+    assert.deepEqual(await st.next(), { value: undefined, done: true });
+    // timeout 0: waits as long as it takes; the timed-out waiters are gone, so it is next in line.
+    const patient = pool.call("org.example.p.Echo", { text: "z" }, { timeout: 0 });
+    f.release();
+    await held;
+    assert.deepEqual(await patient, { text: "z" });
+    assert.equal(f.opened.length, 1);
+    await pool.close();
+    await f.server.shutdown();
+  });
+
+  test("a stream whose lease failed: next() rejects once, then is done", async () => {
+    const pool = createPool(() => Promise.reject(new Error("no route")));
+    const st = pool.stream("org.example.p.Count", { n: 2 });
+    await assert.rejects(st.next(), /no route/);
+    assert.deepEqual(await st.next(), { value: undefined, done: true });
+    assert.deepEqual(await st.next(), { value: undefined, done: true });
+    await pool.close();
+    const closed = pool.stream("org.example.p.Count", { n: 2 });
+    await assert.rejects(closed.next(), ConnectionClosedError);
+    assert.deepEqual(await closed.next(), { value: undefined, done: true });
+  });
+
   test("options are checked", () => {
     assert.throws(() => createPool(() => Promise.reject(new Error()), { max: 0 }), RangeError);
     assert.throws(() => createPool(() => Promise.reject(new Error()), { idleTimeout: -5 }), RangeError);
+    assert.throws(() => createPool(() => Promise.reject(new Error()), { timeout: -1 }), RangeError);
     assert.throws(() => createPool(5 as never), TypeError);
   });
 

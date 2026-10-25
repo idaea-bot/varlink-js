@@ -1,9 +1,10 @@
 // A pool of client connections (DESIGN.md §5.2, §4.11): each operation leases one connection exclusively until it
 // settles; closed connections are never handed out (F4); at `max`, operations wait FIFO.
-import { ConnectionClosedError } from "../core/errors/local.ts";
+import { CallTimeoutError, ConnectionClosedError } from "../core/errors/local.ts";
 import type { Interface } from "../core/idl/ast.ts";
 import {
   connectionInternals,
+  DEFAULT_TIMEOUT,
   type CallOptions,
   type CollectOptions,
   type Connection,
@@ -19,6 +20,11 @@ export interface PoolOptions {
   max?: number;
   /** Idle connections are closed after this many ms; default 30 000; 0 = keep forever. */
   idleTimeout?: number;
+  /**
+   * How long an operation without its own `timeout` waits for a connection (ms; default 45 000, the connection
+   * default; 0 = forever). Expiry rejects with `CallTimeoutError`.
+   */
+  timeout?: number;
 }
 
 /** Opens a connection; `signal` aborts when nobody wants it any more (operation aborted, pool closed). */
@@ -29,6 +35,7 @@ interface Waiter {
   reject(error: unknown): void;
   readonly signal: AbortSignal | undefined;
   onAbort: (() => void) | undefined;
+  timer: ReturnType<typeof setTimeout> | undefined;
   /** Settled (served, aborted or rejected). */
   done: boolean;
 }
@@ -41,12 +48,15 @@ interface Idle {
 /**
  * Connections from `factory`, leased per operation (DESIGN.md §5.2): `call`/`oneway`/`collect` hold their lease
  * until they settle, `stream` until its final reply, an error, or `return()`. A connection that closed is dropped
- * and never handed out again; a factory failure rejects only that operation. Create it with {@link createPool}.
+ * and never handed out again; a factory failure rejects only that operation. Waiting for a lease is bounded by the
+ * operation's `signal` and `timeout` (else the pool's `timeout`; `CallTimeoutError` on expiry). Create it with
+ * {@link createPool}.
  */
 export class Pool {
   readonly #factory: ConnectionFactory;
   readonly #max: number;
   readonly #idleTimeout: number;
+  readonly #timeout: number;
   readonly #all = new Set<Connection>();
   /** Most recently released last. */
   readonly #idle: Idle[] = [];
@@ -60,6 +70,7 @@ export class Pool {
     this.#factory = factory;
     this.#max = checkPositiveInt(options?.max, "max", 8);
     this.#idleTimeout = checkTimeout(options?.idleTimeout, "idleTimeout", 30_000);
+    this.#timeout = checkTimeout(options?.timeout, "timeout", DEFAULT_TIMEOUT);
   }
 
   /** Open connections (leased and idle; not counting ones being opened). */
@@ -74,12 +85,12 @@ export class Pool {
 
   /** {@link Connection.call} on a leased connection. */
   call(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<Record<string, unknown>> {
-    return this.#with(options?.signal, (c) => c.call(method, parameters, options));
+    return this.#with(options, (c) => c.call(method, parameters, options));
   }
 
   /** {@link Connection.oneway} on a leased connection. */
   oneway(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<void> {
-    return this.#with(options?.signal, (c) => c.oneway(method, parameters, options));
+    return this.#with(options, (c) => c.oneway(method, parameters, options));
   }
 
   /** {@link Connection.collect} on a leased connection. */
@@ -88,32 +99,35 @@ export class Pool {
     parameters?: Record<string, unknown>,
     options?: CollectOptions,
   ): Promise<Record<string, unknown>[]> {
-    return this.#with(options?.signal, (c) => c.collect(method, parameters, options));
+    return this.#with(options, (c) => c.collect(method, parameters, options));
   }
 
   /** {@link Connection.getInfo} on a leased connection. */
   getInfo(options?: CallOptions): Promise<ServiceInfo> {
-    return this.#with(options?.signal, (c) => c.getInfo(options));
+    return this.#with(options, (c) => c.getInfo(options));
   }
 
   /** {@link Connection.getInterfaceDescription} on a leased connection. */
   getInterfaceDescription(name: string, options?: CallOptions): Promise<string> {
-    return this.#with(options?.signal, (c) => c.getInterfaceDescription(name, options));
+    return this.#with(options, (c) => c.getInterfaceDescription(name, options));
   }
 
   /** {@link Connection.getInterface} on a leased connection. */
   getInterface(name: string, options?: CallOptions): Promise<Interface> {
-    return this.#with(options?.signal, (c) => c.getInterface(name, options));
+    return this.#with(options, (c) => c.getInterface(name, options));
   }
 
   /**
    * {@link Connection.stream} on a leased connection; the lease is acquired at once and held until the final
    * reply, an error, or `return()` (which closes that connection if the call was written, like on a Connection).
+   * If no lease is obtained (timeout, abort, factory failure, closed pool), `next()` rejects once, then is done.
    */
   stream(method: string, parameters?: Record<string, unknown>, options?: StreamOptions): StreamIterator {
     let inner: StreamIterator | undefined;
     let returned = false;
-    const ready = this.#acquire(options?.signal).then((conn) => {
+    /** The acquire failed and next() already rejected with it: later calls are done. */
+    let failed = false;
+    const ready = this.#acquire(options).then((conn) => {
       if (returned) {
         this.#release(conn);
         return undefined;
@@ -130,7 +144,14 @@ export class Pool {
     ready.catch(() => undefined);
     const it: StreamIterator = {
       next: async () => {
-        const s = await ready;
+        let s: StreamIterator | undefined;
+        try {
+          s = await ready;
+        } catch (e) {
+          if (failed) return { value: undefined, done: true };
+          failed = true;
+          throw e;
+        }
         if (s === undefined) return { value: undefined, done: true };
         return s.next();
       },
@@ -160,8 +181,8 @@ export class Pool {
     await Promise.all([...this.#all].map((c) => c.close()));
   }
 
-  async #with<T>(signal: AbortSignal | undefined, op: (conn: Connection) => Promise<T>): Promise<T> {
-    const conn = await this.#acquire(signal);
+  async #with<T>(options: CallOptions | undefined, op: (conn: Connection) => Promise<T>): Promise<T> {
+    const conn = await this.#acquire(options);
     try {
       return await op(conn);
     } finally {
@@ -169,12 +190,22 @@ export class Pool {
     }
   }
 
-  #acquire(signal: AbortSignal | undefined): Promise<Connection> {
+  /** Waits for a lease, bounded by the operation's `signal` and `timeout` (the pool's `timeout` if absent). */
+  #acquire(options: CallOptions | undefined): Promise<Connection> {
     if (this.#closed) return Promise.reject(new ConnectionClosedError("pool closed"));
+    const signal = options?.signal;
     // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the abort reason as is
     if (signal?.aborted === true) return Promise.reject(signal.reason);
     return new Promise((resolve, reject) => {
-      const w: Waiter = { resolve, reject, signal, onAbort: undefined, done: false };
+      // A RangeError here rejects the operation.
+      const timeout = checkTimeout(options?.timeout, "timeout", this.#timeout);
+      const w: Waiter = { resolve, reject, signal, onAbort: undefined, timer: undefined, done: false };
+      if (timeout > 0)
+        w.timer = setTimeout(() => {
+          const i = this.#waiters.indexOf(w);
+          if (i >= 0) this.#waiters.splice(i, 1);
+          this.#settleWaiter(w, undefined, new CallTimeoutError("timed out waiting for a pool connection"));
+        }, timeout);
       if (signal !== undefined) {
         w.onAbort = () => {
           const i = this.#waiters.indexOf(w);
@@ -191,6 +222,7 @@ export class Pool {
   #settleWaiter(w: Waiter, conn: Connection | undefined, error?: unknown): void {
     if (w.done) return;
     w.done = true;
+    if (w.timer !== undefined) clearTimeout(w.timer);
     if (w.onAbort !== undefined) w.signal?.removeEventListener("abort", w.onAbort);
     if (conn !== undefined) w.resolve(conn);
     else w.reject(error);

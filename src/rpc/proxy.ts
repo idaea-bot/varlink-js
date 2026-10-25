@@ -29,17 +29,21 @@ export interface ProxyMethod {
 }
 
 /**
- * A frozen object with one {@link ProxyMethod} per method of the interface (by short name; varlink method names
- * start with an upper-case letter, so they never collide with `name`/`interface`). An unknown method is
- * `undefined`. Parameters are always encoded with the method's input type (ValidationError before anything is
- * written); replies are decoded per `validateReplies`; error parameters are checked against the interface's errors.
+ * A frozen null-prototype object with one {@link ProxyMethod} per method of the interface (by short name; varlink
+ * method names start with an upper-case letter, so they never collide with `name`/`interface`). An unknown method
+ * is `undefined`, and so are `Object.prototype` names (`toString`, `constructor`, `__proto__`, …). Parameters are
+ * always encoded with the method's input type (ValidationError before anything is written); replies are decoded
+ * per `validateReplies`; error parameters are checked against the interface's errors. Methods are typed by an index
+ * signature over capitalized names; index with a `string` via `px[name as Capitalize<string>]`.
  */
-export type InterfaceProxy = Readonly<Record<string, ProxyMethod | undefined>> & {
+export interface InterfaceProxy {
   /** The interface name. */
   readonly name: string;
   /** The parsed interface (AST). */
   readonly interface: Interface;
-};
+  /** A method by short name (`undefined` if the interface has none). */
+  readonly [method: Capitalize<string>]: ProxyMethod | undefined;
+}
 
 /** Builds the proxy for `name` on `conn`. */
 export async function createProxy(conn: Connection, name: string, options?: ProxyOptions): Promise<InterfaceProxy> {
@@ -47,7 +51,8 @@ export async function createProxy(conn: Connection, name: string, options?: Prox
   const internals = connectionInternals(conn);
   const ast = await conn.getInterface(name);
   const compiled = compileInterface(ast, { ints: internals.ints, codec: internals.codec });
-  const out: Record<string, unknown> = {};
+  // No prototype: `px.toString`, `px.constructor`, `px.__proto__` are undefined like any unknown method.
+  const out = Object.create(null) as Record<string, unknown>;
   for (const m of compiled.methods.values()) {
     const spec: CallSpec = { input: m.input, output: m.output, mode, errors: compiled };
     const method = m.method;
@@ -94,5 +99,5 @@ export async function createProxy(conn: Connection, name: string, options?: Prox
   }
   Object.defineProperty(out, "name", { value: compiled.name, enumerable: true });
   Object.defineProperty(out, "interface", { value: ast, enumerable: true });
-  return Object.freeze(out) as InterfaceProxy;
+  return Object.freeze(out) as unknown as InterfaceProxy;
 }

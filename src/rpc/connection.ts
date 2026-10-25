@@ -483,6 +483,10 @@ export class Connection {
    * A call with `more`: yields every reply including the final one. The call is enqueued at once. An error reply
    * rejects `next()` after the earlier replies were consumed. `return()` (leaving a `for await`) before the final
    * reply closes the connection if the call was written (UAPI has no cancel), else just drops the call.
+   *
+   * Consume the stream (or `return()` it): once `highWaterMark` replies are buffered unread, the connection stops
+   * reading, so every later call on it waits behind the stream — and since a call's timeout starts only when it
+   * reaches the head of the reply queue, awaiting such a call before draining the stream waits forever.
    */
   stream<M extends MethodDescriptor<object, object>>(
     method: M,

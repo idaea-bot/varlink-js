@@ -40,14 +40,17 @@ export interface Endpoint {
   raw(): Promise<RawPeer>;
   /** Drops every server-side connection, as a server restart does (absent if the transport cannot). */
   restart?(): Promise<void>;
+  /** The server-side `net.Socket`s accepted so far and still open (socket transports only). */
+  serverSockets?(): Socket[];
   close(): Promise<void>;
 }
 
 export interface Transport {
   readonly name: string;
   /**
-   * Whether `RawPeer.reset()` is seen by the server as a disconnect (a rejected read). False for unix sockets: they
-   * have no RST, so a destroyed peer is a clean EOF (half-close), which is not "gone" (DESIGN.md §4.11).
+   * Whether `RawPeer.reset()` is seen by the server as a disconnect (a rejected read). False for unix sockets: the
+   * reset there is a plain destroy with nothing unread, which the server reads as a clean EOF (half-close), not
+   * "gone". (A unix socket closed with unread data does give its peer ECONNRESET on Linux; DESIGN.md §4.11.)
    */
   readonly abruptReset: boolean;
   start(server: Server): Promise<Endpoint>;
@@ -231,7 +234,15 @@ function socketTransport(name: string, abruptReset: boolean, address: (dir: stri
     async start(server: Server): Promise<Endpoint> {
       const dir = await mkdtemp(join(tmpdir(), "vj-"));
       const channels = new Set<ByteChannel>();
-      let listener = await listen(address(dir));
+      const accepted = new Set<Socket>();
+      const watch = (l: NodeListener): NodeListener => {
+        l.server.on("connection", (socket: Socket) => {
+          accepted.add(socket);
+          socket.once("close", () => accepted.delete(socket));
+        });
+        return l;
+      };
+      let listener = watch(await listen(address(dir)));
       // Restarts listen again on the very same address (tcp: the real port).
       const canonical = listener.address;
       server.serve(tracked(listener, channels));
@@ -249,7 +260,7 @@ function socketTransport(name: string, abruptReset: boolean, address: (dir: stri
           socket.once("close", () => peers.delete(socket));
           const channel = fromNodeSocket(socket);
           return rawPeerOf(channel, () => {
-            // tcp: a real RST; unix has none, so the server sees EOF.
+            // tcp: a real RST; unix: a destroy with nothing unread, which the server sees as EOF.
             if (abruptReset) socket.resetAndDestroy();
             else socket.destroy();
           });
@@ -257,9 +268,10 @@ function socketTransport(name: string, abruptReset: boolean, address: (dir: stri
         restart: async () => {
           await listener.close();
           await dropConnections();
-          listener = await listen(canonical);
+          listener = watch(await listen(canonical));
           server.serve(tracked(listener, channels));
         },
+        serverSockets: () => [...accepted],
         close: async () => {
           await listener.close();
           for (const socket of peers) socket.destroy();

@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { ConnectionClosedError, type CallContext } from "../../src/index.ts";
 import { connect, listen, type NodeListener } from "../../src/node/index.ts";
 import { createServer } from "../../src/rpc/index.ts";
 import { tcpTransport, unixTransport, waitFor } from "./harness.ts";
@@ -90,3 +91,71 @@ for (const transport of [unixTransport, tcpTransport]) {
     });
   });
 }
+
+describe("accept errors are not fatal (EMFILE): the listener keeps serving", () => {
+  test("an error emitted on the net.Server, then a connection: served", async () => {
+    const errors: unknown[] = [];
+    const reported: string[] = [];
+    const listener = await listen("tcp:127.0.0.1:0", { onError: (e) => errors.push(e) });
+    const server = createServer({ onError: (_e, info) => reported.push(info.reason) });
+    server.addInterface(IDL, { Ping: () => ({}) });
+    server.serve(listener);
+    try {
+      const emfile = Object.assign(new Error("accept EMFILE"), { code: "EMFILE", errno: -24, syscall: "accept" });
+      listener.server.emit("error", emfile);
+      await new Promise((resolve) => setImmediate(resolve));
+      const conn = await connect(listener.address);
+      assert.deepEqual(await conn.call(`${I}.Ping`), {});
+      await conn.close();
+      assert.deepEqual(errors, [emfile]);
+      assert.deepEqual(reported, []);
+      assert.ok(listener.server.listening);
+    } finally {
+      await server.shutdown();
+    }
+    assert.equal(listener.server.listening, false);
+  });
+});
+
+describe("graceful shutdown over tcp delivers the active call's reply (no RST from unread input)", () => {
+  test("pipelined calls behind a slow call: its 2 MB reply arrives, the rest reject ConnectionClosedError", async () => {
+    const big = "z".repeat(2 * 1024 * 1024);
+    let started: AbortSignal | undefined;
+    const server = createServer({ onError: () => undefined });
+    server.addInterface(IDL, {
+      Ping: () => ({}),
+      // "slow" waits for the shutdown signal, then answers with a big reply (longer than the socket buffers).
+      Echo: (p: { text: string }, ctx: CallContext) => {
+        if (p.text !== "slow") return { text: p.text };
+        started = ctx.signal;
+        return new Promise((resolve) => {
+          ctx.signal.addEventListener("abort", () => {
+            resolve({ text: big });
+          });
+        });
+      },
+    });
+    const ep = await tcpTransport.start(server);
+    try {
+      const conn = await ep.connect({ timeout: 0 });
+      const slow = conn.call(`${I}.Echo`, { text: "slow" });
+      await waitFor(() => started !== undefined);
+      // Far more than the server buffers (64 queued calls, Node's read buffer): the rest stays unread in the kernel.
+      const filler = "f".repeat(4096);
+      const dropped = Array.from({ length: 200 }, () => conn.call(`${I}.Echo`, { text: filler }));
+      const settled = Promise.allSettled(dropped);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await server.shutdown({ graceful: true });
+      const reply = (await slow) as { text: string };
+      assert.equal(reply.text.length, big.length);
+      for (const r of await settled) {
+        assert.equal(r.status, "rejected");
+        assert.ok(r.reason instanceof ConnectionClosedError, String(r.reason));
+      }
+      await conn.close();
+    } finally {
+      await ep.close();
+      await server.shutdown({ graceful: false });
+    }
+  });
+});
