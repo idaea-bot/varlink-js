@@ -36,3 +36,17 @@ without `more`; the record count must match `varlinkctl call --more`).
 
 The workflow runs the varlinkctl job on `ubuntu-24.04` (systemd 255) and `ubuntu-latest` (Ubuntu 26.04 since
 2026-10, systemd 259).
+
+## Results (2026-10-25)
+
+- **GitHub Actions** (`Interop` workflow): python-varlink 31.0.0 (python 3.13) both ways over unix and tcp on
+  ubuntu-latest and macos-latest; rust `varlink-certification` (varlink/rust 2041093d, `cargo build --locked`,
+  about 30 s) both ways over unix and tcp; varlinkctl on ubuntu-24.04 (systemd 255.4-1ubuntu8.18, userdb
+  Multiplexer 39 records) and ubuntu-latest (Ubuntu 26.04, systemd 259.9-0ubuntu0.1, 37 records). systemd 259
+  still rejects `[string]()` in `validate-idl`, and its `introspect` then prints the description verbatim.
+- **UTM VM** (`ossvm`, Ubuntu 24.04 arm64, systemd 255.4-1ubuntu8.18, Node 24.22.1, python 3.12 + varlink 31.0.0,
+  `systemd-userdbd` installed), run once on the first M5 commit: `certification.test.ts`, `python.test.ts` (all
+  four directions) and `varlinkctl.test.ts`, 58/58 pass, Multiplexer 34 records from our client and from
+  `varlinkctl call --more`. Rust was not run in the VM (no cargo there); CI covers it.
+- **macOS** (dev host, Node 26, python 3.14 + varlink 31.0.0, rust binary built locally): everything except
+  `varlinkctl.test.ts`.
