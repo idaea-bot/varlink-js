@@ -426,7 +426,8 @@ describe("validateInterface on hand-built ASTs", () => {
       () => formatInterface(ok([{ kind: "type", name: "T", experimental: false, type: level }])),
       isInvalidAst(/^AST too large$/),
     );
-    assert.ok(performance.now() - started < 2_000, String(performance.now() - started));
+    // Generous bound (2^40 paths would never finish): 2 s flaked at ~2.2 s on loaded CI runners.
+    assert.ok(performance.now() - started < 10_000, String(performance.now() - started));
   });
 
   test("shared, non-cyclic subtrees are valid", () => {

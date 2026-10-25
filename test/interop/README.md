@@ -4,7 +4,7 @@
 | --------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
 | `certification.test.ts` | always (`npm test`)                    | nothing: JS client ↔ JS server over pair/unix/tcp, the server's checks, the CLIs as child processes |
 | `python.test.ts`      | `VARLINK_PYTHON=<python>`                | a python with `varlink` (`pip install varlink==31.0.0`)               |
-| `rust.test.ts`        | `VARLINK_RUST_CERT=<binary>`             | `varlink-certification` from github.com/varlink/rust (`cargo build --release -p varlink-certification`) |
+| `rust.test.ts`        | `VARLINK_RUST_CERT=<binary>`             | `varlink-certification` from github.com/varlink/rust (`cargo build --release --locked -p varlink-certification`) |
 | `varlinkctl.test.ts`  | `VARLINK_VARLINKCTL=1`                   | Linux with systemd ≥ 255 (`varlinkctl`); the Multiplexer cases also need `systemd-userdbd` |
 
 Without their variable the optional suites skip with a reason. `VARLINK_REQUIRE_INTEROP=1` (set by the

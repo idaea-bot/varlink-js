@@ -11,7 +11,7 @@ import { formatInterface, parseInterface } from "../../src/idl/index.ts";
 import { VarlinkError } from "../../src/index.ts";
 import { connect, listen } from "../../src/node/index.ts";
 import { createServer, type Server } from "../../src/rpc/index.ts";
-import { createCertificationServer } from "../../examples/certification/certification.ts";
+import { createCertificationServer, readCertificationIdl } from "../../examples/certification/certification.ts";
 import { gate, REQUIRE_INTEROP, ROOT, tempDir } from "./helpers.ts";
 
 const ENABLED = process.env["VARLINK_VARLINKCTL"] === "1";
@@ -299,13 +299,14 @@ describe("varlinkctl", { skip: ENABLED ? false : "set VARLINK_VARLINKCTL=1 (Linu
     try {
       const path = join(tmp.dir, "cert.sock");
       cert.serve(await listen(`unix:${path}`));
-      const accepted = (await varlinkctl(t, "validate-idl", join(ROOT, "interfaces/org.varlink.certification.varlink")))
-        .code;
+      const validated = await varlinkctl(t, "validate-idl", join(ROOT, "interfaces/org.varlink.certification.varlink"));
       const r = await varlinkctl(t, "introspect", path, "org.varlink.certification");
-      if (accepted === 0) assert.equal(r.code, 0, "introspect works when systemd accepts the IDL");
+      assert.equal(r.code, 0);
+      if (validated.code === 0) assert.equal(r.stdout, validated.stdout);
       else {
-        assert.notEqual(r.code, 0, "introspect fails like validate-idl of the same text");
-        t.diagnostic("this systemd rejects the certification IDL ([string]()), so introspect fails as expected");
+        // systemd 255 and 259 cannot parse `[string]()`; introspect then prints the description verbatim.
+        assert.equal(r.stdout.trimEnd(), (await readCertificationIdl()).trimEnd());
+        t.diagnostic("this systemd rejects the certification IDL ([string]()); introspect printed it verbatim");
       }
       const [started] = jsonLines(await ok(t, "--json=short", "call", path, "org.varlink.certification.Start", "{}"));
       assert.match(String((started as Record<string, unknown>)["client_id"]), /^[0-9a-f]{32}$/);

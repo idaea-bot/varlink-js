@@ -381,7 +381,8 @@ describe("jsonEqual and withoutNullOptionals", () => {
 
 describe("certification client against a broken server", () => {
   // One wrong reply per case; runCertificationClient must notice it (the reference servers would not be needed).
-  const cases: { name: string; method: string; reply: Record<string, unknown> }[] = [
+  const mytype = CERTIFICATION_STEPS[8]?.replies[0]?.["mytype"] as Record<string, unknown>;
+  const cases: { name: string; method: string; reply: Record<string, unknown>; ok?: true }[] = [
     {
       name: "a float that is only close to π",
       method: "Test05",
@@ -394,6 +395,25 @@ describe("certification client against a broken server", () => {
       reply: { set: { one: {}, two: {}, three: {}, four: {} } },
     },
     { name: "End without all_ok", method: "End", reply: { all_ok: false } },
+    {
+      name: "MyType.object with an extra null key",
+      method: "Test09",
+      reply: { mytype: { ...mytype, object: { ...(mytype["object"] as object), extra: null } } },
+    },
+    {
+      name: "MyType.stringset with an own __proto__ member",
+      method: "Test09",
+      reply: {
+        mytype: { ...mytype, stringset: JSON.parse('{"one":{},"two":{},"three":{},"__proto__":{}}') as unknown },
+      },
+    },
+    {
+      // What python's server sends: an extra client_id and the ? fields as null. Not broken: must pass.
+      name: "python-shaped Test09 reply (passes)",
+      method: "Test09",
+      reply: { client_id: "x", mytype: { ...mytype, nullable: null, nullable_array_struct: null } },
+      ok: true,
+    },
   ];
   for (const c of cases) {
     test(c.name, async () => {
@@ -409,13 +429,16 @@ describe("certification client against a broken server", () => {
           return c.reply;
         },
       });
-      const endpoint = await pairTransport().start(server);
-      const conn = await endpoint.connect({ validateReplies: "throw", timeout: 10_000 });
+      let endpoint: Endpoint | undefined;
+      let conn: Connection | undefined;
       try {
-        await assert.rejects(runCertificationClient(conn), new RegExp(`^Error: ${c.method}: expected`));
+        endpoint = await pairTransport().start(server);
+        conn = await endpoint.connect({ validateReplies: "throw", timeout: 10_000 });
+        if (c.ok === true) await runCertificationClient(conn);
+        else await assert.rejects(runCertificationClient(conn), new RegExp(`^Error: ${c.method}: expected`));
       } finally {
-        await conn.close();
-        await endpoint.close();
+        await conn?.close();
+        await endpoint?.close();
         await server.shutdown({ graceful: false });
       }
     });
