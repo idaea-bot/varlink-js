@@ -103,6 +103,22 @@ describe("fromWebSocket: reading", () => {
     assert.deepEqual(ws.closes, [{ code: 1011, reason: "unreadable message" }]);
   });
 
+  test("an unreadable Blob also rejects a write waiting for the buffer, even if the close is clean", async () => {
+    const ws = new FakeWebSocket();
+    ws.holdClose = true;
+    const ch = fromWebSocket(ws, { writeHighWaterMark: 0 });
+    ws.bufferedAmount = 1;
+    const w = ch.write(enc("x"));
+    const boom = new Error("unreadable");
+    ws.message({ size: 3, arrayBuffer: () => Promise.reject(boom) });
+    await assert.rejects(ch.read(), (e: unknown) => e instanceof ConnectionClosedError && e.cause === boom);
+    ws.closed(1000);
+    await assert.rejects(w, ConnectionClosedError);
+    await assert.rejects(ch.write(enc("y")), ConnectionClosedError);
+    ch.close();
+    await ch.closed;
+  });
+
   test("an unsupported message type fails the next read and closes the socket", async () => {
     const ws = new FakeWebSocket();
     ws.strictCodes = true;

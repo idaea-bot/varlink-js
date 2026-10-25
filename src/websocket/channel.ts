@@ -362,6 +362,9 @@ class WebSocketChannel implements ByteChannel {
         this.#outcome = null;
         this.#outcomeDelivered = true;
         reader.reject(slot.error);
+        // Our own failure: like #fail, waiting writes reject at once.
+        this.#writeShut = true;
+        this.#rejectWrites(new ConnectionClosedError("the websocket is closed", { cause: slot.error }));
         if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
         closeSocket(this.#ws, 1011, "unreadable message");
         this.#armGuard();

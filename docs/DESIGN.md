@@ -1007,8 +1007,9 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   absent/null/an object; such a record is held back until the next record starts (it was a reply: yielded) or the
   body ends (a valid error name → that `VarlinkError`, otherwise `HttpBridgeError(200, bridgeMessage = error)`, the
   spec's transport-failure record `{"error": "<message>"}`). Every other record is yielded at once. Records completed before an error in the same body chunk (a
-  record too large, malformed or not JSON, data after a record) are still yielded first; the error follows them
-  (found on CI, where TCP coalesced two writes). Records are pulled
+  record too large, malformed or not JSON, data after a record) are still yielded first, so the result does not depend
+  on how the body is chunked; an error-shaped record held back right before the error is dropped (the error wins), and
+  an error found this way wins over a later abort or timeout while the buffered records are read. Records are pulled
   from the body reader on demand (natural backpressure); concurrent `next()` calls are served in order. `timeout`
   counts from the call to the first record (also while nobody calls `next()`), `idleTimeout` (default none) runs only
   while a `next()` waits for the network, armed once per wait and reset only by a complete record (never by a body
