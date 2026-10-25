@@ -1013,7 +1013,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   case variant), `service`, `timeout` (45 000, 0 = none), `ints`, `validateReplies`, `codec`, `errors`, `interfaces`,
   `maxMessageSize` (16 MiB: a whole non-streaming body and each json-seq record), `onError` (as on a Connection).
   Methods mirror Connection (same option names; a per-call `service` overrides the client's): `call`, `stream`,
-  `collect` (with the typed descriptor overloads; the descriptor's interface must be registered), `addInterface`,
+  `collect` (with the typed descriptor overloads; the descriptor's interface must be registered), `addInterface`
+  (the same rules as on a Connection: `bindDescriptor`, compatible IDL for the built-ins, their classes fill gaps),
   `oneway()` → `OperationNotSupportedError` (UAPI "Limitations"), `listServices()` (`GET services`),
   `getInfo(service)` (`GET services/{service}`, always validated against GetInfo's output, `"throw"`),
   `listMethods(service, iface)`, `health()` (`GET health`: true iff 200, the body is cancelled, a network failure
@@ -1181,9 +1182,9 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   `builtins.test.ts` fails when they are stale, when a source differs from its constant, or when a built-in IDL
   contains `int` (so they bind in both modes). rpc imports them through `src/interfaces/index.ts`, so the
   internal interface's name stays in one place in hand-written code. A generated built-in descriptor says
-  `ints: "number"` and, being `int`-free, binds on a bigint connection or server as is (`bindDescriptor`, the same
+  `ints: "number"` and, being `int`-free, binds on a bigint connection, server or HTTP client as is (`bindDescriptor`, the same
   rule as for any descriptor; no built-in override): `OrgVarlinkService.client(bigintConn)` works. A client generated from another implementation's `org.varlink.service` text (libvarlink,
-  python, rust, systemd) binds too: connections and pools accept a text under the built-in names that is
+  python, rust, systemd) binds too: connections, pools and HTTP clients accept a text under the built-in names that is
   compatible with the built-in definition (§4.11; all five corpus texts are), and reject others. Not generated here: `org.varlink.certification` (M5's interface file) and
   `org.varlink.resolver` (M8).
 - **Tests** (`test/unit/codegen/`): `generate.test.ts` (each mapping rule, docs, flags, names and collisions,
@@ -1644,7 +1645,7 @@ nightly (optional).
   browser-facing subpaths (`src/index.ts`, `src/idl`, `src/websocket`, `src/http`, plus M6's generated
   `src/interfaces`, which is not a subpath): a local rule (`eslint-rules/layer-boundaries.js`) allows only relative imports that resolve
   inside the layer's allowed directories (core → core; rpc, the root entry and interfaces → core+rpc+interfaces;
-  idl → core+idl; websocket/http → core+rpc+self),
+  idl → core+idl; websocket → core+rpc+self; http → core+rpc+interfaces+self),
   so `node:*`, bare built-ins, npm packages, the package's own name and adapter paths are all rejected,
   including `export … from`, `import()`, `import("x").T` and `declare module "x"`;
   `no-restricted-globals` (`process`, `Buffer`, `Bun`, `Deno`, `require`, `window`, `document`, …), the same

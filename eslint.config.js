@@ -17,7 +17,8 @@ const LAYERS = {
   "src/interfaces": ["src/core", "src/rpc", "src/interfaces"],
   "src/idl": ["src/core", "src/idl"],
   "src/websocket": ["src/core", "src/rpc", "src/websocket"],
-  "src/http": ["src/core", "src/rpc", "src/http"],
+  // http binds the generated built-ins itself, as rpc's Connection does (bindDescriptor, DESIGN.md §4.12).
+  "src/http": ["src/core", "src/rpc", "src/interfaces", "src/http"],
 };
 const agnosticFiles = Object.keys(LAYERS).map((l) => (l.endsWith(".ts") ? l : `${l}/**`));
 

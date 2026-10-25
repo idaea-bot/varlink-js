@@ -11,7 +11,7 @@ import {
   safeQuote,
 } from "../core/errors/local.ts";
 import { createErrorRegistry, type ErrorRegistry } from "../core/errors/registry.ts";
-import { INTERNAL_ERROR_INTERFACE_IDL, ORG_VARLINK_SERVICE, ORG_VARLINK_SERVICE_IDL } from "../core/errors/standard.ts";
+import { ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
 import { isErrorName, VarlinkError, type ErrorClass } from "../core/errors/varlink-error.ts";
 import { isInterfaceName } from "../core/idl/names.ts";
 import { parseMethodName, type ValidateReplies } from "../core/protocol/dispatch.ts";
@@ -32,6 +32,8 @@ import {
   type ServiceInfo,
   type StreamIterator,
 } from "../rpc/connection.ts";
+import { InternalErrorInterface, OrgVarlinkService } from "../interfaces/index.ts";
+import { assertBuiltinCompatible } from "../rpc/service.ts";
 import { checkMode, checkPositiveInt, checkTimeout, splitName } from "../rpc/util.ts";
 import { HttpBridgeError } from "./errors.ts";
 import { isJsonWhitespace, JsonSeqSplitter } from "./jsonseq.ts";
@@ -400,8 +402,8 @@ export class HttpClient {
     const onError = options?.onError ?? defaultOnError;
     if (typeof onError !== "function") throw new TypeError("onError must be a function");
     this.#onError = onError;
-    this.addInterface(ORG_VARLINK_SERVICE_IDL);
-    this.addInterface(INTERNAL_ERROR_INTERFACE_IDL);
+    this.addInterface(OrgVarlinkService);
+    this.addInterface(InternalErrorInterface);
     for (const i of options?.interfaces ?? []) this.addInterface(i);
   }
 
@@ -411,14 +413,15 @@ export class HttpClient {
   }
 
   /**
-   * Registers an interface for validation: compiled with this client's `ints` and codec; a descriptor binds as on
-   * `Connection.addInterface` (`bindDescriptor`, DESIGN §4.9: one with no `int` binds in either `ints` mode, one that
-   * uses `int` must match this client's `ints`); its error classes are added to the error registry; the same name
-   * again is a no-op for the same IDL text and a TypeError for a different one (unlike a Connection, built-in names
-   * accept only their exact IDL text).
+   * Registers an interface for validation, as `Connection.addInterface` does: compiled with this client's `ints`
+   * and codec; a descriptor binds through `bindDescriptor` (DESIGN §4.9: one without `int` binds in either `ints`
+   * mode) and its error classes are added to the error registry. The same name again: no-op for the same IDL text,
+   * TypeError for a different one. The built-ins (`org.varlink.service` and the internal error interface) are
+   * registered at construction (their error classes fill the gaps of a user-supplied registry) and accept another IDL text if it is compatible: the built-in definition stays in
+   * charge of validation, and their error classes are added only under names that have no class yet.
    *
-   * @throws {TypeError} on a different IDL under a taken name, a descriptor mismatch or an `ints` mismatch of an
-   *   `int`-using descriptor.
+   * @throws {TypeError} on a different IDL under a taken name (for a built-in: an incompatible one), a descriptor
+   *   mismatch or an `ints` mismatch (only for an interface that uses `int`: one without binds in either mode).
    * @throws {IdlSyntaxError} for invalid IDL.
    */
   addInterface(descriptorOrIdl: InterfaceDescriptor | string): void {
@@ -432,6 +435,14 @@ export class HttpClient {
       idl = descriptorOrIdl.idl;
       compiled = bindDescriptor(descriptorOrIdl, this.#ints, { codec: this.#codec });
       classes = Object.values(descriptorOrIdl.errors);
+    }
+    if (compiled.name === OrgVarlinkService.name || compiled.name === InternalErrorInterface.name) {
+      // As on a Connection: never replaced; a user-supplied registry keeps its own classes.
+      const builtin = this.#interfaces.get(compiled.name);
+      if (builtin !== undefined && builtin.idl !== idl) assertBuiltinCompatible(compiled.ast);
+      this.#errors.register(...classes.filter((cls) => !this.#errors.has(cls.errorName)));
+      if (builtin === undefined) this.#interfaces.set(compiled.name, { idl, compiled });
+      return;
     }
     const existing = this.#interfaces.get(compiled.name);
     if (existing !== undefined && existing.idl !== idl)

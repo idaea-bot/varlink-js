@@ -8,6 +8,7 @@ import { createHttpClient, HttpBridgeError, type FetchLike } from "../../../src/
 import {
   CallTimeoutError,
   ConnectionClosedError,
+  ErrorRegistry,
   IntegerRangeError,
   type InterfaceDescriptor,
   InterfaceNotFoundError,
@@ -330,13 +331,58 @@ describe("HTTP client: calls", () => {
         idl: nointIdl.replace("noint", "noint2"),
         methods: {},
       });
-    }, TypeError);
+    }, /^TypeError: descriptor of org\.example\.noint2: /);
+    // The reverse: a bigint-generated int-free descriptor on a number client.
+    createHttpClient(bridge.base).addInterface({ ...noint, ints: "bigint" });
     // An int-using descriptor must still match the client's ints.
     assert.throws(() => {
       bigint.addInterface(DESC);
     }, /ints/);
     assert.throws(() => createHttpClient(bridge.base, { ints: "bigint", interfaces: [DESC] }), TypeError);
     createHttpClient(bridge.base, { ints: "number", interfaces: [DESC, OrgVarlinkService, noint] });
+  });
+
+  test("built-in names follow the Connection rules: compatible IDL accepted, user registry classes kept, gaps filled", async () => {
+    // Another implementation's org.varlink.service text: docs and order differ, members agree.
+    const other = [
+      "# Another implementation's text.",
+      "interface org.varlink.service",
+      "error InterfaceNotFound (interface: string)",
+      "method GetInfo() -> (vendor: string, product: string, version: string, url: string, interfaces: []string)",
+      "",
+    ].join("\n");
+    const client = createHttpClient(bridge.base, { ints: "bigint", interfaces: [other], validateReplies: "throw" });
+    // The built-in definition still validates: GetInterfaceDescription is not in `other` but is known.
+    assert.equal(
+      typeof (await client.call(OrgVarlinkService.methods.GetInfo, {}, { service: SERVICE })).vendor,
+      "string",
+    );
+    await client.call("org.varlink.service.GetInterfaceDescription", { interface: SERVICE }, { service: SERVICE });
+    assert.throws(
+      () => {
+        client.addInterface(other + "\nmethod Ping() -> ()\n");
+      },
+      (e) => e instanceof TypeError && /method Ping is not in the built-in definition/.test(e.message),
+    );
+    // A user registry with its own class for a built-in error keeps it; the generated built-in fills only gaps.
+    class MyNotFound extends VarlinkError<{ interface: string }> {
+      static readonly errorName: string = "org.varlink.service.InterfaceNotFound";
+      constructor(parameters: { interface: string }, options?: ErrorOptions) {
+        super(MyNotFound.errorName, parameters, options);
+      }
+      static is(e: unknown): e is MyNotFound {
+        return e instanceof MyNotFound;
+      }
+    }
+    const errors = new ErrorRegistry().register(MyNotFound);
+    const own = createHttpClient(bridge.base, { errors, interfaces: [OrgVarlinkService] });
+    own.addInterface(OrgVarlinkService);
+    assert.equal(errors.get(MyNotFound.errorName), MyNotFound);
+    assert.equal(errors.get(MethodNotFoundError.errorName), MethodNotFoundError);
+    await assert.rejects(
+      own.call("org.varlink.service.GetInterfaceDescription", { interface: "org.example.none" }, { service: SERVICE }),
+      MyNotFound,
+    );
   });
 
   test("invalid method and service names, bad parameters and bad options are rejected before any request", async () => {
