@@ -1257,6 +1257,17 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   hand; `/`, DEL, C1 and non-ASCII are left raw as by `JSON.stringify`); `format`, `codegen`, `bridge`, `certify`
   and the HTTP/WebSocket targets are ours; `--upgrade` (M9), `--exec`, `--push-fd` (M11), `serve`,
   `list-registry`, `list-sockets`, `--user`/`--system`, `monitor` options are not in M7.
+- **Checked against varlinkctl** (systemd 255.4 in the UTM VM, Node 24.22.1, M7; scripts and results in
+  `test/e2e/cli/varlinkctl/`): byte-identical stdout and the same exit code for `info`, `info -j`,
+  `list-interfaces` (both), `introspect -j`, `call --json=short`, `call --oneway`, `call --more` (JSON-SEQ) against
+  `io.systemd.ManagedOOM` and the userdb Multiplexer, and for 34 of 42 echo replies in `--json=short|pretty` (nested
+  empty containers, escapes, `\u0001`, U+007F/U+0080/U+2028, non-ASCII, ±2⁶³, 2⁶⁴−1, `-0`, key order, `--more`
+  pretty SEQ). Differences seen: reals (sd-json 255 prints `1.500000000000000000000000000000000000e+00` /
+  `1.000000000000000055511151231257827021e-01`; we print JS's shortest round-trip form `1.5` / `0.1`, deliberately);
+  systemd 255 ends `call` output without a newline (newer varlinkctl adds it, as we do); `introspect`/`validate-idl`
+  text is our canonical formatting, not sd-varlink's re-print (multi-line parameter lists); 255 has no `-q`,
+  `--graceful`, `--collect`, `list-methods`, sends invalid method names unchecked and names `ExpectedMore` instead of
+  newer varlinkctl's text; our validate-idl messages are ours. systemd 259 was not compared in M7.
 - **Tests**: `test/unit/cli/` (in-process `run()` with a fake `CliIo` against a service on a unix socket and
   `tcp:127.0.0.1:0`, a raw socket peer for hostile bytes, and the M10 bridge fixture for one WebSocket and one HTTP
   call; Node, Bun, Deno): every command and option, usage errors, goldens of both JSON styles, SEQ framing, int

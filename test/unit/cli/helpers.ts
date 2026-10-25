@@ -56,6 +56,8 @@ export interface Fixture {
   readonly logged: string[];
   /** Number of Monitor calls whose connection went away (their signal aborted). */
   monitorsEnded: number;
+  /** Number of Hang calls received. */
+  hangs: number;
   close(): Promise<void>;
 }
 
@@ -75,6 +77,7 @@ export async function startFixture(): Promise<Fixture> {
     tcp: "",
     logged,
     monitorsEnded: 0,
+    hangs: 0,
     close: async () => {
       await server.shutdown({ graceful: false });
       await rm(dir, { recursive: true, force: true });
@@ -99,12 +102,14 @@ export async function startFixture(): Promise<Fixture> {
       }
       return { i: -1 };
     },
-    Hang: (_p: Record<string, unknown>, ctx: CallContext) =>
-      new Promise((resolve) => {
+    Hang: (_p: Record<string, unknown>, ctx: CallContext) => {
+      fixture.hangs++;
+      return new Promise((resolve) => {
         ctx.signal.addEventListener("abort", () => {
           resolve({});
         });
-      }),
+      });
+    },
     Fail: (p: Record<string, unknown>) => {
       throw new VarlinkError(String(p["error"]), (p["parameters"] as Record<string, unknown> | null) ?? {});
     },
@@ -230,8 +235,11 @@ export async function tempDir(): Promise<{ path: string; remove(): Promise<void>
  * A raw socket server on tcp:127.0.0.1:0 that answers every NUL-terminated message with the next of `replies`
  * (verbatim JSON texts, NUL appended). For peer-controlled bytes the library's own server would refuse to send.
  */
-export async function rawServer(replies: readonly string[]): Promise<{ address: string; close(): Promise<void> }> {
+export async function rawServer(
+  replies: readonly string[],
+): Promise<{ address: string; received(): number; close(): Promise<void> }> {
   const sockets = new Set<Socket>();
+  let received = 0;
   const server: NetServer = createNetServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -240,6 +248,7 @@ export async function rawServer(replies: readonly string[]): Promise<{ address: 
     socket.on("data", (chunk: Uint8Array) => {
       for (const byte of chunk) {
         if (byte !== 0) continue;
+        received++;
         const reply = replies[next++];
         if (reply !== undefined) socket.write(`${reply}\0`);
       }
@@ -250,6 +259,7 @@ export async function rawServer(replies: readonly string[]): Promise<{ address: 
   if (addr === null || typeof addr === "string") throw new Error("no tcp address");
   return {
     address: `tcp:127.0.0.1:${String(addr.port)}`,
+    received: () => received,
     close: () =>
       new Promise((resolve) => {
         for (const s of sockets) s.destroy();

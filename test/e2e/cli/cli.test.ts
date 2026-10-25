@@ -173,9 +173,10 @@ describe("varlink-js (real process)", () => {
 
   test("SIGTERM during a call: exit code 143", TIMEOUT, async () => {
     const c = start(["call", fx.unix, "org.example.cli.Hang", "{}"]);
+    const hangs = fx.hangs;
     c.child.stdin.end();
-    // Give it time to connect and send the call.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // Wait until the call is in flight (a fixed delay raced the child's startup on CI: killed before main.ts ran).
+    await waitFor(() => fx.hangs > hangs, 20_000);
     c.child.kill("SIGTERM");
     const { code } = await c.exited;
     assert.equal(code, 143, c.stderr());

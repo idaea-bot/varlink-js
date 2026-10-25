@@ -1,0 +1,304 @@
+== systemd systemd 255 (255.4-1ubuntu8.18)
+SAME  info OOM (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  info OOM -j (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  list-interfaces OOM (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  list-interfaces OOM -j (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+DIFF  introspect OOM io.systemd.ManagedOOM (varlinkctl exit 0, varlink-js exit 0)
+4,15c4,15
+< 0000060   u   p   (  \n  \t   m   o   d   e   :       s   t   r   i   n
+< 0000100   g   ,  \n  \t   p   a   t   h   :       s   t   r   i   n   g
+< 0000120   ,  \n  \t   p   r   o   p   e   r   t   y   :       s   t   r
+< 0000140   i   n   g   ,  \n  \t   l   i   m   i   t   :       ?   i   n
+< 0000160   t  \n   )  \n  \n   m   e   t   h   o   d       S   u   b   s
+< 0000200   c   r   i   b   e   M   a   n   a   g   e   d   O   O   M   C
+< 0000220   G   r   o   u   p   s   (   )       -   >       (  \n  \t   c
+< 0000240   g   r   o   u   p   s   :       [   ]   C   o   n   t   r   o
+< 0000260   l   G   r   o   u   p  \n   )  \n  \n   e   r   r   o   r    
+< 0000300   S   u   b   s   c   r   i   p   t   i   o   n   T   a   k   e
+< 0000320   n   (   )  \n
+< 0000324
+---
+> 0000060   u   p       (  \n           m   o   d   e   :       s   t   r
+> 0000100   i   n   g   ,  \n           p   a   t   h   :       s   t   r
+> 0000120   i   n   g   ,  \n           p   r   o   p   e   r   t   y   :
+> 0000140       s   t   r   i   n   g   ,  \n           l   i   m   i   t
+> 0000160   :       ?   i   n   t  \n   )  \n  \n   m   e   t   h   o   d
+> 0000200       S   u   b   s   c   r   i   b   e   M   a   n   a   g   e
+> 0000220   d   O   O   M   C   G   r   o   u   p   s   (   )       -   >
+> 0000240       (   c   g   r   o   u   p   s   :       [   ]   C   o   n
+> 0000260   t   r   o   l   G   r   o   u   p   )  \n  \n   e   r   r   o
+> 0000300   r       S   u   b   s   c   r   i   p   t   i   o   n   T   a
+> 0000320   k   e   n       (   )  \n
+> 0000327
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  introspect -j OOM org.varlink.service (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+DIFF  call GetInfo (varlinkctl exit 0, varlink-js exit 0)
+15,16c15,16
+< 0000340   ]   }
+< 0000342
+---
+> 0000340   ]   }  \n
+> 0000343
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  call GetInfo --json=short (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+DIFF  call unknown interface error (varlinkctl exit 1, varlink-js exit 1)
+2,3c2,3
+< 0000020   y   "   }
+< 0000023
+---
+> 0000020   y   "   }  \n
+> 0000024
+   stderr varlinkctl: Method call org.varlink.service.GetInterfaceDescription() failed: org.varlink.service.InterfaceNotFound|
+   stderr varlink-js: Method call org.varlink.service.GetInterfaceDescription() failed: org.varlink.service.InterfaceNotFound|
+DIFF  call unknown method (varlinkctl exit 1, varlink-js exit 1)
+2,3c2,3
+< 0000020   "   }
+< 0000022
+---
+> 0000020   "   }  \n
+> 0000023
+   stderr varlinkctl: Method call x.y.Z() failed: org.varlink.service.MethodNotFound|
+   stderr varlink-js: Method call x.y.Z() failed: org.varlink.service.MethodNotFound|
+DIFF  call --graceful (varlinkctl exit 1, varlink-js exit 0)
+1c1,3
+< 0000000
+---
+> 0000000   {   "   i   n   t   e   r   f   a   c   e   "   :   "   x   .
+> 0000020   y   "   }  \n
+> 0000024
+   stderr varlinkctl: varlinkctl: unrecognized option '--graceful=org.varlink.service.InterfaceNotFound'|
+   stderr varlink-js: Method call org.varlink.service.GetInterfaceDescription() returned expected error: org.varlink.service.InterfaceNotFound|
+DIFF  call -q (varlinkctl exit 1, varlink-js exit 0)
+   stderr varlinkctl: varlinkctl: invalid option -- 'q'|
+   stderr varlink-js: 
+SAME  call bad params (exit 1)
+   stderr varlinkctl: Failed to issue org.varlink.service.GetInfo() call: Invalid argument|
+   stderr varlink-js: Failed to parse parameters at <argv>: not a JSON object|
+DIFF  call bad method name (varlinkctl exit 1, varlink-js exit 1)
+1,3c1
+< 0000000   {   "   m   e   t   h   o   d   "   :   "   n   o   d   o   t
+< 0000020   s   "   }
+< 0000023
+---
+> 0000000
+   stderr varlinkctl: Method call nodots() failed: org.varlink.service.MethodNotFound|
+   stderr varlink-js: Not a valid qualified method name: 'nodots' (Expected valid Varlink interface name, followed by a dot, followed by a valid Varlink symbol name.)|
+SAME  call missing socket (exit 1)
+   stderr varlinkctl: Failed to open '/run/nonexistent.sock': No such file or directory|
+   stderr varlink-js: Failed to connect to /run/nonexistent.sock: connect ENOENT /run/nonexistent.sock|
+SAME  call --oneway (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  Multiplexer --more (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+DIFF  Multiplexer --collect (varlinkctl exit 1, varlink-js exit 0)
+1c1,30
+< 0000000
+---
+> 0000000   [   {   "   r   e   c   o   r   d   "   :   {   "   u   s   e
+> 0000020   r   N   a   m   e   "   :   "   r   o   o   t   "   ,   "   u
+> 0000040   i   d   "   :   0   ,   "   g   i   d   "   :   0   ,   "   h
+> 0000060   o   m   e   D   i   r   e   c   t   o   r   y   "   :   "   /
+> 0000100   r   o   o   t   "   ,   "   s   h   e   l   l   "   :   "   /
+> 0000120   b   i   n   /   b   a   s   h   "   ,   "   p   a   s   s   w
+> 0000140   o   r   d   C   h   a   n   g   e   N   o   w   "   :   f   a
+> 0000160   l   s   e   ,   "   l   a   s   t   P   a   s   s   w   o   r
+> 0000200   d   C   h   a   n   g   e   U   S   e   c   "   :   1   7   9
+> 0000220   2   1   9   5   2   0   0   0   0   0   0   0   0   ,   "   p
+> 0000240   a   s   s   w   o   r   d   C   h   a   n   g   e   M   a   x
+> 0000260   U   S   e   c   "   :   8   6   3   9   9   1   3   6   0   0
+> 0000300   0   0   0   0   0   0   ,   "   p   a   s   s   w   o   r   d
+> 0000320   C   h   a   n   g   e   W   a   r   n   U   S   e   c   "   :
+> 0000340   6   0   4   8   0   0   0   0   0   0   0   0   ,   "   s   t
+> 0000360   a   t   u   s   "   :   {   "   7   e   2   8   7   b   f   3
+> 0000400   a   9   c   f   4   d   1   6   8   b   5   5   d   2   3   4
+> 0000420   d   0   3   4   4   b   4   3   "   :   {   "   s   e   r   v
+> 0000440   i   c   e   "   :   "   i   o   .   s   y   s   t   e   m   d
+> 0000460   .   N   a   m   e   S   e   r   v   i   c   e   S   w   i   t
+> 0000500   c   h   "   }   }   }   ,   "   i   n   c   o   m   p   l   e
+> 0000520   t   e   "   :   f   a   l   s   e   }   ,   {   "   r   e   c
+> 0000540   o   r   d   "   :   {   "   u   s   e   r   N   a   m   e   "
+> 0000560   :   "   d   a   e   m   o   n   "   ,   "   u   i   d   "   :
+> 0000600   1   ,   "   g   i   d   "   :   1   ,   "   h   o   m   e   D
+> 0000620   i   r   e   c   t   o   r   y   "   :   "   /   u   s   r   /
+> 0000640   s   b   i   n   "   ,   "   s   h   e   l   l   "   :   "   /
+   stderr varlinkctl: varlinkctl: unrecognized option '--collect'|
+   stderr varlink-js: 
+DIFF  Multiplexer no more (varlinkctl exit 0, varlink-js exit 0)
+22,23c22,23
+< 0000520   e   "   :   f   a   l   s   e   }
+< 0000531
+---
+> 0000520   e   "   :   f   a   l   s   e   }  \n
+> 0000532
+   stderr varlinkctl: 
+   stderr varlink-js: 
+DIFF  Multiplexer ExpectedMore (varlinkctl exit 1, varlink-js exit 1)
+1,2c1,2
+< 0000000   {   }
+< 0000002
+---
+> 0000000   {   }  \n
+> 0000003
+   stderr varlinkctl: Method call io.systemd.UserDatabase.GetUserRecord() failed: org.varlink.service.ExpectedMore|
+   stderr varlink-js: Method call io.systemd.UserDatabase.GetUserRecord() failed: called without 'more' flag, but flag needs to be set.|
+DIFF  validate-idl service (varlinkctl exit 0, varlink-js exit 0)
+1,30c1,30
+< 0000000   i   n   t   e   r   f   a   c   e       o   r   g   .   v   a
+< 0000020   r   l   i   n   k   .   s   e   r   v   i   c   e  \n  \n   m
+< 0000040   e   t   h   o   d       G   e   t   I   n   f   o   (   )    
+< 0000060   -   >       (  \n  \t   v   e   n   d   o   r   :       s   t
+< 0000100   r   i   n   g   ,  \n  \t   p   r   o   d   u   c   t   :    
+< 0000120   s   t   r   i   n   g   ,  \n  \t   v   e   r   s   i   o   n
+< 0000140   :       s   t   r   i   n   g   ,  \n  \t   u   r   l   :    
+< 0000160   s   t   r   i   n   g   ,  \n  \t   i   n   t   e   r   f   a
+< 0000200   c   e   s   :       [   ]   s   t   r   i   n   g  \n   )  \n
+< 0000220  \n   m   e   t   h   o   d       G   e   t   I   n   t   e   r
+< 0000240   f   a   c   e   D   e   s   c   r   i   p   t   i   o   n   (
+< 0000260  \n  \t   i   n   t   e   r   f   a   c   e   :       s   t   r
+< 0000300   i   n   g  \n   )       -   >       (  \n  \t   d   e   s   c
+< 0000320   r   i   p   t   i   o   n   :       s   t   r   i   n   g  \n
+< 0000340   )  \n  \n   e   r   r   o   r       I   n   t   e   r   f   a
+< 0000360   c   e   N   o   t   F   o   u   n   d   (  \n  \t   i   n   t
+< 0000400   e   r   f   a   c   e   :       s   t   r   i   n   g  \n   )
+< 0000420  \n  \n   e   r   r   o   r       M   e   t   h   o   d   N   o
+< 0000440   t   F   o   u   n   d   (  \n  \t   m   e   t   h   o   d   :
+< 0000460       s   t   r   i   n   g  \n   )  \n  \n   e   r   r   o   r
+< 0000500       M   e   t   h   o   d   N   o   t   I   m   p   l   e   m
+< 0000520   e   n   t   e   d   (  \n  \t   m   e   t   h   o   d   :    
+< 0000540   s   t   r   i   n   g  \n   )  \n  \n   e   r   r   o   r    
+< 0000560   I   n   v   a   l   i   d   P   a   r   a   m   e   t   e   r
+< 0000600   (  \n  \t   p   a   r   a   m   e   t   e   r   :       s   t
+< 0000620   r   i   n   g  \n   )  \n  \n   e   r   r   o   r       P   e
+< 0000640   r   m   i   s   s   i   o   n   D   e   n   i   e   d   (   )
+< 0000660  \n  \n   e   r   r   o   r       E   x   p   e   c   t   e   d
+< 0000700   M   o   r   e   (   )  \n  \n   e   r   r   o   r       E   x
+   stderr varlinkctl: 
+   stderr varlink-js: 
+SAME  validate-idl bad (exit 1)
+   stderr varlinkctl: /tmp/m7-bad.varlink:3:1: Bad syntax.|
+   stderr varlink-js: /tmp/m7-bad.varlink:2:19: expected a type, found "nope"|
+SAME  cert info (exit 0)
+   stderr varlinkctl: 
+   stderr varlink-js: 
+DIFF  cert call Start (varlinkctl exit 0, varlink-js exit 0)
+1,4c1,5
+< 0000000   {   "   c   l   i   e   n   t   _   i   d   "   :   "   6   4
+< 0000020   6   d   9   c   d   6   7   a   3   b   f   0   8   7   7   c
+< 0000040   f   9   7   7   f   2   f   8   7   7   f   6   b   1   "   }
+< 0000060
+---
+> 0000000   {   "   c   l   i   e   n   t   _   i   d   "   :   "   2   e
+> 0000020   b   7   7   d   b   b   a   9   6   5   0   6   e   3   f   1
+> 0000040   8   a   8   a   4   8   c   0   f   4   2   0   2   4   "   }
+> 0000060  \n
+> 0000061
+   stderr varlinkctl: 
+   stderr varlink-js: 
+== 12 same, 12 different
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":{"a":1}}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":{}}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":[]}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":{"e":{},"f":[],"g":[{}],"h":[[]]}}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":"q\"b\\s/t\tn\nc\u0001x"}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":"zażółć ☃ 😀"}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":"\u007f\u0080\u2028"}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":9223372036854775807}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":-9223372036854775808}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":18446744073709551615}
+DIFF --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":1.5} (0/0)
+--- varlinkctl
+{"value":1.500000000000000000000000000000000000e+00}$
+--- varlink-js
+{"value":1.5}$
+DIFF --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":0.1} (0/0)
+--- varlinkctl
+{"value":1.000000000000000055511151231257827021e-01}$
+--- varlink-js
+{"value":0.1}$
+DIFF --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":1e300} (0/0)
+--- varlinkctl
+{"value":1.000000000000000052504760255204420249e+300}$
+--- varlink-js
+{"value":1e+300}$
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":-0}
+DIFF --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":1e-7} (0/0)
+--- varlinkctl
+{"value":9.999999999999999547481118258862586856e-08}$
+--- varlink-js
+{"value":1e-7}$
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":123456789012}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":true}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":null}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":[1,"x",null,false,{"k":[]}]}
+SAME --json=short call /tmp/m7-echo.sock org.example.echo.Echo {"value":{"b":1,"a":2,"1":3}}
+SAME --json=short call --more /tmp/m7-echo.sock org.example.echo.Count {"n":3,"value":{"x":[1,2]}}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":{"a":1}}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":{}}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":[]}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":{"e":{},"f":[],"g":[{}],"h":[[]]}}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":"q\"b\\s/t\tn\nc\u0001x"}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":"zażółć ☃ 😀"}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":"\u007f\u0080\u2028"}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":9223372036854775807}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":-9223372036854775808}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":18446744073709551615}
+DIFF --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":1.5} (0/0)
+--- varlinkctl
+{$
+^I"value" : 1.500000000000000000000000000000000000e+00$
+}$
+--- varlink-js
+{$
+^I"value" : 1.5$
+}$
+DIFF --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":0.1} (0/0)
+--- varlinkctl
+{$
+^I"value" : 1.000000000000000055511151231257827021e-01$
+}$
+--- varlink-js
+{$
+^I"value" : 0.1$
+}$
+DIFF --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":1e300} (0/0)
+--- varlinkctl
+{$
+^I"value" : 1.000000000000000052504760255204420249e+300$
+}$
+--- varlink-js
+{$
+^I"value" : 1e+300$
+}$
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":-0}
+DIFF --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":1e-7} (0/0)
+--- varlinkctl
+{$
+^I"value" : 9.999999999999999547481118258862586856e-08$
+}$
+--- varlink-js
+{$
+^I"value" : 1e-7$
+}$
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":123456789012}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":true}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":null}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":[1,"x",null,false,{"k":[]}]}
+SAME --json=pretty call /tmp/m7-echo.sock org.example.echo.Echo {"value":{"b":1,"a":2,"1":3}}
+SAME --json=pretty call --more /tmp/m7-echo.sock org.example.echo.Count {"n":3,"value":{"x":[1,2]}}
+== 34 same, 8 different
