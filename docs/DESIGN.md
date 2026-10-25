@@ -555,8 +555,8 @@ entry.
   `MethodOutput`), `InterfaceDescriptor {name, idl, ints, methods, errors}`, `JsonValue`. `compileDescriptor`
   checks the descriptor against its IDL both ways (names, `more`/`upgrade`/`experimental`, error names; every
   IDL method and error present); `JsonValue` admits readonly arrays; `assertIntsMode` checks `ints` at bind
-  time. Connection, Server and Pool bind through the internal `bindDescriptor(desc, runtimeInts, options)`: the
-  checks of `compileDescriptor`, then an interface with no `int` anywhere (`usesInt` walks every member, field and
+  time. Connection, Server, Pool and the HTTP client (§4.12) bind through the internal
+  `bindDescriptor(desc, runtimeInts, options)`: the checks of `compileDescriptor`, then an interface with no `int` anywhere (`usesInt` walks every member, field and
   element type, nested, nullable, array, map and inline) compiles with the runtime's `ints` whatever `desc.ints`
   says (its TS types are the same in both modes); one that uses `int` goes through `assertIntsMode`.
 - **Errors**: `VarlinkError`/`isVarlinkError` (brand, §6), the seven `org.varlink.service` classes (IDL text:

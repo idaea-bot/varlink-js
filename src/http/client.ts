@@ -19,8 +19,7 @@ import { checkMaxMessageSize } from "../core/protocol/framer.ts";
 import { jsonCodec, type Codec } from "../core/types/codec.ts";
 import { compileInterfaceText, type CompiledInterface, type IntsMode, type Validator } from "../core/types/compile.ts";
 import {
-  assertIntsMode,
-  compileDescriptor,
+  bindDescriptor,
   type InterfaceDescriptor,
   type MethodDescriptor,
   type MethodInput,
@@ -412,11 +411,14 @@ export class HttpClient {
   }
 
   /**
-   * Registers an interface for validation, as `Connection.addInterface` does: compiled with this client's `ints`
-   * and codec; a descriptor's error classes are added to the error registry; the same name again is a no-op for the
-   * same IDL text and a TypeError for a different one.
+   * Registers an interface for validation: compiled with this client's `ints` and codec; a descriptor binds as on
+   * `Connection.addInterface` (`bindDescriptor`, DESIGN §4.9: one with no `int` binds in either `ints` mode, one that
+   * uses `int` must match this client's `ints`); its error classes are added to the error registry; the same name
+   * again is a no-op for the same IDL text and a TypeError for a different one (unlike a Connection, built-in names
+   * accept only their exact IDL text).
    *
-   * @throws {TypeError} on a different IDL under a taken name, a descriptor mismatch or an `ints` mismatch.
+   * @throws {TypeError} on a different IDL under a taken name, a descriptor mismatch or an `ints` mismatch of an
+   *   `int`-using descriptor.
    * @throws {IdlSyntaxError} for invalid IDL.
    */
   addInterface(descriptorOrIdl: InterfaceDescriptor | string): void {
@@ -427,9 +429,8 @@ export class HttpClient {
       idl = descriptorOrIdl;
       compiled = compileInterfaceText(idl, { ints: this.#ints, codec: this.#codec });
     } else {
-      assertIntsMode(descriptorOrIdl, this.#ints);
       idl = descriptorOrIdl.idl;
-      compiled = compileDescriptor(descriptorOrIdl, { codec: this.#codec });
+      compiled = bindDescriptor(descriptorOrIdl, this.#ints, { codec: this.#codec });
       classes = Object.values(descriptorOrIdl.errors);
     }
     const existing = this.#interfaces.get(compiled.name);

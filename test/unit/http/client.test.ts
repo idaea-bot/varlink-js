@@ -9,6 +9,7 @@ import {
   CallTimeoutError,
   ConnectionClosedError,
   IntegerRangeError,
+  type InterfaceDescriptor,
   InterfaceNotFoundError,
   InvalidParameterError,
   isVarlinkLocalError,
@@ -19,6 +20,7 @@ import {
   ValidationError,
   VarlinkError,
 } from "../../../src/index.ts";
+import { OrgVarlinkService } from "../../../src/interfaces/index.ts";
 import { fromNodeSocket, listen } from "../../../src/node/index.ts";
 import { openSocket } from "../../../src/node/connect.ts";
 import { startBridge, type Bridge, type RequestLog } from "../websocket/bridge.ts";
@@ -295,6 +297,46 @@ describe("HTTP client: calls", () => {
       "x",
     );
     await assert.rejects(createHttpClient(bridge.base).call(Echo, { text: "t" }), TypeError);
+  });
+
+  test("descriptors bind as on a Connection: an int-free one in either ints mode, an int-using one must match", async () => {
+    // OrgVarlinkService is generated with ints: "number" and has no int, so a bigint client takes it (bindDescriptor).
+    assert.equal(OrgVarlinkService.ints, "number");
+    const bigint = createHttpClient(bridge.base, {
+      ints: "bigint",
+      interfaces: [OrgVarlinkService],
+      validateReplies: "throw",
+    });
+    const info = await bigint.call(OrgVarlinkService.methods.GetInfo, {}, { service: SERVICE });
+    assert.equal(typeof info.vendor, "string");
+    assert.ok(info.interfaces.includes(SERVICE));
+    const nointIdl = "interface org.example.noint\nmethod Say(text: string) -> ()\n";
+    const noint: InterfaceDescriptor = {
+      name: "org.example.noint",
+      idl: nointIdl,
+      ints: "number",
+      methods: {
+        Say: { interface: "org.example.noint", name: "Say", method: "org.example.noint.Say" },
+      },
+      errors: {},
+    };
+    bigint.addInterface(noint);
+    bigint.addInterface(noint);
+    // A descriptor that disagrees with its IDL is still rejected, int-free or not.
+    assert.throws(() => {
+      bigint.addInterface({
+        ...noint,
+        name: "org.example.noint2",
+        idl: nointIdl.replace("noint", "noint2"),
+        methods: {},
+      });
+    }, TypeError);
+    // An int-using descriptor must still match the client's ints.
+    assert.throws(() => {
+      bigint.addInterface(DESC);
+    }, /ints/);
+    assert.throws(() => createHttpClient(bridge.base, { ints: "bigint", interfaces: [DESC] }), TypeError);
+    createHttpClient(bridge.base, { ints: "number", interfaces: [DESC, OrgVarlinkService, noint] });
   });
 
   test("invalid method and service names, bad parameters and bad options are rejected before any request", async () => {
