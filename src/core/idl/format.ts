@@ -26,6 +26,9 @@ const MAX_INLINE_LENGTH = 40;
 /**
  * Formats an interface canonically. Only doc comments and annotations survive; the output ends with one "\n".
  *
+ * The AST must be plain data that does not change during the call (it is read again after validation), and
+ * the output size is not bounded beyond what the AST implies.
+ *
  * @throws {IdlSyntaxError} the first problem {@link validateInterface} finds.
  */
 export function formatInterface(iface: Interface): string {
@@ -76,6 +79,17 @@ function inline(type: Type, level: number, state: InlineState): string {
   return out;
 }
 
+/** Hand-built ASTs: an items list must be a dense array of objects (a hole would print as an empty item). */
+function checkItems(items: readonly unknown[]): void {
+  if (!Array.isArray(items)) throw new IdlSyntaxError("invalid-ast", "fields/values is not an array");
+  for (let i = 0; i < items.length; i++) {
+    const item: unknown = items[i];
+    if (!(i in items) || typeof item !== "object" || item === null) {
+      throw new IdlSyntaxError("invalid-ast", "field or enum value is not an object");
+    }
+  }
+}
+
 function inlineNode(type: Type, level: number, state: InlineState): string {
   switch (type.kind) {
     case "bool":
@@ -94,8 +108,10 @@ function inlineNode(type: Type, level: number, state: InlineState): string {
     case "nullable":
       return "?" + inline(type.element, level + 1, state);
     case "struct":
+      checkItems(type.fields);
       return "(" + type.fields.map((f) => `${f.name}: ${inline(f.type, level + 1, state)}`).join(", ") + ")";
     case "enum":
+      checkItems(type.values);
       if (type.values.length === 0) throw new IdlSyntaxError("invalid-ast", "an enum needs at least one value");
       return "(" + type.values.map((v) => v.name).join(", ") + ")";
     default:

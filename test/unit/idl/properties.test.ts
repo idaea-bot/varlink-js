@@ -198,6 +198,8 @@ const insertion = fc.oneof(
   fc.tuple(spaces, junk, lineBreak).map(([sp, j, br]) => `${sp}#${j}${br}`),
   fc
     .tuple(lineBreak, indentation, junk, lineBreak, lineBreak)
+    // "\r" + "\n" would merge into one CRLF break and leave no blank line, so the comment would become a doc.
+    .filter(([, , , b2, b3]) => !(b2 === "\r" && b3.startsWith("\n")))
     .map(([b1, ind, j, b2, b3]) => `${b1}${ind}#${j}${b2}${b3}`),
 );
 
@@ -246,6 +248,9 @@ describe("whitespace and comment insertion", () => {
       return t?.kind === "type" && t.type.kind === "struct" ? stripSpans(t.type.fields[1]) : undefined;
     };
     assert.deepEqual(fieldB(insert(" #k\n")), { name: "b", type: { kind: "int" }, experimental: false });
+    // A detached comment needs a real blank line: "\r\n" is a single break.
+    assert.equal((fieldB(insert("\n#j\r\n")) as { doc?: string }).doc, "j");
+    assert.equal((fieldB(insert("\n#j\r\r")) as { doc?: string }).doc, undefined);
     assert.deepEqual(fieldB(insert("\n" + " #k\n")), {
       name: "b",
       type: { kind: "int" },

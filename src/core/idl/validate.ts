@@ -53,7 +53,9 @@ const COMMENT_BREAKING = new RegExp(`[\r${String.fromCharCode(0x2028, 0x2029)}]`
  * no `??T`, non-empty enums, structs where the grammar needs them, nesting depth, no cycles, a bounded
  * size, and doc strings that survive a format/parse round trip. Never throws.
  *
- * @returns all problems, sorted by position where known (errors without a position come last); `[]` if valid.
+ * @returns the problems found, sorted by position where known (errors without a position come last); `[]`
+ * if valid. At most 1000 are collected, in discovery order (member names are checked before member bodies),
+ * so a huge invalid AST may not report its earliest problem.
  */
 export function validateInterface(iface: Interface): IdlSyntaxError[] {
   const validator = new Validator();

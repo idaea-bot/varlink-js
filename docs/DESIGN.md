@@ -768,8 +768,9 @@ use `fast-check` (dev dependency).
 
 - `idl/`: golden tests on a corpus: every `.varlink` in libvarlink, python-varlink, rust varlink, the
   UAPI examples, and real systemd interfaces dumped with `varlinkctl introspect` in the VM (stored
-  under `test/corpus/systemd-<version>/`). Parse → format → parse must be a fixpoint; formatted output
-  compared with `varlinkctl validate-idl` output where feasible (VM).
+  under `test/corpus/systemd-<version>/`). Parse → format → parse must be a fixpoint. Against `varlinkctl validate-idl`
+  (VM, M1, `test/corpus/VARLINKCTL.md`): systemd's re-print of our output must equal its re-print of the original
+  (the styles differ, so the texts themselves are not compared).
 - Negative cases: each grammar rule (bad names, `__` in field names, trailing `_`, missing newline
   after members, duplicate member names, unresolved refs, `??T`). Note that `?any` is grammatical
   (`"?" element_type`) and must parse.
@@ -808,7 +809,8 @@ without NUL → connection closed and memory bounded, wire output contains no `c
 - **systemd**: 
   - CI (GitHub `ubuntu-latest` has systemd and `varlinkctl`; version to check in M5): `varlinkctl info`,
     `introspect` and `call` against our test server, `varlinkctl validate-idl` on our formatter output (only for
-    inputs systemd itself accepts: not empty `()` / `[string]()`, nor the experimental-consistency shapes of §4.8), and
+    inputs systemd itself accepts: see the differences in `test/corpus/VARLINKCTL.md` (empty `()`, `?any`, `?[]?T`, …)
+    and the experimental-consistency rules of §4.8), and
     our client against `/run/systemd/userdb/io.systemd.Multiplexer` (`GetUserRecord` with `more`).
   - UTM Linux VM (`~/oss/vm/README.md`, once available): a newer systemd for `--upgrade` (≥ 261),
     `exec:` against `/usr/lib/systemd/systemd-pcrextend`-style binaries, socket activation with

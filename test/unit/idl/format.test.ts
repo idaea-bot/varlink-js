@@ -447,3 +447,14 @@ test("formatType rejects non-object types and composites at depth MAX_TYPE_DEPTH
   );
   assert.throws(() => formatType(wrap({ kind: "struct", fields: [] }, MAX_TYPE_DEPTH)), isCode("too-deep"));
 });
+
+test("formatType rejects malformed item lists in hand-built types", () => {
+  const isAst = (e: unknown) => e instanceof IdlSyntaxError && e.code === "invalid-ast";
+  const a = { name: "a", type: { kind: "int" }, experimental: false };
+  // eslint-disable-next-line no-sparse-arrays
+  const sparse = [, a];
+  for (const fields of [null, [null], sparse]) {
+    assert.throws(() => formatType({ kind: "struct", fields } as unknown as Type), isAst);
+  }
+  assert.throws(() => formatType({ kind: "enum", values: [null] } as unknown as Type), isAst);
+});
