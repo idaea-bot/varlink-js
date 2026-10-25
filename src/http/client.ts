@@ -841,6 +841,8 @@ class RecordSource {
   /** An error-shaped record held back until the next record or the end of the body. */
   #held: { value: Record<string, unknown>; record: ErrorRecord } | undefined;
   #records = 0;
+  /** A record error found after good records of the same chunk, thrown once those are delivered. */
+  #deferred: { error: unknown } | undefined;
   /** The idle timer is running: armed once per wait for the next record, never re-armed per body chunk. */
   #idleArmed = false;
   #ended = false;
@@ -883,6 +885,7 @@ class RecordSource {
           const value = this.#ready.shift();
           return { value: this.#ctx.reply(value, this.#p.spec, this.#p.method), done: false };
         }
+        if (this.#deferred !== undefined) throw this.#deferred.error;
         if (this.#ended) {
           const held = this.#held;
           this.#held = undefined;
@@ -920,10 +923,12 @@ class RecordSource {
 
   /** Reads one body chunk and parses the records it completes. */
   async #pull(): Promise<void> {
+    // Records completed before an error in the same chunk were delivered first; now the error.
+    this.#splitter.throwIfFailed();
     const chunk = await this.#ex.read();
     if (chunk === null) {
       this.#ended = true;
-      if (this.#mode === "seq") for (const r of this.#splitter.end()) this.#record(r);
+      if (this.#mode === "seq") this.#accept(this.#splitter.end());
       else if (this.#mode === "json") this.#record(concatChunks(this.#jsonChunks, this.#jsonSize), true);
       return;
     }
@@ -936,13 +941,29 @@ class RecordSource {
       this.#mode = bytes[0] === 0x1e ? "seq" : "json";
     }
     if (this.#mode === "seq") {
-      for (const r of this.#splitter.push(bytes)) this.#record(r);
+      this.#accept(this.#splitter.push(bytes));
       return;
     }
     this.#jsonSize += bytes.length;
     if (this.#jsonSize > this.#ctx.max)
       throw new MessageTooLargeError(`response body larger than maxMessageSize (${String(this.#ctx.max)} bytes)`);
     this.#jsonChunks.push(bytes.slice());
+  }
+
+  /**
+   * Decodes the records of one chunk in order. A record that fails to decode after good ones of the same chunk is
+   * deferred: the good ones are delivered first, the next pull throws.
+   */
+  #accept(records: Uint8Array[]): void {
+    for (const r of records) {
+      try {
+        this.#record(r);
+      } catch (e) {
+        if (this.#ready.length === 0) throw e;
+        this.#deferred = { error: e };
+        return;
+      }
+    }
   }
 
   /** A complete record: decoded, then held back if it is shaped like an error record (json-seq only). */

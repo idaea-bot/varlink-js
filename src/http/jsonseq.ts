@@ -59,9 +59,31 @@ export class JsonSeqSplitter {
     this.#max = maxRecordSize;
   }
 
-  /** Feeds bytes; returns the records completed by them, in order. */
+  /** An error found after records that were completed in the same chunk: thrown by the next call. */
+  #failure: { error: unknown } | undefined;
+
+  /** Throws the error deferred by {@link push} (found after records it still returned), if any. */
+  throwIfFailed(): void {
+    if (this.#failure !== undefined) throw this.#failure.error;
+  }
+
+  /**
+   * Feeds bytes; returns the records completed by them, in order. An error after some complete records of the same
+   * chunk is deferred: those records are returned and the error is thrown by the next call (or `throwIfFailed()`).
+   */
   push(chunk: Uint8Array): Uint8Array[] {
+    this.throwIfFailed();
     const out: Uint8Array[] = [];
+    try {
+      this.#scan(chunk, out);
+    } catch (e) {
+      if (out.length === 0) throw e;
+      this.#failure = { error: e };
+    }
+    return out;
+  }
+
+  #scan(chunk: Uint8Array, out: Uint8Array[]): void {
     /** Start of the current record's text within `chunk`, or -1. */
     let start = this.#began && !this.#complete ? 0 : -1;
     for (let i = 0; i < chunk.length; i++) {
@@ -117,11 +139,11 @@ export class JsonSeqSplitter {
       this.#parts.push(rest);
       this.#partsSize += rest.length;
     }
-    return out;
   }
 
   /** The end of the body: returns the last record if it was still open (a scalar), or throws if it was cut off. */
   end(): Uint8Array[] {
+    this.throwIfFailed();
     if (!this.#inRecord || !this.#began || this.#complete) return [];
     if (this.#container) throw new ProtocolError("json-seq: the body ended in the middle of a record");
     const record = this.#take(new Uint8Array(0), -1, 0);

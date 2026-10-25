@@ -510,6 +510,20 @@ describe("HTTP client: streams", () => {
     const it = client.stream("org.example.ws.Count", { n: 1 });
     assert.deepEqual(await it.next(), { value: { i: 0 }, done: false });
     await assert.rejects(it.next(), MessageTooLargeError);
+    // Both in one chunk (TCP may coalesce the two above, as on a CI runner once): the good record still comes first.
+    script([`${RS}{"i":0}\n${RS}{"i":"${"x".repeat(100)}"}\n`]);
+    const it2 = client.stream("org.example.ws.Count", { n: 1 });
+    assert.deepEqual(await it2.next(), { value: { i: 0 }, done: false });
+    await assert.rejects(it2.next(), MessageTooLargeError);
+    // Same for a record that is not JSON, also when it is the last one of the body.
+    for (const tail of [`${RS}{"i":}\n`, `${RS}{"i":}\n${RS}{"i":2}\n`]) {
+      script([`${RS}{"i":0}\n${RS}{"i":1}\n${tail}`]);
+      const it3 = client.stream("org.example.ws.Count", { n: 1 });
+      assert.deepEqual(await it3.next(), { value: { i: 0 }, done: false });
+      assert.deepEqual(await it3.next(), { value: { i: 1 }, done: false });
+      await assert.rejects(it3.next(), ProtocolError);
+      assert.deepEqual(await it3.next(), { value: undefined, done: true });
+    }
     script([`{"i":"${"x".repeat(100)}"}`], { contentType: "application/json" });
     await assert.rejects(drain(client.stream("org.example.ws.Count", { n: 1 })), MessageTooLargeError);
   });

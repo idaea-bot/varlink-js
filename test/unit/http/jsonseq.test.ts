@@ -81,3 +81,17 @@ describe("JsonSeqSplitter", () => {
     assert.equal(run(`${RS}${record}\n`.repeat(50), [], size).records.length, 50);
   });
 });
+
+test("an error after complete records of the same chunk: the records first, then the error", () => {
+  const s = new JsonSeqSplitter(16);
+  const records = s.push(new TextEncoder().encode(`\x1e{"i":0}\n\x1e{"i":"${"x".repeat(40)}"}\n`));
+  assert.deepEqual(
+    records.map((r) => new TextDecoder().decode(r)),
+    ['{"i":0}'],
+  );
+  assert.throws(() => {
+    s.throwIfFailed();
+  }, MessageTooLargeError);
+  assert.throws(() => s.push(new Uint8Array(0)), MessageTooLargeError);
+  assert.throws(() => s.end(), MessageTooLargeError);
+});
