@@ -81,6 +81,7 @@
     "build:test": "tsc -p tsconfig.json --noEmit false --outDir build",
     "test:interop": "node --test \"test/interop/*.test.ts\"",
     "test:consumer": "node test/fixtures/consumer/run.js",
+    "gen:interfaces": "node scripts/gen-interfaces.ts",
     "prepack": "npm run build"
   },
   "devDependencies": {

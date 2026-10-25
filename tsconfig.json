@@ -29,6 +29,6 @@
     "outDir": "build",
     "noEmit": true
   },
-  "include": ["src", "test", "examples"],
+  "include": ["src", "test", "examples", "scripts"],
   "exclude": ["test/fixtures/consumer"]
 }

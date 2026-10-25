@@ -1,18 +1,29 @@
 // A pool of client connections (DESIGN.md §5.2, §4.11): each operation leases one connection exclusively until it
 // settles; closed connections are never handed out (F4); at `max`, operations wait FIFO.
 import { CallTimeoutError, ConnectionClosedError } from "../core/errors/local.ts";
+import { INTERNAL_ERROR_INTERFACE, ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
 import type { Interface } from "../core/idl/ast.ts";
+import { compileInterfaceText } from "../core/types/compile.ts";
+import {
+  compileDescriptor,
+  type InterfaceDescriptor,
+  type MethodDescriptor,
+  type MethodInput,
+  type MethodOutput,
+} from "../core/types/descriptors.ts";
 import {
   connectionInternals,
   DEFAULT_TIMEOUT,
   type CallOptions,
+  type CallSpec,
   type CollectOptions,
   type Connection,
   type ServiceInfo,
   type StreamIterator,
   type StreamOptions,
 } from "./connection.ts";
-import { checkPositiveInt, checkTimeout } from "./util.ts";
+import { assertBuiltinCompatible } from "./service.ts";
+import { checkPositiveInt, checkTimeout, splitName } from "./util.ts";
 
 /** Options for {@link createPool}. */
 export interface PoolOptions {
@@ -42,6 +53,24 @@ interface Waiter {
   done: boolean;
 }
 
+/** An interface registered with {@link Pool.addInterface}. */
+interface PoolInterface {
+  readonly name: string;
+  readonly idl: string;
+  readonly value: InterfaceDescriptor | string;
+}
+
+type AnyMethod = MethodDescriptor<object, object>;
+
+/** Registered on every connection at construction; a compatible text is accepted again (Connection.addInterface). */
+const BUILTIN_NAMES: ReadonlySet<string> = new Set([ORG_VARLINK_SERVICE, INTERNAL_ERROR_INTERFACE]);
+
+/** The interface an operation's method belongs to (a descriptor's, or the interface part of a name). */
+function interfaceOf(method: string | AnyMethod): string | undefined {
+  if (typeof method !== "string") return (method as Partial<AnyMethod> | null)?.interface;
+  return splitName(method)?.interface;
+}
+
 interface Idle {
   readonly conn: Connection;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -64,6 +93,16 @@ export class Pool {
   readonly #idle: Idle[] = [];
   readonly #waiters: Waiter[] = [];
   readonly #opening = new Set<AbortController>();
+  /** Registered with addInterface(), in order. */
+  readonly #interfaces: PoolInterface[] = [];
+  /**
+   * Per connection: how many of #interfaces it has applied (a lease does not recompile them) and the errors of
+   * the entries it rejected, by name and by the rejected descriptors' methods.
+   */
+  readonly #applied = new WeakMap<
+    Connection,
+    { count: number; failed: Map<string, unknown>; failedMethods: WeakMap<object, unknown> }
+  >();
   #closed = false;
 
   /** Use {@link createPool}. */
@@ -85,38 +124,99 @@ export class Pool {
     return this.#idle.length;
   }
 
+  /**
+   * Registers an interface on every connection the pool hands out (idle ones and new ones), just before an
+   * operation uses it; each connection registers each interface once. Checked now: IDL text is parsed and
+   * validated, a descriptor is checked against its IDL (`compileDescriptor`). The same value again is a no-op, a
+   * different IDL under a registered name a TypeError (the built-ins accept a compatible one: see
+   * {@link Connection.addInterface}). The `ints` match is checked per connection
+   * ({@link Connection.addInterface}): if a connection rejects an entry, the operations on that connection that use
+   * it reject with that error (the connection is released): the rejected descriptor's methods always, other
+   * descriptors and method names of the interface while the connection has no registration of that name (from
+   * another entry or its own `interfaces` option). Other operations are not affected.
+   *
+   * @throws {TypeError} for a different IDL under a registered name, a built-in text incompatible with the
+   *   built-in definition, or a descriptor mismatch.
+   * @throws {IdlSyntaxError} for invalid IDL.
+   */
+  addInterface(descriptorOrIdl: InterfaceDescriptor | string): void {
+    let entry: PoolInterface;
+    let ast: Interface;
+    if (typeof descriptorOrIdl === "string") {
+      ast = compileInterfaceText(descriptorOrIdl).ast;
+      entry = { name: ast.name, idl: descriptorOrIdl, value: descriptorOrIdl };
+    } else {
+      if (typeof descriptorOrIdl !== "object" || (descriptorOrIdl as unknown) === null)
+        throw new TypeError("addInterface expects a descriptor or IDL text");
+      // The pool has no ints mode: check the descriptor against its IDL in "number" mode (no lossless codec
+      // needed); each connection checks the ints match when the interface is applied.
+      ast = compileDescriptor({ ...descriptorOrIdl, ints: "number" }).ast;
+      entry = { name: descriptorOrIdl.name, idl: descriptorOrIdl.idl, value: descriptorOrIdl };
+    }
+    // Every connection would reject an incompatible built-in text: fail here, like a different IDL.
+    if (BUILTIN_NAMES.has(entry.name)) assertBuiltinCompatible(ast);
+    for (const e of this.#interfaces) {
+      if (e.value === entry.value) return;
+      if (e.name === entry.name && e.idl !== entry.idl && !BUILTIN_NAMES.has(entry.name))
+        throw new TypeError(`interface ${entry.name} is already registered with a different IDL`);
+    }
+    this.#interfaces.push(entry);
+  }
+
   /** {@link Connection.call} on a leased connection. */
-  call(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<Record<string, unknown>> {
-    return this.#with(options, (c) => c.call(method, parameters, options));
+  call<M extends AnyMethod>(method: M, parameters: MethodInput<M>, options?: CallOptions): Promise<MethodOutput<M>>;
+  call(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<Record<string, unknown>>;
+  call(method: string | AnyMethod, parameters?: object, options?: CallOptions): Promise<object> {
+    return this.#with(options, method, (c) =>
+      typeof method === "string"
+        ? c.call(method, parameters as Record<string, unknown> | undefined, options)
+        : c.call(method, parameters as MethodInput<AnyMethod>, options),
+    );
   }
 
   /** {@link Connection.oneway} on a leased connection. */
-  oneway(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<void> {
-    return this.#with(options, (c) => c.oneway(method, parameters, options));
+  oneway<M extends AnyMethod>(method: M, parameters: MethodInput<M>, options?: CallOptions): Promise<void>;
+  oneway(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<void>;
+  oneway(method: string | AnyMethod, parameters?: object, options?: CallOptions): Promise<void> {
+    return this.#with(options, method, (c) =>
+      typeof method === "string"
+        ? c.oneway(method, parameters as Record<string, unknown> | undefined, options)
+        : c.oneway(method, parameters as MethodInput<AnyMethod>, options),
+    );
   }
 
   /** {@link Connection.collect} on a leased connection. */
+  collect<M extends AnyMethod>(
+    method: M,
+    parameters: MethodInput<M>,
+    options?: CollectOptions,
+  ): Promise<MethodOutput<M>[]>;
   collect(
     method: string,
     parameters?: Record<string, unknown>,
     options?: CollectOptions,
-  ): Promise<Record<string, unknown>[]> {
-    return this.#with(options, (c) => c.collect(method, parameters, options));
+  ): Promise<Record<string, unknown>[]>;
+  collect(method: string | AnyMethod, parameters?: object, options?: CollectOptions): Promise<object[]> {
+    return this.#with(options, method, (c) =>
+      typeof method === "string"
+        ? c.collect(method, parameters as Record<string, unknown> | undefined, options)
+        : c.collect(method, parameters as MethodInput<AnyMethod>, options),
+    );
   }
 
   /** {@link Connection.getInfo} on a leased connection. */
   getInfo(options?: CallOptions): Promise<ServiceInfo> {
-    return this.#with(options, (c) => c.getInfo(options));
+    return this.#with(options, undefined, (c) => c.getInfo(options));
   }
 
   /** {@link Connection.getInterfaceDescription} on a leased connection. */
   getInterfaceDescription(name: string, options?: CallOptions): Promise<string> {
-    return this.#with(options, (c) => c.getInterfaceDescription(name, options));
+    return this.#with(options, undefined, (c) => c.getInterfaceDescription(name, options));
   }
 
   /** {@link Connection.getInterface} on a leased connection. */
   getInterface(name: string, options?: CallOptions): Promise<Interface> {
-    return this.#with(options, (c) => c.getInterface(name, options));
+    return this.#with(options, undefined, (c) => c.getInterface(name, options));
   }
 
   /**
@@ -124,7 +224,13 @@ export class Pool {
    * reply, an error, or `return()` (which closes that connection if the call was written, like on a Connection).
    * If no lease is obtained (timeout, abort, factory failure, closed pool), `next()` rejects once, then is done.
    */
-  stream(method: string, parameters?: Record<string, unknown>, options?: StreamOptions): StreamIterator {
+  stream<M extends AnyMethod>(
+    method: M,
+    parameters: MethodInput<M>,
+    options?: StreamOptions,
+  ): StreamIterator<MethodOutput<M>>;
+  stream(method: string, parameters?: Record<string, unknown>, options?: StreamOptions): StreamIterator;
+  stream(method: string | AnyMethod, parameters?: object, options?: StreamOptions): StreamIterator {
     let inner: StreamIterator | undefined;
     let returned = false;
     /** The acquire failed and next() already rejected with it: later calls are done. */
@@ -134,8 +240,20 @@ export class Pool {
         this.#release(conn);
         return undefined;
       }
+      const internals = connectionInternals(conn);
+      let resolved: [string, CallSpec | undefined];
+      try {
+        this.#apply(conn, method);
+        // Resolved like Connection.stream() does: a name of a registered interface (pool or connection
+        // `interfaces`) is validated too, exactly as pool.call(name) is.
+        resolved = internals.resolve(method);
+      } catch (e) {
+        this.#release(conn);
+        throw e;
+      }
       let released = false;
-      inner = connectionInternals(conn).stream(method, parameters, options, undefined, () => {
+      const params = parameters as Record<string, unknown> | undefined;
+      inner = internals.stream(resolved[0], params, options, resolved[1], () => {
         if (released) return;
         released = true;
         this.#release(conn);
@@ -183,13 +301,48 @@ export class Pool {
     await Promise.all([...this.#all].map((c) => c.close()));
   }
 
-  async #with<T>(options: CallOptions | undefined, op: (conn: Connection) => Promise<T>): Promise<T> {
+  async #with<T>(
+    options: CallOptions | undefined,
+    method: string | AnyMethod | undefined,
+    op: (conn: Connection) => Promise<T>,
+  ): Promise<T> {
     const conn = await this.#acquire(options);
     try {
+      this.#apply(conn, method);
       return await op(conn);
     } finally {
       this.#release(conn);
     }
+  }
+
+  /**
+   * Registers the interfaces added since this connection was last leased, each on its own: what addInterface
+   * throws is recorded for that entry. Then throws the recorded error for the operation's `method` (undefined:
+   * none, e.g. getInfo): a method descriptor of a rejected descriptor, or a name (or descriptor) of an interface
+   * the connection has no registration of (from no entry, nor its own `interfaces` option).
+   */
+  #apply(conn: Connection, method: string | AnyMethod | undefined): void {
+    let state = this.#applied.get(conn);
+    if (state === undefined) {
+      state = { count: 0, failed: new Map(), failedMethods: new WeakMap() };
+      this.#applied.set(conn, state);
+    }
+    for (; state.count < this.#interfaces.length; state.count++) {
+      const entry = this.#interfaces[state.count];
+      if (entry === undefined) break;
+      try {
+        conn.addInterface(entry.value);
+      } catch (e) {
+        if (!state.failed.has(entry.name)) state.failed.set(entry.name, e);
+        if (typeof entry.value !== "string")
+          for (const md of Object.values(entry.value.methods)) state.failedMethods.set(md, e);
+      }
+    }
+    if (method === undefined) return;
+    if (typeof method === "object" && state.failedMethods.has(method)) throw state.failedMethods.get(method);
+    const iface = interfaceOf(method);
+    if (iface !== undefined && state.failed.has(iface) && !connectionInternals(conn).has(iface))
+      throw state.failed.get(iface);
   }
 
   /** Waits for a lease, bounded by the operation's `signal` and `timeout` (the pool's `timeout` if absent). */

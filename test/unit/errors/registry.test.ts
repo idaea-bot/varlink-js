@@ -202,19 +202,35 @@ describe("InternalError interface (Q2)", () => {
   });
 
   test("the interface name appears literally only once in src/", () => {
+    // The two generated built-in modules are made from the constants (test/unit/codegen/builtins.test.ts checks
+    // they are up to date), so they are skipped; every hand-written file, src/interfaces/ included, is checked.
+    const generated = new Set(
+      [INTERNAL_ERROR_INTERFACE, ORG_VARLINK_SERVICE].map((name) => join(SRC, "interfaces", `${name}.ts`)),
+    );
+    const index = join(SRC, "interfaces/index.ts");
     const hits: string[] = [];
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const path = join(dir, entry.name);
         if (entry.isDirectory()) walk(path);
-        else if (entry.name.endsWith(".ts")) {
-          const count = readFileSync(path, "utf8").split(INTERNAL_ERROR_INTERFACE).length - 1;
-          for (let i = 0; i < count; i++) hits.push(path);
+        else if (entry.name.endsWith(".ts") && !generated.has(path)) {
+          const lines = readFileSync(path, "utf8").split("\n");
+          for (const line of lines) {
+            const count = line.split(INTERNAL_ERROR_INTERFACE).length - 1;
+            // The one exception: src/interfaces/index.ts imports the generated module, whose file name is the
+            // interface name (a module specifier, not a string naming the interface).
+            if (path === index && count === 1 && line.endsWith(` from "./${INTERNAL_ERROR_INTERFACE}.ts";`)) {
+              assert.match(line, /^export \{ \w+ as InternalErrorInterface \} from /);
+              hits.push(`${path} (import)`);
+              continue;
+            }
+            for (let i = 0; i < count; i++) hits.push(path);
+          }
         }
       }
     };
     walk(SRC);
-    assert.deepEqual(hits, [join(SRC, "core/errors/standard.ts")]);
+    assert.deepEqual(hits.sort(), [join(SRC, "core/errors/standard.ts"), `${index} (import)`].sort());
   });
 });
 

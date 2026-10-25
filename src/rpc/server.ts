@@ -447,7 +447,9 @@ export class Server {
    * @throws {TypeError} for a built-in or already registered name, an unknown handler key, a bad handler value,
    *   a descriptor that does not match its IDL, or an `ints` mismatch.
    */
-  implement<D extends InterfaceDescriptor>(descriptor: D, handlers: Handlers<D>): void {
+  // NoInfer: D comes from the descriptor alone; inferring it from inline handlers too would widen their results'
+  // literals (`kind: "large"` → string) before the contextual type is known.
+  implement<D extends InterfaceDescriptor>(descriptor: D, handlers: NoInfer<Handlers<D>>): void {
     assertIntsMode(descriptor, this.#ints);
     const compiled = compileDescriptor(descriptor, { codec: this.#codec });
     this.#register(compiled, descriptor.idl, handlers);

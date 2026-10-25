@@ -1,0 +1,5 @@
+# Errors of the varlink-js library itself.
+interface io.github.pzmarzly.varlinkjs
+
+# A method handler failed unexpectedly. Details are reported to the server's onError hook, never sent.
+error InternalError ()

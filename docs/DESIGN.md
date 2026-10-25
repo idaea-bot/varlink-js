@@ -534,7 +534,10 @@ entry.
   `JSON.rawJSON`); anything else is `type`/`null`, including functions, symbols, `Date`, `Map` and a top-level
   `Infinity` (from `1e400` or a too long literal; it could not be sent back). Only the top level is checked.
   Structs are plain objects; a field is present iff it is an own enumerable key (inherited `toString` etc. are
-  never read). **Absent ≡ null ≡ undefined for `?T` fields, and the output omits them**; in arrays and maps a
+  never read). **Absent ≡ null ≡ undefined for `?T` fields, and the output omits them** (except on decode, where
+  an absent `?T` field named like an `Object.prototype` member — `constructor`, `toString`, `valueOf`,
+  `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toLocaleString` — is an own `undefined` property, so
+  it never reads as the inherited function; `JSON.stringify` still omits it); in arrays and maps a
   `?T` null stays `null` (array holes encode as `null`; `undefined` map values are skipped on encode, like
   `JSON.stringify`). `?[]T`/`?[string]T`: `[]`/`{}` are values, not null. Map outputs are built with own data
   properties (`"__proto__"` is a plain key). Named types compile lazily, so recursive types work; more than
@@ -759,15 +762,29 @@ over `pair()`, unix and tcp sockets.
   head, so awaiting a later call before draining the stream waits forever (documented on `stream()`).
   `collect()` rejects with `RangeError` past `max` (1024).
 - **Validation** only for interfaces registered on the connection (`interfaces` option, `addInterface`; built-ins
-  `org.varlink.service` and `INTERNAL_ERROR_INTERFACE` always): parameters are `input.encode`d (a ValidationError
-  rejects before writing); replies per `validateReplies` (`"off"` raw, so unsafe ints may be bigints; `"warn"`
-  decode with `drop`, raw value + `onError invalid-reply` on failure; `"throw"` reject). An `int-range` in `"number"`
-  mode rejects in `"warn"` too. A rejection while replies are still pending (a stream's non-final reply, collect over
+  `org.varlink.service` and `INTERNAL_ERROR_INTERFACE` always, registered from their generated descriptors (§4.13)
+  with `ints` set to the connection's; their core error classes are registered only under names that have no class
+  in `errors` yet, so a user-supplied registry keeps its entries, e.g. a custom `InvalidParameter` subclass, and is
+  used for those replies, while an empty one is filled with the core classes): parameters are `input.encode`d (a
+  ValidationError rejects before writing); replies per `validateReplies` (`"off"` raw, so unsafe ints may be
+  bigints; `"warn"` decode with `drop`, raw value + `onError invalid-reply` on failure; `"throw"` reject).
+  **Typed (descriptor) calls treat `"off"` as `"warn"`**, so their replies are always decoded (unknown fields
+  dropped, ints per mode) and valid replies match their types; an invalid reply under `"off"`/`"warn"` is delivered
+  raw and reported to `onError` (`invalid-reply`), so use `"throw"` for a hard guarantee. Untyped calls keep `"off"`. An `int-range` in `"number"` mode
+  rejects in `"warn"` too. A rejection while replies are still pending (a stream's non-final reply, collect over
   `max`) closes the connection; on a final reply the connection stays intact. Error replies of a registered
   interface are decoded with its error validator (`drop`) and built with `errors.create`; invalid or undeclared →
   plain `VarlinkError` + `invalid-error`; unregistered interface → plain `VarlinkError`. `addInterface`: same name
-  and same text is a no-op (a descriptor's error classes are still registered), different text a `TypeError`;
-  descriptors go through `assertIntsMode` + `compileDescriptor`. Typed overloads (descriptor must be registered) exist
+  and same text is a no-op (a descriptor's error classes are still registered), different text a `TypeError`,
+  except for the two built-in names: another text is accepted if it is compatible with the built-in definition
+  (`assertBuiltinCompatible` in service.ts, used by Connection and Pool: every method, type and error of the text
+  exists in the built-in interface with the same kind and the same `formatType` of its input/output structs, error
+  struct or type; docs, member order and the experimental/more/upgrade markers are ignored), else a `TypeError`
+  (`interface org.varlink.service: method GetInfo differs from the built-in definition` / `… is not in the built-in
+  definition`), since the built-in (UAPI) definition stays in charge of validation and a member it lacks or types
+  otherwise would make generated types lie; a descriptor's classes fill only the registry's gaps (generated
+  built-ins map to the core classes, so a client generated from another implementation's `org.varlink.service`
+  binds); descriptors go through `assertIntsMode` + `compileDescriptor`. Typed overloads (descriptor must be registered) exist
   for `call`, `oneway`, `stream`, `collect`. `getInfo`/`getInterfaceDescription` always validate their replies
   (`"throw"`); `getInterface` parses + validates and checks the declared name (`TypeError` otherwise).
 - **Proxy** (`conn.proxy(name, {validateReplies = "throw"})`): `getInterface` + a private `compileInterface` (not
@@ -788,12 +805,32 @@ over `pair()`, unix and tcp sockets.
   factory's signal aborts with that error, so a factory that would hang frees its slot); the operation's `timeout`
   then applies again to the call itself. A `stream()` whose lease failed rejects its first `next()`, then is done. Connections are dropped
   when their `closed` settles. `close()` rejects waiters, closes all connections, later operations reject. `size`
-  counts open connections (not those being opened).
-- **Server** (`createServer(options)`, `service.ts` for the built-ins behind `builtinInterfaces()`): registration
+  counts open connections (not those being opened). **`addInterface(descriptorOrIdl)`** (M6): the pool keeps a list
+  of interfaces and registers the ones a connection has not seen yet on it (`Connection.addInterface`) right after
+  every lease, before the operation (`call`/`oneway`/`collect`/`stream`, also `getInfo` & co.); a `WeakMap` per
+  connection remembers how much of the list it has applied, so nothing is recompiled per lease. It is checked
+  eagerly (IDL: parse + validate; descriptor: `compileDescriptor` in `"number"` mode, since the pool has no `ints` of
+  its own; same value again a no-op, a different IDL under a registered name a `TypeError`, except for the built-in
+  names, which take a compatible text as on a Connection and throw for an incompatible one at once); the `ints`
+  match is checked per connection when applied. Each entry is applied on its own and a failure (ints mismatch, a
+  different IDL already on that connection) is recorded for that connection: an operation then rejects with the
+  recorded error (and releases the connection) only if it uses the failed entry — a method descriptor of a rejected
+  descriptor always; a name or another descriptor of the interface while the leased connection itself has no
+  registration of that name (asked through the internal `has(name)`, so one from another entry or from the
+  connection's own `interfaces` option counts). Everything else (`getInfo` & co., other interfaces, a correct
+  client of the same interface) keeps working. Typed descriptor overloads of `call`/`oneway`/`stream`/`collect` mirror
+  Connection's. `stream()` resolves the validation spec on the leased connection like `Connection.stream`, for a
+  descriptor and for a name of a registered interface alike (M4's `pool.stream(name)` skipped validation even when
+  `pool.call(name)` validated; M6 makes them consistent).
+- **Server** (`createServer(options)`, `service.ts` for the built-ins behind `builtinInterfaces()`, compiled from the
+  generated descriptors of §4.13 with `{ ...Desc, ints: server ints }`, sound because the built-in IDLs contain no
+  `int`; GetInfo/GetInterfaceDescription are typed with the generated `OrgVarlinkService_Handlers`): registration
   compiles at once (verbatim text kept for GetInterfaceDescription); handlers are functions or `{handler,
   requiresMore?: true, requiresUpgrade?: true}` (raising, never lowering, the IDL flag); unknown keys, bad values,
   built-in or taken names are `TypeError`s and nothing is registered. `UntypedHandler` uses a method signature, so
-  an untyped handler may annotate its parameters. The dispatch table and GetInterfaceDescription use `Map`s only.
+  an untyped handler may annotate its parameters. `implement(desc, handlers: NoInfer<Handlers<D>>)` infers `D`
+  from the descriptor only (inferring it from inline handlers too widened their literal results, M6). The dispatch
+  table and GetInterfaceDescription use `Map`s only.
   GetInfo lists `org.varlink.service`, user interfaces in registration order, then `INTERNAL_ERROR_INTERFACE`.
 - **Server driver**: per connection a reader task (`while wantsInput` read → receive; woken when the dispatcher takes
   a call off the queue and after each finished call, so a reader parked on a full queue reads again — and notices a
@@ -1041,6 +1078,117 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   channel options and `timeout` before dialling but the other `ConnectionOptions` (`ints`, `interfaces`, …) only in
   `createConnection`, after the handshake. The websocket/http mode-mismatch errors quote addresses without their user/password
   (`parseAddress`'s own "invalid varlink address" errors, a core M4 file, still quote the raw input).
+### 4.13 Codegen (M6)
+
+`src/codegen/` (`varlink-js/codegen`: `generate`, `generateFromService`, `GENERATOR_VERSION`; internal `doc.ts`,
+`sha256.ts`), `src/rpc/typed-client.ts` (root: `createClient`, `TypedClient`, `TypedMethod`, `freezeDescriptor`,
+`VarlinkErrorOptions`), `src/interfaces/` (generated built-ins + hand-written `runtime.ts`, `index.ts`),
+`interfaces/*.varlink`, `scripts/gen-interfaces.ts` (`npm run gen:interfaces`). No `node:*` in `src/codegen`.
+- **API**: `generate(idl, {ints = "number", importPath = "varlink-js"})` → `{fileName: "<iface>.ts", code,
+  interfaceName, constName}`; parses and validates (`IdlSyntaxError`); `options` not an object (null, an array),
+  unknown `ints`, or an `importPath` that is empty or contains a quote, backtick, backslash, C0 control, DEL or
+  U+2028/U+2029 → `TypeError`. `generateFromService(conn | pool, name, {…GenerateOptions, signal, timeout})` =
+  `getInterfaceDescription` + `generate`; its options are checked before any I/O (as `generate`'s, plus `signal`
+  an `AbortSignal` and `timeout` a number, else `TypeError`; the timeout's range is the call's, `RangeError`); a
+  description declaring another interface is a `TypeError` (M6's "dynamic client from
+  introspection"; the runtime one is `conn.proxy()`). `GENERATOR_VERSION` equals package.json's version (tested).
+- **File shape** (deterministic, byte-identical for identical input + options): header `// Generated by varlink-js
+  codegen <version> from interface <name> (ints: <mode>).` + `// Source sha256: <hex of the UTF-8 IDL>. Do not
+  edit; regenerate instead.` (no timestamps or paths; SHA-256 in pure TS, since `generate()` is synchronous; lone
+  surrogates hash as U+FFFD), `import * as $vjs from "<importPath>";`, then `<C>_IDL: string` (a template literal
+  whose value is the IDL byte for byte: `` ` `` `\` `$` and CR escaped, LF and TAB raw, other C0, DEL, C1, the
+  Bidi_Control characters (U+061C, U+200E/F, U+202A–E, U+2066–9), lone surrogates and ESLint's irregular
+  whitespace as `\uXXXX`), the members in IDL order, then `<C>_Descriptor` (type), `<C>_Client =
+  $vjs.TypedClient<…>`, `<C>_Handlers = $vjs.Handlers<…>` and `export const <C>: <C>_Descriptor =
+  $vjs.freezeDescriptor<<C>_Descriptor>({name, idl, ints, methods, errors, <each error>, client: (target) =>
+  $vjs.createClient(<C>, target)})`. `freezeDescriptor` freezes the method descriptors, `methods`, `errors` and the
+  descriptor (no `Object.freeze` in generated code, see naming). Per member: `type` → `export type T = …` (+ for an
+  enum `export const T_Values = [...] as const`, IDL order); `method M` → `M_Input`, `M_Output`; `error E` →
+  `E_Parameters` and `class E extends $vjs.VarlinkError<E_Parameters>` with `static readonly errorName =
+  "<iface>.E"` (literal type), `constructor(parameters[?]: E_Parameters, options?: $vjs.VarlinkErrorOptions)`
+  (`?` iff no required field) and `static is(e): e is E` via `$vjs.isVarlinkError` (the core classes' shape).
+  Method descriptors are `{interface, name, method, more?, upgrade?, experimental?: true}` (absent flags omitted;
+  no `"~types"` at runtime); every generated descriptor passes `compileDescriptor` (tested for the whole corpus).
+- **Naming**: `<C>` = PascalCase of the dotted name, `-` segments joined (`io.systemd.Resolve.Monitor` →
+  `IoSystemdResolveMonitor`, `org.example.my-iface` → `OrgExampleMyIface`), or `<C>_Interface` if a member has that
+  name. Member names match `[A-Z][A-Za-z0-9]*`, so every generator-made name, which contains `_` or `$`, is
+  collision-free. Generated code names no global (a varlink type may be called `Record`, `Array`, `Promise`, `Error`,
+  `ErrorOptions`, `Object`, …): only keywords, its own names and `$vjs.*` (`VarlinkErrorOptions` is the root's
+  alias of `ErrorOptions` for that reason). Field names are emitted bare (reserved words are valid keys).
+- **Type mapping** (§5.7): struct → object type literal in a `type` alias (never `interface`), always multiline;
+  `()` → `{ [key: string]: never }`; field `?T` → `f?: T | null` (`f?: T | null | undefined` if `f` is one of the
+  `Object.prototype` names of §4.9, `INHERITED_NAMES` in compile.ts, which the decoder sets to an own `undefined`
+  when absent, so under `exactOptionalPropertyTypes` the type admits it), others `f: T`; `bool` boolean, `int` number or
+  bigint, `float` number, `string` string, `object` `{ [key: string]: unknown }`, `any` `$vjs.JsonValue`; `[]T` →
+  `T[]` (a union in parentheses), `[string]T` → `{ [key: string]: T }` (so `[string]()` is a map of empty structs);
+  named refs by name (recursion works); inline enum → string literal union with no `_Values` const; inline struct
+  → inline object type (no `Method_Input_field` names: §5.7's "when needed" never arises); `?` of an enum flattens
+  into one union. Enum values are JSON string literals. Decoded maps are ordinary objects (own data properties on
+  `Object.prototype`): look keys up with `Object.hasOwn(m, k)`, since an absent key such as `toString` reads the
+  inherited function although `m[k]` is typed `T | undefined`.
+- **Docs**: TSDoc on the IDL const and descriptor const (interface doc), types, fields, classes and the
+  descriptor's method entries (type and const); `*/` → `*\/`; doc text from the IDL has every `@` followed by an ASCII
+  letter written as the text `@` (the generated comments contain no `@internal`/`@deprecated`/… substring, so a
+  peer's doc adds no tag and `stripInternal`, which matches `@internal` by substring, cannot drop declarations;
+  tested with `ts.transpileDeclaration`), and every C0 control
+  (TAB too), DEL, C1 and Bidi_Control character and ESLint's irregular whitespace as `\uXXXX` text (no raw control
+  bytes, no "Trojan Source" reordering); enum-value docs become a ``- `v`: doc`` list in the owning type's or
+  field's TSDoc; `[Experimental]` → `@experimental` (the generator's own tags are not escaped); method notes for
+  `[Requires|Supports 'more' flag]` (use `.stream()`/`.collect()`) and the upgrade flags. Decoded structs never
+  expose inherited `Object.prototype` members for absent optional fields (§4.9), so a generated
+  `constructor?: number | null | undefined` reads `undefined`, not `Object`.
+- **Layout**: `doc.ts` is a small Wadler/prettier document printer (group, indent, align, line, softline,
+  hardline, ifBreak, width 120) and the generator builds the documents prettier would for these constructs
+  (structs always broken; maps, unions, `(…)[]`, type arguments, call arguments and long strings break as
+  prettier breaks them), so output is prettier-clean; `prettier.test.ts` checks it for every corpus file in both
+  modes plus a layout stress interface. The committed generated files need no `.prettierignore` or
+  `eslint-disable`. Without methods, `<C>_Client`/`<C>_Handlers` are `{ readonly [K in never]: never }` (a generic
+  reference resolving to `{}` trips `@typescript-eslint/no-generated-empty-object-type`), as are empty
+  `methods`/`errors` types (`{}` trips `no-empty-object-type`).
+- **Built-in exception**: for `ORG_VARLINK_SERVICE` and `INTERNAL_ERROR_INTERFACE` (compared with the exported
+  constants, never a literal) no classes are generated: each error is `export const E: typeof $vjs.EError =
+  $vjs.EError` plus `export type E = $vjs.EError`, and `errors` holds the core classes, matched by `errorName`
+  (`InterfaceNotFoundError` … `InternalError`); an error of those interfaces without a core class is a `TypeError`.
+- **Typed client** (`createClient(desc, target)`, what `<C>.client(target)` calls): `target` must have Connection's
+  /Pool's `addInterface`/`call`/`stream`/`collect`/`oneway` (duck-typed, else `TypeError`; `typed-client.ts`
+  imports Connection and Pool as types only, so rpc/connection.ts → src/interfaces → runtime.ts →
+  typed-client.ts is no cycle; a fresh-process test imports service.ts first). It calls
+  `target.addInterface(desc)` (a Connection: idempotent, `TypeError` for an ints mismatch or a different IDL; a Pool:
+  as in §4.11) and returns a frozen null-prototype object with one frozen function per method (`.stream()`,
+  `.collect()`, `.oneway()`; `.upgrade()` comes with M9) over the target's typed overloads. `TypedMethod`'s
+  parameters are optional iff the input has no required field. Replies are always decoded: the connection's
+  `validateReplies` `"off"` (the default) acts as `"warn"` for typed calls (§4.11), so valid replies match their
+  types, while an invalid one under `"off"`/`"warn"` is delivered raw and reported to `onError` (`invalid-reply`);
+  `"throw"` rejects it (use it for a hard guarantee); error replies
+  of the interface become the generated classes (`instanceof` works). `<C>.client` closes over the generated
+  constant (documented in its TSDoc): `({ ...C, ints }).client(target)` still binds the generated `ints`; use
+  `createClient({ ...C, ints }, target)` for another mode.
+  `Handlers<D>` (server.ts) gives the precise input/result types (a `@ts-expect-error` test covers wrong
+  parameter use, results, unknown keys and client parameters).
+- **Built-ins** (deviation from §5.7, which said "at build time"): `interfaces/org.varlink.service.varlink` and
+  `interfaces/<INTERNAL_ERROR_INTERFACE>.varlink` (byte-identical to the core IDL constants) are generated by
+  `scripts/gen-interfaces.ts` with `importPath: "./runtime.ts"` into `src/interfaces/` and committed;
+  `builtins.test.ts` fails when they are stale, when a source differs from its constant, or when a built-in IDL
+  contains `int` (the `ints` override needs that). rpc imports them through `src/interfaces/index.ts`, so the
+  internal interface's name stays in one place in hand-written code. A generated built-in descriptor says
+  `ints: "number"`; on a bigint connection use `createClient({ ...OrgVarlinkService, ints: "bigint" }, conn)` (or
+  `conn.getInfo()`). A client generated from another implementation's `org.varlink.service` text (libvarlink,
+  python, rust, systemd) binds too: connections and pools accept a text under the built-in names that is
+  compatible with the built-in definition (§4.11; all five corpus texts are), and reject others. Not generated here: `org.varlink.certification` (M5's interface file) and
+  `org.varlink.resolver` (M8).
+- **Tests** (`test/unit/codegen/`): `generate.test.ts` (each mapping rule, docs, flags, names and collisions,
+  built-in exception, options, determinism, IDL round trip, `generateFromService`), `snapshots/*.ts.snap`
+  (ftl in both modes, rust's org.example.complex, python's org.varlink.certification, io.systemd.Resolve,
+  org.varlink.service; `UPDATE_SNAPSHOTS=1 npm test` rewrites them and the committed generated files),
+  `corpus-typecheck.test.ts` (every corpus file × both modes + collision/layout/test interfaces with usage files,
+  one `tsc` run with the repo's strict options and `paths` to `src/index.ts`, plus `compileDescriptor` at runtime),
+  `prettier.test.ts`, `builtins.test.ts`, `sha256.test.ts` (NIST vectors, node:crypto at lengths 0–200),
+  `e2e.test.ts` over `pair()` with the committed fixtures in `generated/` (incl. a bigint one), `review-fixes.test.ts`
+  (review-1 regressions: typed decoding under `"off"`, per-entry pool failures, corpus `org.varlink.service`
+  clients, `Object.prototype` field names, user registries, control/bidi/`@` escaping, `generateFromService`
+  options), `review-fixes-2.test.ts` (review-2: incompatible built-in texts rejected on Connection and Pool,
+  `stripInternal` keeps a peer-`@internal` type, pool per-entry failures ask the leased connection, `| undefined`
+  only for the `Object.prototype` names).
 
 ---
 
@@ -1057,7 +1205,7 @@ const conn = await connect("unix:/run/systemd/io.systemd.Hostname", {
   timeout: 45_000,          // default 45 s like sd-varlink; 0 = none. See "Timeouts" below.
   ints: "number",           // §4.3
   maxMessageSize: 16 << 20,
-  validateReplies: "off",   // "off" | "warn" | "throw"; needs an IDL (typed client or getInterface)
+  validateReplies: "off",   // "off" | "warn" | "throw"; needs an IDL (typed calls: "off" acts as "warn")
 });
 
 // Untyped calls
@@ -1120,7 +1268,9 @@ The runtime-agnostic core is `createPool(factory, options)` from `varlink-js` (`
 Promise<Connection>`); the Node adapter's `createPool(address)` wraps it (§4.11). The pool leases an idle healthy
 connection or opens one (up to `max`, then waits). A connection that
 closed or failed is discarded, never reused (F4). Streams hold their lease until they end, so
-cancelling one stream doesn't kill other calls.
+cancelling one stream doesn't kill other calls. `pool.addInterface(descriptorOrIdl)` registers an interface on
+every connection it hands out (§4.11), and `call`/`oneway`/`stream`/`collect` have the same typed descriptor
+overloads as Connection, so `X.client(pool)` works like `X.client(conn)` (§5.3).
 
 ### 5.3 Typed calls (codegen output, §5.7)
 
@@ -1136,14 +1286,19 @@ const { configuration } = await ftl.CalculateConfiguration({ current, target });
 try { await ftl.Jump({ configuration }); }
 catch (e) { if (OrgExampleFtl.NotEnoughEnergy.is(e)) … }   // typed error
 
-// Each method is callable (single reply) and also has .stream(), .collect(), .oneway() (and .upgrade()),
-// mirroring the untyped Connection API, so the return type never depends on a runtime option.
+// Each method is callable (single reply) and also has .stream(), .collect(), .oneway() (.upgrade() comes with
+// M9), mirroring the untyped Connection API, so the return type never depends on a runtime option.
 for await (const c of ftl.Monitor.stream({})) { c.condition.state }  // "idle" | "spooling" | "busy"
 ```
 
-Generated descriptors carry the IDL, so typed clients can validate replies with `validateReplies`
-(same option as §5.1; default `"off"`). Clients SHOULD ignore unknown reply fields, so reply
-validation skips unknown fields.
+Generated descriptors carry the IDL, so typed calls always decode their replies (unknown fields dropped, `int`s
+converted per the `ints` mode), whatever `validateReplies` says: for them the default `"off"` acts as `"warn"` (an
+invalid reply is delivered raw and reported to `onError` as `invalid-reply`; an unsafe int in `"number"` mode
+rejects), and `"throw"` rejects an invalid reply. Untyped calls keep `"off"` (raw). Clients SHOULD ignore unknown
+reply fields, so reply validation skips unknown fields. `X.client(target)` is `createClient(X, target)` (§4.13): it registers the
+descriptor on the connection (`addInterface`; a different IDL under the name or an `ints` mismatch is a
+`TypeError`) or the pool (checked per leased connection), so parameters are encoded with the IDL and error replies
+of the interface become the generated classes. Parameters are optional iff the input has no required field.
 
 Untyped introspection proxy (no codegen, part of M4): `const x = await conn.proxy("org.example.ftl")`
 fetches and parses the interface, then exposes the same method shape with runtime validation and
@@ -1272,14 +1427,15 @@ One `.ts` file per interface:
 
 - `type` structs and error parameters → `type` aliases, not `interface` (TS interfaces are not assignable to
   index signatures such as `JsonValue` or `VarlinkError<P extends Record<string, unknown>>`); fields `?T` →
-  `field?: T | null`; enums → string literal unions plus
-  `const …Values = [...] as const`; `[]T` → `T[]`; `[string]T` → `Record<string, T>`; `[string]()` →
-  `Record<string, Record<string, never>>` (string set); `object` → `Record<string, unknown>`;
+  `field?: T | null`; named enums → string literal unions plus
+  `const …_Values = [...] as const` (inline enums: the union only); `[]T` → `T[]`; `[string]T` →
+  `{ [key: string]: T }`; `[string]()` → `{ [key: string]: { [key: string]: never } }` (string set); `()` →
+  `{ [key: string]: never }`; `object` → `{ [key: string]: unknown }`;
   `any` → `JsonValue` (non-null; includes `bigint`, §4.3); `int` → `number` or `bigint` per
   `--ints number|bigint` (must match the runtime `ints` option; the generated descriptor records it and the
   client/server checks the match at bind time);
-  anonymous inline structs/enums → inline types, named `Method_Input_field` only when needed for
-  readability.
+  anonymous inline structs/enums → inline types. (M6: index signatures instead of `Record<…>`, because generated
+  code must not name globals a varlink type may shadow, and no `Method_Input_field` names: §4.13.)
 - Doc comments → TSDoc on the generated declarations.
 - Errors → classes extending `VarlinkError` with typed `parameters` and a static `is()` guard, registered so
   clients map error replies to them. Exception: for `org.varlink.service` and `INTERNAL_ERROR_INTERFACE`,
@@ -1296,8 +1452,10 @@ One `.ts` file per interface:
 Generated code imports only `varlink-js` (core). It is deterministic (stable ordering; header with the
 generator version and a hash of the source) so it can be committed and diff-reviewed.
 
-The repo regenerates `org.varlink.service`, `org.varlink.certification` and `org.varlink.resolver`
-from `.varlink` files at build time; the hand-written `*.varlink.ts` files go away.
+The repo generates `org.varlink.service` and `INTERNAL_ERROR_INTERFACE` from `interfaces/*.varlink` into
+`src/interfaces/` (M6 deviation: by `npm run gen:interfaces`, committed, and checked up to date by a test, not
+regenerated during `npm run build`); `org.varlink.certification` (M5) and `org.varlink.resolver` (M8) are not
+generated in M6. Details in §4.13.
 
 ### 5.8 Socket activation and exec
 

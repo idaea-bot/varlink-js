@@ -2,6 +2,7 @@
 // its IDL type and returns a new normalized copy, or throws ValidationError with the path of the first problem.
 import type { Interface, MethodMember, Type, TypeMember } from "../idl/ast.ts";
 import { formatType } from "../idl/format.ts";
+import { isFieldName } from "../idl/names.ts";
 import { parseInterface } from "../idl/parser.ts";
 import { validateInterface } from "../idl/validate.ts";
 import {
@@ -74,6 +75,13 @@ const INT_MAX = 2n ** 64n - 1n;
 const LENIENT_INT = /^-?(0|[1-9][0-9]*)$/;
 /** Longer decimal strings are out of range anyway; checked before BigInt() parses them. */
 const MAX_INT_DIGITS = 21;
+/**
+ * Field names a struct inherits from Object.prototype (`constructor`, `toString`, …): decode sets them even when
+ * absent (an own `undefined`); codegen types such optional fields `?: T | null | undefined`.
+ */
+export const INHERITED_NAMES: ReadonlySet<string> = new Set(
+  Object.getOwnPropertyNames(Object.prototype).filter((n) => isFieldName(n)),
+);
 
 type Direction = "reject" | "drop" | "encode";
 
@@ -265,6 +273,7 @@ class Compiler {
         const fields = type.fields.map((f) => ({
           name: f.name,
           nullable: f.type.kind === "nullable",
+          inherited: INHERITED_NAMES.has(f.name),
           check: this.compile(f.type.kind === "nullable" ? f.type.element : f.type),
           type: f.type,
         }));
@@ -281,6 +290,8 @@ class Compiler {
                 if (value === null) fail(ctx, "null", `expected ${formatType(field.type)}, got null`);
                 fail(ctx, "missing", `required field is missing (${formatType(field.type)})`);
               }
+              // An own undefined, so the absent field does not read as the inherited function.
+              if (field.inherited && ctx.dir !== "encode") out[field.name] = undefined;
             } else {
               out[field.name] = field.check(value, ctx, depth + 1);
             }

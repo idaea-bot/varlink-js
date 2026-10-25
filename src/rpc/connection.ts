@@ -3,7 +3,7 @@
 // streams, reply/error validation for registered interfaces.
 import { CallTimeoutError, ConnectionClosedError, isVarlinkLocalError, safeQuote } from "../core/errors/local.ts";
 import { createErrorRegistry, type ErrorRegistry } from "../core/errors/registry.ts";
-import { INTERNAL_ERROR_INTERFACE_IDL, ORG_VARLINK_SERVICE, ORG_VARLINK_SERVICE_IDL } from "../core/errors/standard.ts";
+import { ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
 import { VarlinkError, type ErrorClass } from "../core/errors/varlink-error.ts";
 import type { Interface } from "../core/idl/ast.ts";
 import { parseInterface } from "../core/idl/parser.ts";
@@ -22,7 +22,9 @@ import {
   type MethodInput,
   type MethodOutput,
 } from "../core/types/descriptors.ts";
+import { InternalErrorInterface, OrgVarlinkService } from "../interfaces/index.ts";
 import { createProxy, type InterfaceProxy, type ProxyOptions } from "./proxy.ts";
+import { assertBuiltinCompatible, builtinDescriptor } from "./service.ts";
 import { checkMode, checkPositiveInt, checkTimeout, splitName } from "./util.ts";
 
 /** Default call timeout in ms (sd-varlink's 45 s). */
@@ -47,11 +49,17 @@ export interface ConnectionOptions {
    * Reply validation for registered interfaces: `"off"` (default) gives the raw parameters (in `"number"` mode
    * they may contain bigints for unsafe integers), `"warn"` decodes them (unknown fields dropped) and on a
    * mismatch delivers the raw value and calls `onError`, `"throw"` rejects the call with the ValidationError.
+   * Typed calls (a method descriptor) treat `"off"` as `"warn"`: their replies are always decoded, and valid
+   * ones match their types; an invalid one is delivered raw and reported to `onError` (`invalid-reply`), so use
+   * `"throw"` for a hard guarantee.
    */
   validateReplies?: ValidateReplies;
   /** Default {@link jsonCodec}. */
   codec?: Codec;
-  /** Maps error replies to classes; default `createErrorRegistry()`. Descriptor error classes are added to it. */
+  /**
+   * Maps error replies to classes; default `createErrorRegistry()`. Descriptor error classes are added to it; the
+   * built-ins' core classes only under names that have no class in it yet (existing entries are kept).
+   */
   errors?: ErrorRegistry;
   /** Interfaces registered for validation at construction (descriptors or IDL text). */
   interfaces?: readonly (InterfaceDescriptor | string)[];
@@ -276,10 +284,17 @@ function isIntRange(e: unknown): boolean {
 
 const SERVICE_OPTIONS: CallSpec = { mode: "throw" };
 
+/** The interfaces every connection registers at construction (see addInterface). */
+const BUILTIN_NAMES: ReadonlySet<string> = new Set([OrgVarlinkService.name, InternalErrorInterface.name]);
+
 /** Internal entry points for the proxy and the pool (not re-exported). */
 export interface ConnectionInternals {
   readonly ints: IntsMode;
   readonly codec: Codec;
+  /** Whether an interface of this name is registered (built-ins, `interfaces`, addInterface). */
+  has(name: string): boolean;
+  /** The wire name and validation spec of a call, as the public methods resolve it (the pool's typed overloads). */
+  resolve(method: string | MethodDescriptor<object, object>): [string, CallSpec | undefined];
   start(
     kind: OpKind,
     method: string,
@@ -362,6 +377,8 @@ export class Connection {
     internalsOf = (conn) => ({
       ints: conn.#ints,
       codec: conn.#codec,
+      has: (name) => conn.#interfaces.has(name),
+      resolve: (method) => conn.#resolve(method),
       start: (kind, method, parameters, options, spec, sink, onDone) => {
         conn.#start(kind, method, parameters, options, spec, sink, onDone);
       },
@@ -385,8 +402,9 @@ export class Connection {
       codec: this.#codec,
       maxMessageSize: checkMaxMessageSize(options?.maxMessageSize),
     });
-    this.addInterface(ORG_VARLINK_SERVICE_IDL);
-    this.addInterface(INTERNAL_ERROR_INTERFACE_IDL);
+    // The built-ins from their generated descriptors; their core error classes fill only the gaps of `errors`.
+    this.addInterface(builtinDescriptor(OrgVarlinkService, this.#ints));
+    this.addInterface(builtinDescriptor(InternalErrorInterface, this.#ints));
     for (const i of options?.interfaces ?? []) this.addInterface(i);
     this.closed = new Promise((resolve) => {
       this.#resolveClosed = resolve;
@@ -414,9 +432,14 @@ export class Connection {
   /**
    * Registers an interface for validation (compiled with this connection's `ints` and codec). A descriptor's error
    * classes are added to the error registry. The same name again: no-op for the same IDL text (a descriptor's
-   * error classes are still registered), TypeError for a different one.
+   * error classes are still registered), TypeError for a different one. The built-ins (`org.varlink.service` and
+   * the internal error interface) are registered at construction and accept another IDL text if it is compatible
+   * (every member exists in the built-in definition with the same kind and types; docs, order and markers aside):
+   * the built-in definition stays in charge of validation, and their error classes are added only under names that
+   * have no class yet.
    *
-   * @throws {TypeError} on a different IDL under a taken name, a descriptor mismatch or an `ints` mismatch.
+   * @throws {TypeError} on a different IDL under a taken name (for a built-in: an incompatible one), a descriptor
+   *   mismatch or an `ints` mismatch.
    * @throws {IdlSyntaxError} for invalid IDL.
    */
   addInterface(descriptorOrIdl: InterfaceDescriptor | string): void {
@@ -431,6 +454,14 @@ export class Connection {
       idl = descriptorOrIdl.idl;
       compiled = compileDescriptor(descriptorOrIdl, { codec: this.#codec });
       classes = Object.values(descriptorOrIdl.errors);
+    }
+    if (BUILTIN_NAMES.has(compiled.name)) {
+      // Never replaced; a user-supplied registry keeps its own classes (generated built-ins map to the core ones).
+      const builtin = this.#interfaces.get(compiled.name);
+      if (builtin !== undefined && builtin.idl !== idl) assertBuiltinCompatible(compiled.ast);
+      this.#errors.register(...classes.filter((cls) => !this.#errors.has(cls.errorName)));
+      if (builtin === undefined) this.#interfaces.set(compiled.name, { idl, compiled });
+      return;
     }
     const existing = this.#interfaces.get(compiled.name);
     if (existing !== undefined && existing.idl !== idl)
@@ -588,7 +619,8 @@ export class Connection {
       throw new TypeError("method must be a name or a MethodDescriptor");
     if (!this.#interfaces.has(method.interface))
       throw new TypeError(`interface ${safeQuote(method.interface)} is not registered on this connection`);
-    return [method.method, this.#specFor(method.method, this.#mode)];
+    // Typed calls always decode their replies (their result type holds in every mode): "off" acts as "warn".
+    return [method.method, this.#specFor(method.method, this.#mode === "off" ? "warn" : this.#mode)];
   }
 
   #specFor(method: string, mode: ValidateReplies): CallSpec | undefined {

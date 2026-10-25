@@ -16,6 +16,13 @@ export {
 export { createPool, Pool, type ConnectionFactory, type PoolOptions } from "./pool.ts";
 export type { InterfaceProxy, ProxyMethod, ProxyOptions } from "./proxy.ts";
 export {
+  createClient,
+  freezeDescriptor,
+  type TypedClient,
+  type TypedMethod,
+  type VarlinkErrorOptions,
+} from "./typed-client.ts";
+export {
   createServer,
   Server,
   type HandlerOptions,

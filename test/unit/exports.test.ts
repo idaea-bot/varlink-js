@@ -89,6 +89,27 @@ test("varlink-js exports the RPC layer and the address parser; sessions stay int
     assert.equal(internal in root, false, internal);
 });
 
+test("varlink-js/codegen exports generate(); the root entry the typed-client runtime generated code uses (M6)", () => {
+  assert.deepEqual(Object.keys(codegen).sort(), ["GENERATOR_VERSION", "generate", "generateFromService"]);
+  assert.equal(typeof codegen.generate, "function");
+  assert.equal(typeof codegen.generateFromService, "function");
+  assert.equal(codegen.GENERATOR_VERSION, pkg.version);
+  for (const fn of ["createClient", "freezeDescriptor", "isVarlinkError"] as const)
+    assert.equal(typeof root[fn], "function", fn);
+  assert.equal(typeof root.VarlinkError, "function");
+  // Types only (checked by tsc): what generated code names through `$vjs.`.
+  const types: [
+    root.TypedClient<root.InterfaceDescriptor>,
+    root.TypedMethod<root.MethodDescriptor>,
+    root.VarlinkErrorOptions,
+    root.Handlers<root.InterfaceDescriptor>,
+    root.JsonValue,
+  ][] = [];
+  assert.deepEqual(types, []);
+  // The generated built-ins are internal (rpc uses them), not a subpath.
+  assert.equal("OrgVarlinkService" in root, false);
+});
+
 test("varlink-js/node exports the socket adapter (M4)", () => {
   assert.deepEqual(Object.keys(node).sort(), ["connect", "createPool", "fromNodeSocket", "listen"]);
   for (const fn of ["connect", "createPool", "fromNodeSocket", "listen"] as const)

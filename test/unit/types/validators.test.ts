@@ -369,7 +369,8 @@ describe("structs", () => {
   test("fields named like Object.prototype members never read inherited values", () => {
     const fields = compileInterfaceText(DEFS).types.get("Fields");
     assert.ok(fields);
-    assert.deepEqual(fields.decode({ valueOf: 1 }), { valueOf: 1 });
+    // Absent nullable ones decode as own undefined properties (§4.9), so they never read as the inherited ones.
+    assert.deepStrictEqual(fields.decode({ valueOf: 1 }), { toString: undefined, constructor: undefined, valueOf: 1 });
     assert.deepEqual(fields.encode({ valueOf: 1, toString: 2, constructor: "c" }), {
       toString: 2,
       constructor: "c",
