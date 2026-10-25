@@ -1478,8 +1478,8 @@ first member that has one; one-shot (connected-fd, stdio) listeners have none. P
 access, so no path traversal): `mkdir -p` the directory, the directories it created `chmod`ed to 0755 (a restrictive
 umask must not hide the registry from readers; each is `lstat`ed first and skipped unless it is a directory, not a
 symlink, owned by `process.getuid()` where that exists); target = the absolute socket path; absent → `symlink` (an `EEXIST`
-race is re-evaluated once); a symlink whose `readlink` equals the target, or whose `realpath` equals the target's
-(e.g. a relative link) → adopted (not rolled back; removed on unbind only if spelled exactly as the target);
+race is re-evaluated once); a symlink whose `readlink` equals the target, or that resolves to the same file (same
+dev + inode; e.g. a relative link) → adopted (not rolled back; removed on unbind only if spelled exactly as the target);
 stale (dangling symlink, or a socket /
 symlink to one that refuses 3 connects ~20 ms apart with `ECONNREFUSED`/`ENOENT`) → replaced atomically (`symlink` to
 `<dir>/.<iface>.<random>.tmp`, `rename` over the entry, then `readlink` again: if another binder replaced it right
@@ -1615,7 +1615,7 @@ M8 phase A: `src/node/spawn-channel.ts`, `spawn.ts`, `activation.ts`, plus `exit
   outcome (like `sd_listen_fds(1)`), before the options are validated, so also when those throw.
   fds 3… named `name` are used; with no `LISTEN_FDNAMES` a single fd is used. Per fd, `accept: "auto"` on Linux
   reads `/proc/self/fd/N` (`socket:[ino]`) and looks the inode up in `/proc/self/net/unix` (Flags `__SO_ACCEPTCON`
-  = listening; the Path column, the name at bind time, gives the address, `@…` → `unix:@…`) and `tcp`/`tcp6` (st
+  = listening; the Path column, the name at bind time, gives the address if a socket still exists there (else `fd:<n>`, so a renamed or removed bind path is never published), `@…` → `unix:@…`) and `tcp`/`tcp6` (st
   `0A`). Those tables list only our network namespace: under `PrivateNetwork=yes` the sockets systemd made (an
   `Accept=yes` connection included) are in the host's, so an inode missing there is looked up in
   `/proc/1/net/{unix,tcp,tcp6}` (pid 1's namespace, where the service manager made it; read lazily, once per call).

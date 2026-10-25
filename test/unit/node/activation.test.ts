@@ -141,7 +141,7 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
     });
     assert.deepEqual(reply.after, {});
     // On Linux the address comes from /proc (the bound name); elsewhere Node cannot name the socket.
-    assert.equal(reply.address, LINUX ? `unix:${s.procPath}` : "fd:3");
+    assert.equal(reply.address, "fd:3");
     await conn.close();
     assert.equal(await exited, 0, "exitOnIdle: 0 shut the server down; closed resolved; exit(0)");
     assert.ok(existsSync(s.path), "closing a {fd} listener never unlinks");
@@ -206,7 +206,8 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
       try {
         const r = await report({ fds: [a.fd], env: { LISTEN_FDS: "1" }, hint: true, args: ["--accept=auto"] });
         assert.equal(r.result, "listener");
-        assert.equal(r.address, `unix:${a.procPath}`);
+        // /proc names the bind-time path (`<path>.tmp`, renamed since): not a socket any more, so no address.
+        assert.equal(r.address, "fd:3");
       } finally {
         await closeServer(a.server);
       }
@@ -234,7 +235,7 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
     try {
       const r = await report({ fds: [a.fd], env: { LISTEN_FDS: "1" }, hint: true, args: ["--accept=listening"] });
       assert.equal(r.result, "listener");
-      assert.equal(r.address, LINUX ? `unix:${a.procPath}` : "fd:3");
+      assert.equal(r.address, "fd:3");
     } finally {
       await closeServer(a.server);
     }
@@ -352,9 +353,9 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
       const env = { LISTEN_FDS: "3", LISTEN_FDNAMES: "other::varlink" };
       const fds = [a.fd, b.fd, b.fd];
       const byDefault = await report({ fds, env, args: ["--accept=listening"] });
-      assert.equal(byDefault.address, LINUX ? `unix:${b.procPath}` : "fd:5");
+      assert.equal(byDefault.address, "fd:5");
       const named = await report({ fds, env, args: ["--accept=listening", "--name=other"] });
-      assert.equal(named.address, LINUX ? `unix:${a.procPath}` : "fd:3");
+      assert.equal(named.address, "fd:3");
       const none = await report({ fds, env, args: ["--name=missing"] });
       assert.equal(none.result, "null");
     } finally {
@@ -377,7 +378,7 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
     const cb = await connect(`unix:${b.path}`);
     const [ra, rb] = await Promise.all([ping(ca), ping(cb)]);
     assert.equal(ra.pid, rb.pid);
-    assert.equal(ra.address, LINUX ? `unix:${a.procPath}` : "fd:3", "the merged address is the first one's");
+    assert.equal(ra.address, "fd:3", "the merged address is the first one's");
     await ca.close();
     await cb.close();
     assert.equal(await exited, 0);
@@ -487,7 +488,7 @@ describe("listenAuto in a child", () => {
         args: ["--accept=listening"],
       });
       assert.equal(r.result, "listener");
-      assert.equal(r.address, LINUX ? `unix:${a.procPath}` : "fd:3");
+      assert.equal(r.address, "fd:3");
     } finally {
       await closeServer(a.server);
     }

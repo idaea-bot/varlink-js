@@ -1,7 +1,7 @@
 // Socket activation (DESIGN.md §5.8): listeners from LISTEN_FDS/LISTEN_FDNAMES, SYSTEMD_VARLINK_LISTEN, stdio.
 // Reference: sd-daemon.c (sd_listen_fds, sd_listen_fds_with_names), sd-varlink.c (sd_varlink_server_listen_name,
 // sd_varlink_server_listen_auto).
-import { readFileSync, readlinkSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { Socket } from "node:net";
 import { formatAddress, type AddressSpec } from "../core/address/parse.ts";
 import { OperationNotSupportedError } from "../core/errors/local.ts";
@@ -351,6 +351,20 @@ class MergedListener implements Listener {
 }
 
 /**
+ * A `/proc` address only if it still names a socket: /proc/net/unix shows the path a socket was *bound* to, which may
+ * have been renamed or removed since (our own listen() and exec: listening mode bind under a temporary name), and a
+ * dangling address would be published by `serve(listener, {registry})`. Abstract names and tcp are kept as they are.
+ */
+function existingAddress(address: string | undefined): string | undefined {
+  if (address?.startsWith("unix:/") !== true) return address;
+  try {
+    return lstatSync(address.slice("unix:".length)).isSocket() ? address : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * One {@link Listener} over several: iterating it yields the channels of all of them until all ended (an
  * iteration error of one is delivered once to `next()`); `close()` closes all; `address` is the first one's. One
  * iteration at a time (a second concurrent one is a `TypeError`); after `return()` it may be iterated again. It has
@@ -430,8 +444,9 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
       // /proc silent (not Linux, or an inode unknown in both namespaces): only our own exec:'s hint says "connected".
       const connected = info === undefined ? hinted : !info.listening;
       const mode = accept === "auto" ? (connected ? "connected" : "listening") : accept;
-      if (mode === "connected") listeners.push(connectedListener(fd, info?.address));
-      else listeners.push(await listen({ fd }, info?.address === undefined ? {} : { address: info.address }));
+      const address = existingAddress(info?.address);
+      if (mode === "connected") listeners.push(connectedListener(fd, address));
+      else listeners.push(await listen({ fd }, address === undefined ? {} : { address }));
     }
   } catch (e) {
     await Promise.allSettled(listeners.map((l) => l.close()));
