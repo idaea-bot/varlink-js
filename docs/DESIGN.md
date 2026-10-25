@@ -415,9 +415,22 @@ systemd before shipping M8.*
   `server.listen({fd})` for socket activation. Found in M4 (§4.11): libuv unlinks a unix socket's bound path on
   `server.close()` even after it was replaced (hence bind in a private directory + `link`), and `server.address()` is `null`
   for a unix socket listened via `{fd}` (hence the `fd:<n>` placeholder address).
-- **Bun, Deno 2**: start by running the Node adapter through their `node:` compat; M10 adds CI jobs. Native
-  adapters (`Bun.connect`, `Deno.connect`) only if CI shows gaps. Unknowns to test: abstract sockets,
-  `listen({fd})`, half-close.
+- **Bun, Deno 2**: the Node adapter runs through their `node:` compat; no native adapters (`Bun.connect`,
+  `Deno.connect`) were needed. M10 (`.github/workflows/runtimes.yml`, ubuntu-latest): Bun latest runs
+  `bun test test/unit test/regression`, Deno 2.x `deno test -A --no-check test/unit test/regression` (`npm ci` for the
+  dev dependencies; types are checked by `tsc` in ci.yml), i.e. every unit test plus the e2e regressions over pair,
+  unix and tcp, `sockets.test.ts`, the WebSocket/HTTP clients against the bridge fixture, abstract sockets and
+  `listen({fd})`. Checked on Bun 1.4.4 and Deno 2.9.8 (macOS, and the versions CI resolves on Linux). Results:
+  abstract sockets (Linux), `listen({fd})` (unix and tcp), half-close, `context.source`/`JSON.rawJSON` and the global
+  `WebSocket`/`fetch` all work on both. Gaps found and how they are handled: Bun's `server.address()` for a unix socket
+  inherited via `{fd}` is an object without `address`/`port` (handled: `fd:<n>` placeholder, as on Node); Bun reports
+  an accepted socket's `timeout` as `0` instead of `undefined` (both mean none; the F1 test accepts either); Bun keys
+  its module cache by path and ignores a `?query`, so the F11 two-module-instances test is skipped on Bun (the brand
+  check itself runs everywhere); RSS grows in ~4 MiB steps on Bun and Deno, so F15's pair bound is doubled there.
+  Not covered on Bun/Deno: the fuzz suite and the tooling tests (`test/fuzz`, `test/tooling`; they run on Node), and
+  the compiled-dist consumer fixture (Node only). Browsers: the websocket/http subpaths are lint- and
+  typecheck-guarded (no `node:`, no runtime globals, `.d.ts` without DOM types) but no browser runs them yet
+  (Playwright smoke test not done; M10 leftover).
 - **Browser**: `varlink-js/websocket` (WebSocket mode against systemd's `varlink-http-bridge` or any
   UAPI bridge). It's standardised now, so it is worth doing. No fds, as the spec says.
 - **fd passing / peer credentials**: no JS runtime exposes `SCM_RIGHTS` or `SO_PEERCRED`. Plan: a
@@ -890,6 +903,133 @@ over `pair()`, unix and tcp sockets.
   fails, it finishes, or the socket's `close` arrives. F15's memory bound is 4 × `maxMessageSize` over
   pair and 16 × over sockets (a fresh Buffer per read, garbage until the next GC, plus kernel buffers), still a
   quarter of the 64 MiB input.
+
+### 4.12 WebSocket and HTTP clients (M10)
+
+`src/websocket/` (`channel.ts`, `connect.ts`) is `varlink-js/websocket`: `connect`, `createPool`, `fromWebSocket` and
+the types `WebSocketConnectOptions`, `WebSocketChannelOptions`, `WebSocketLike`, `WebSocketConstructorLike`.
+`src/http/` (`client.ts`, `errors.ts`, internal `jsonseq.ts`) is `varlink-js/http`: `createHttpClient`, the class
+`HttpClient` (a class like `Connection`, created by the factory), `HttpBridgeError` and the types `HttpClientOptions`,
+`HttpRequestOptions`, `HttpCallOptions`, `HttpStreamOptions`, `HttpCollectOptions`, `FetchLike`, `FetchInitLike`,
+`ResponseLike`, `ReadableStreamLike`, `ReadableStreamReaderLike`. Both are browser-facing layers (§4, §8): imports from
+core, rpc and their own directory only; globals `fetch`, `WebSocket`, `setTimeout`, `AbortController`,
+`TextEncoder`/`TextDecoder`, `queueMicrotask`. Public signatures name no DOM type: structural interfaces of exactly the
+members used, so the `.d.ts` compiles with lib `dom` or with `@types/node` (both runtimes' globals are assignable to
+them); the globals are read as `unknown` and checked with `typeof … === "function"`.
+- **WebSocket channel** (`fromWebSocket(ws, {maxBufferedBytes, writeHighWaterMark})`): `TypeError` unless OPEN; sets
+  `binaryType = "arraybuffer"`. Frames are bytes, never messages (UAPI: clients MUST NOT rely on one message per frame;
+  the Connection's framer reassembles on NUL): ArrayBuffers and views as they are, text UTF-8 encoded, a `Blob` (a
+  runtime ignoring `binaryType`) read with `arrayBuffer()` in its own queue slot (later messages wait behind it; a
+  failed read fails the stream at that position, close 1011), empty messages skipped, any other data type fails the
+  stream (1003). Pull API, one reader (concurrent `read()` is a `TypeError`). The WebSocket API cannot apply
+  backpressure, so the queue is bounded by `maxBufferedBytes` (default 4 × `DEFAULT_MAX_MESSAGE_SIZE` = 64 MiB,
+  counting unread bytes, a Blob by its `size`; every incoming message is checked against the room left, so a single
+  larger message fails too): exceeding it drops the queue, closes with 1009 and the next `read()` rejects with
+  `ConnectionClosedError("websocket receive buffer limit exceeded …")`, later reads `null`. The WHATWG `close()` only
+  takes 1000 and 3000–4999, so 1009/1011/1003 (fine for the `ws` package) fall back to 1000 with the same reason text.
+  `WebSocketStream` would give real backpressure but is not universally available. Order as in `fromNodeSocket`:
+  queued data, then the close outcome: a `close` event with `wasClean` and code 1000 or 1005 is EOF; anything else
+  rejects ONE read with `ConnectionClosedError("websocket closed: code N" + safeQuote(reason))` (an `error` event
+  alone: `"websocket error"`; when a close follows before it was read, the close's message with the error as `cause`),
+  later reads `null`. `write(chunk)`: non-empty `fds` → `OperationNotSupportedError`; not OPEN, or after
+  `end()`/`close()`/a failure → `ConnectionClosedError`; `send()` throwing → `ConnectionClosedError(cause)`; resolves
+  once `bufferedAmount <= writeHighWaterMark` (default 1 MiB; polled with `setTimeout`, 1 ms doubling to 50 ms); a
+  waiting write resolves on a clean close (the closing handshake follows the queued data) and rejects on an unclean
+  one. `end()` (WebSocket has no half-close) is `close(1000)` after the queued data and resolves on the `close` event;
+  reads go on until then. `close(reason?)` is an idempotent hard close: queue dropped, a pending read gives `null`,
+  pending and later writes reject, `ws.close(1000)` if CONNECTING/OPEN. `closed` never rejects and settles once the
+  `close` event arrived and the end of the stream was read (or after a local `close()`), one microtask after that
+  read settled: a read that settles inside its executor has no reaction yet, and the Connection, which closes when
+  `channel.closed` settles, must see the end of the stream (and its error) first. A 5 s guard after
+  `close()`/`end()` settles `closed` and `end()` (rejecting waiting writes) if the peer never answers the closing
+  handshake; the `close` event clears it. Every listener is removed on the `close` event (the socket's last event).
+  `capabilities: {}`.
+- **`connect(address, options)`**: kind `websocket` (`http(s)` URLs dialled as `ws(s)`); `http` → `TypeError` naming
+  `createHttpClient` from `varlink-js/http`; other kinds → `OperationNotSupportedError` naming `varlink-js/node`.
+  Options: `ConnectionOptions`, the channel options (checked before dialling), `signal`, `protocols`, `WebSocket`
+  (default `globalThis.WebSocket`, absent → `OperationNotSupportedError`; lets Node users pass e.g. a subclass of the
+  `ws` package's client that sets headers or a client certificate). The channel is created inside the `open` handler,
+  so no message can be dispatched before it listens. The connect phase is bounded by `timeout` (default 45 s, 0 = none
+  → `CallTimeoutError("connect timed out")`) and `signal` (its reason); the socket is closed on either and on an
+  `error`/`close` before `open` (→ `ConnectionClosedError("websocket connect failed", {cause: event})`: browsers do
+  not expose the HTTP status, e.g. the bridge's 502 or 404). After a failure a no-op `error` listener stays until the
+  socket's `close` (the `ws` package throws on an unheard `error`). Constructor exceptions (invalid URL, a fragment's
+  `SyntaxError`) reject as they are. `createPool(address, options)` mirrors `src/node/pool.ts`.
+- **HTTP client** (`createHttpClient(base, options)`): `base` is an `http` address (a string goes through
+  `parseAddress`); `websocket` → `TypeError` naming `varlink-js/websocket`, other kinds and URLs with credentials
+  (fetch refuses them) → `TypeError`; fragment and query are dropped (nothing of the query is kept) and a trailing `/`
+  is added, so `https://h/waldo` and `https://h/waldo/` both address `https://h/waldo/call/…` (`baseUrl`). Options:
+  `fetch` (default `globalThis.fetch`, looked up per request, absent → `OperationNotSupportedError` at call time;
+  always called as a plain function, never as a method, which browsers refuse), `headers` (sent with every request;
+  checked at construction: token names, values without CR/LF/NUL; the client's `Content-Type`/`Accept` replace any
+  case variant), `service`, `timeout` (45 000, 0 = none), `ints`, `validateReplies`, `codec`, `errors`, `interfaces`,
+  `maxMessageSize` (16 MiB: a whole non-streaming body and each json-seq record), `onError` (as on a Connection).
+  Methods mirror Connection (same option names; a per-call `service` overrides the client's): `call`, `stream`,
+  `collect` (with the typed descriptor overloads; the descriptor's interface must be registered), `addInterface`,
+  `oneway()` → `OperationNotSupportedError` (UAPI "Limitations"), `listServices()` (`GET services`),
+  `getInfo(service)` (`GET services/{service}`, always validated against GetInfo's output, `"throw"`),
+  `listMethods(service, iface)`, `health()` (`GET health`: true iff 200, the body is cancelled, a network failure
+  rejects). There is no connection, so no `close()`: each call is its own request, cancelled by its `signal`, and
+  nothing orders concurrent calls.
+- **Requests**: the method must be a fully qualified `interface.Method` and services/interfaces valid interface names
+  (`TypeError` before any request); parameters are `input.encode`d for registered interfaces (a `ValidationError`
+  rejects before any request), must be an object and are `codec.encode`d (`{}` when none). `POST {base}call/{enc(method)}`
+  or `call/{enc(service)}/{enc(method)}` (`enc` = `encodeURIComponent`), streams add `?more=true`; `Content-Type:
+  application/json`, `Accept: application/json` (calls, GETs) or `application/json-seq` (streams). Bodies are read
+  with the body's reader, bounded by `maxMessageSize` (exceeded → `MessageTooLargeError`, body cancelled, request
+  aborted), decoded as strict UTF-8 and with `codec.decode` (lossless ints). One `AbortController` per request,
+  linked to `signal` and the timer; after an abort every later rejection (fetch, a body read, or a cancelled reader's
+  plain end) reports the recorded reason (`CallTimeoutError` on expiry, else the signal's reason). On every settle path
+  the timer and the abort listener are removed and an unread body is cancelled. `call`/`collect`/introspection:
+  `timeout` covers the whole request, body included.
+- **Response mapping**: 2xx + a JSON object → the reply parameters (validated as on a Connection, §4.11; a non-object
+  → `ProtocolError`). Non-2xx: a JSON body `{error: <valid fully qualified error name>, parameters?: object|null}` →
+  that `VarlinkError` whatever the status (the status is only the broad class, UAPI; registered interfaces: error
+  validator + `errors.create`, else a plain `VarlinkError` + `onError` `invalid-error`); anything else →
+  `HttpBridgeError` (`VarlinkLocalError`, `localName` `"varlink-js.HttpBridge"`, `status`, `bridgeMessage` from a
+  `{message: string}` body, message `HTTP bridge error (status N): "<safeQuote'd message>"`; such bodies are decoded
+  leniently). `fetch` rejecting (network, CORS) → `ConnectionClosedError("http request failed", {cause})`; a body
+  read failing → `ConnectionClosedError("http response body failed", {cause})`.
+- **Streams**: the body is sniffed, not its Content-Type: a first non-whitespace byte RS (0x1E) means json-seq, else
+  it is one `application/json` document → one reply (a bridge whose method replied once; never taken for an error
+  record). The splitter (`jsonseq.ts`) tracks strings, escapes and bracket depth, so an object record is handed out when
+  its outermost bracket closes, without waiting for its LF or the next RS (monitors see each reply at once, and
+  pretty-printed records with inner LFs work). It tolerates leading whitespace, CRLF, a missing final LF and empty
+  records; `ProtocolError` for data before the first RS or after a complete record and for a record cut off by an RS
+  or the end of the body (truncated JSON); `MessageTooLargeError` for a record text over `maxMessageSize`. Each record
+  is one reply (`continues` is not transmitted; the stream ends with the body; a body without any record is a
+  `ProtocolError`). A success reply may itself have a field named `error`, so a record is a terminating error only if
+  it is an object whose own keys are within {`error`, `parameters`}, `error` is a string and `parameters` is
+  absent/null/an object; such a record is held back until the next record starts (it was a reply: yielded) or the
+  body ends (a valid error name → that `VarlinkError`, otherwise `HttpBridgeError(200, bridgeMessage = error)`, the
+  spec's transport-failure record `{"error": "<message>"}`). Every other record is yielded at once. Records are pulled
+  from the body reader on demand (natural backpressure); concurrent `next()` calls are served in order. `timeout`
+  counts from the call to the first record (also while nobody calls `next()`), `idleTimeout` (default none) runs only
+  while a `next()` waits for the network. Expiry → `CallTimeoutError`, abort → `signal.reason`; a validation failure
+  rejects too; each ends the request (body cancelled, request aborted), after which the iterator is done. `return()`
+  cancels the body and aborts the request (a pending `next()` resolves done). `collect()` rejects with `RangeError`
+  past `max` (1024) and aborts.
+- **Tests**: `test/unit/websocket/` (`channel.test.ts` with a scripted `FakeWebSocket` and a mocked clock for the
+  write poll and the 5 s guard; `connect.test.ts` end to end with each runtime's own `WebSocket` in every framing mode;
+  `bridge.ts`, the fixture; `service.ts`, the backend service and its descriptor) and `test/unit/http/`
+  (`client.test.ts` end to end with each runtime's own `fetch`; `jsonseq.test.ts` at every split point;
+  `fetch.test.ts`, the request lifecycle against a scripted fetch: timers, abort listeners, cancel, abort). The bridge
+  fixture (dev-only) is a UAPI bridge on `node:http` at `127.0.0.1:0` (its `upgrade` event works on Node, Bun and Deno,
+  so no runtime-specific path and no skips): a hand-written RFC 6455 server side (`Sec-WebSocket-Accept` via
+  `node:crypto`, masked client frames, 7/16/64-bit lengths, continuation frames, text = binary, ping → pong, the close
+  handshake answered, or awaited for 1 s after its own close frame), one backend channel per WebSocket with framing
+  `message` (one varlink message per frame), `split` (1-byte first frame, then up to three) or `coalesce` (5 ms
+  batches, cut anywhere); 401/404/502 before the upgrade; simple mode over a fresh `Connection` per request (the UAPI
+  error → status table, json-seq with error and transport-failure records, `{"message"}` bodies), and knobs
+  (`requiredHeader`, `stallHandshake`, `earlyStreamHeaders`, `streamAsJson`, `dropAfterRecords`, `delayMs`, `healthy`,
+  a scripted raw `respond`). Backends run over `pair()` and, in one test per transport, a tcp listener.
+- **Known limits**: no read backpressure on the WebSocket side (a fast stream the consumer does not read hits the
+  64 MiB cap and the connection is closed); a failed WebSocket handshake shows no HTTP status in browsers (every
+  failure is "websocket connect failed"); browsers cannot set headers on a WebSocket (authentication by cookie or by
+  the browser's TLS client certificate; in Node pass a `WebSocket` constructor that can); the json-seq error-record
+  ambiguity: a reply whose only fields are a string `error` and optionally `parameters` is taken for an error record
+  when it is the last record of the body, and is held back by one record otherwise; simple mode has no oneway, no
+  upgrade and no pipelining, and concurrent calls are unordered; neither mode carries fds.
 
 ---
 

@@ -100,3 +100,8 @@ test("bin points at the compiled CLI entry", () => {
   assert.deepEqual(pkg.bin, { "varlink-js": "./dist/cli/main.js" });
   assert.ok(existsSync(resolve("src/cli/main.ts")));
 });
+
+test("varlink-js/websocket and varlink-js/http export the bridge clients (M10)", () => {
+  assert.deepEqual(Object.keys(websocket).sort(), ["connect", "createPool", "fromWebSocket"]);
+  assert.deepEqual(Object.keys(http).sort(), ["HttpBridgeError", "HttpClient", "createHttpClient"]);
+});
