@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { SPAWN_SKIP } from "../node/helpers.ts";
+import { childCommand } from "../node/helpers.ts";
 import { ESC, RS, rawServer, runCli, startFixture, tempDir, waitFor, type Fixture } from "./helpers.ts";
 
 const EXEC_CHILD = resolve(import.meta.dirname, "exec-child.ts");
@@ -246,10 +246,10 @@ describe("call: error replies", () => {
   });
 });
 
-// exec: through varlink-js/node's connect (DESIGN.md §4.7): a real child (exec-child.ts) on a socketpair. Spawned
-// children are Node-only for now, so these skip under Bun and Deno like the src/node spawn tests.
+// exec: through varlink-js/node's connect (DESIGN.md §4.7): a real child (exec-child.ts) on a socketpair, started
+// with the runtime running the tests (childCommand: `deno run -A --no-check` on Deno).
 const EXEC_SKIP: string | false =
-  SPAWN_SKIP || (process.platform === "win32" ? "Windows: the exec: fixtures are /bin/sh scripts" : false);
+  process.platform === "win32" ? "Windows: the exec: fixtures are /bin/sh scripts" : false;
 describe("call over exec:", { skip: EXEC_SKIP }, () => {
   let state: { path: string; remove(): Promise<void> };
   before(async () => {
@@ -268,11 +268,13 @@ describe("call over exec:", { skip: EXEC_SKIP }, () => {
     }
   };
 
-  /** A fresh state dir and an executable wrapper that records its pid there, then execs the child with node. */
+  /** A fresh state dir and an executable wrapper that records its pid there, then execs the child with the test runtime. */
   const child = async (): Promise<{ address: string; pid(): Promise<number>; hanging(): boolean }> => {
     const dir = await mkdtemp(join(state.path, "c-"));
     const wrapper = join(dir, "child.sh");
-    const script = `#!/bin/sh\necho $$ > "${dir}/pid"\nexec "${process.execPath}" "${EXEC_CHILD}" "--state=${dir}" "$@"\n`;
+    const script = `#!/bin/sh\necho $$ > "${dir}/pid"\nexec ${childCommand(EXEC_CHILD)
+      .map((w) => `"${w}"`)
+      .join(" ")} "--state=${dir}" "$@"\n`;
     await writeFile(wrapper, script, { mode: 0o755 });
     const pidFile = join(dir, "pid");
     return {
