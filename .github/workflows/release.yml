@@ -1,16 +1,20 @@
 # Release to npm on a version tag (DESIGN §8, M12).
 #
-# NOT RUN YET. Publishing is Pawel's decision (DESIGN §9 Q1). Three guards keep this from publishing by accident:
+# NOT RUN YET. Publishing is Pawel's decision (DESIGN §9 Q1). Guards that keep this from publishing by accident:
 #   1. It only runs in pzmarzly/varlink-js (the `if:` on both jobs), never in a fork.
-#   2. The publish job uses the `npm-release` environment. Before the first release, create that environment
-#      in the repository settings with "Required reviewers" (Pawel) and add the NPM_TOKEN secret to it, or set
-#      up npm trusted publishing for this workflow and leave NPM_TOKEN unset. GitHub creates a referenced
-#      environment WITHOUT protection rules if it does not exist, so create it first.
-#   3. The tag must equal "v" + package.json "version"; prereleases (a version with "-") go to the `next`
-#      dist-tag, never `latest`.
+#   2. The publish job uses the `npm-release` environment, and the verify job fails unless that environment
+#      exists with a "Required reviewers" rule (GitHub would otherwise create it on first use WITHOUT protection
+#      rules). Before the first release, in the repository settings:
+#        - create the `npm-release` environment with "Required reviewers" (Pawel), and limit its deployment
+#          branches and tags to the tag pattern `v*`;
+#        - either add NPM_TOKEN as a secret OF THAT ENVIRONMENT (never a repository secret: `secrets.*` also
+#          resolves repository secrets, which would not need the approval), or set up npm trusted publishing for
+#          this workflow BOUND TO THE `npm-release` ENVIRONMENT and leave NPM_TOKEN unset.
+#   3. The tag must equal "v" + package.json "version", and the tagged commit must be on master; prereleases (a
+#      version with "-") go to the `next` dist-tag, never `latest`.
 #
-# To release (after Pawel's OK): bump "version" in package.json, commit, `git tag v<version>`, push the tag,
-# then approve the deployment in the Actions tab.
+# To release (after Pawel's OK): bump "version" in package.json, commit to master, `git tag v<version>`, push the
+# tag, then approve the deployment in the Actions tab.
 
 name: Release
 
@@ -27,11 +31,34 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify tag, lint, typecheck, test, pack
+    name: Verify environment, tag, lint, typecheck, test, pack
     if: github.repository == 'pzmarzly/varlink-js'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
+      - name: The npm-release environment exists and requires reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! env_json="$(gh api "repos/$GITHUB_REPOSITORY/environments/npm-release")"; then
+            echo "::error::the npm-release environment does not exist (or cannot be read): create it with required reviewers first"
+            exit 1
+          fi
+          if ! printf '%s' "$env_json" | jq -e 'any(.protection_rules[]?; .type == "required_reviewers")' > /dev/null; then
+            echo "::error::the npm-release environment has no required_reviewers protection rule"
+            exit 1
+          fi
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on master
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::tagged commit $GITHUB_SHA is not on master"
+            exit 1
+          fi
       - uses: actions/setup-node@v7
         with:
           node-version: 24

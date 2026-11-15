@@ -27,10 +27,11 @@ server.implement(OrgExampleNotes, {
 
 const listener = await listen(process.argv[2] ?? "tcp:127.0.0.1:0", { mode: 0o644 });
 server.serve(listener);
-console.log(`Listening on ${listener.address}`);
-
 const stop = (): void => {
   void server.shutdown().then(() => process.exit(0));
 };
 process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
+
+// Handlers first, then the line the caller waits for, so an early signal still shuts down cleanly.
+console.log(`Listening on ${listener.address}`);

@@ -3,6 +3,12 @@
 // the block. The only substitution: relative imports of the package's entry points (`../src/index.ts`,
 // `../../src/node/index.ts`, …) are shown as the package specifiers users write (`varlink-js`, `varlink-js/node`, …).
 // Blocks marked `<!-- snippet: none (0.1.x, not compiled) -->` (old API samples in MIGRATION.md) are exempt.
+// Every block whose info string is not a non-code language (sh, bash, shell, console, text, json, varlink, yaml,
+// diff), untagged blocks included, counts as code and needs a marker; `~~~`, four-backtick and indented fences are
+// rejected (helpers.ts `fences`).
+//
+// Limit of the "What is tested where" check below: it checks that each test file and CI job the table names exists,
+// not that the job's command actually runs that file (e.g. that `bun test test/unit test/regression` covers it).
 import assert from "node:assert/strict";
 import { existsSync, readdirSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -22,6 +28,8 @@ const ENTRY_POINTS: Readonly<Record<string, string>> = {
 
 const EXEMPT = "none (0.1.x, not compiled)";
 const CODE_LANGS = new Set(["ts", "typescript", "js", "javascript", "mjs", "tsx"]);
+/** Info strings of blocks that are not code; any other block (an untagged one too) must be a snippet or exempt. */
+const NON_CODE_LANGS = new Set(["sh", "bash", "shell", "console", "text", "json", "varlink", "yaml", "diff"]);
 
 /** The markdown files whose code blocks are checked. */
 const DOCS: readonly string[] = [
@@ -78,12 +86,13 @@ for (const doc of DOCS) {
         assert.ok(!/["'](\.\.?\/)+src\//.test(b.code), `${doc}:${String(b.line)} shows a ../src import`);
     });
 
-    for (const b of blocks.filter((x) => CODE_LANGS.has(x.lang))) {
+    for (const b of blocks.filter((x) => !NON_CODE_LANGS.has(x.lang))) {
       test(`line ${String(b.line)}: ${b.snippet ?? "(no marker)"}`, () => {
         assert.ok(
           b.snippet !== undefined,
-          `${doc}:${String(b.line)}: a ${b.lang} block needs a <!-- snippet: examples/FILE[#region] --> line before it`,
+          `${doc}:${String(b.line)}: a ${b.lang || "untagged"} block needs a <!-- snippet: examples/FILE[#region] --> line before it`,
         );
+        assert.ok(CODE_LANGS.has(b.lang), `${doc}:${String(b.line)}: tag the block ts (or a non-code language)`);
         if (b.snippet === EXEMPT) {
           assert.equal(doc, "docs/MIGRATION.md", "only MIGRATION.md may show 0.1.x code");
           return;
@@ -109,6 +118,15 @@ describe("docs coverage", () => {
     }
   });
 
+  test("fences(): ~~~, four-backtick and indented fences are rejected", () => {
+    for (const bad of ["~~~ts\nx\n~~~", "````ts\nx\n````", "  ```ts\nx\n  ```", "\t```\nx\n```"])
+      assert.throws(() => fences(bad), /only unindented ``` fences/, JSON.stringify(bad));
+    assert.deepEqual(
+      fences("```\nuntagged\n```").map((b) => b.lang),
+      [""],
+    );
+  });
+
   test("every MIGRATION.md after-sample file is shown", () => {
     const shown = new Set(fences(readRepoFile("docs/MIGRATION.md")).map((b) => b.snippet?.split("#")[0]));
     for (const f of readdirSync(join(ROOT, "examples/migration")))
@@ -117,13 +135,30 @@ describe("docs coverage", () => {
 });
 
 describe("paths named in the docs exist", () => {
-  /** Repo-relative paths in a markdown text: in backticks, link targets or plain text. */
+  /**
+   * Files of the 0.1.x code, cited as `pzmarzly/varlink-js@ac28a30:PATH` (or `git show ac28a30:PATH`, MIGRATION.md):
+   * not paths of this tree, so they are removed before the check. Only that exact commit is exempt; any other
+   * `REV:PATH` form is checked as a path of this tree (and fails if it does not exist).
+   */
+  const OLD_CITATION = /(?:\bpzmarzly\/varlink-js@|\bgit show )ac28a30:[\w./@-]*[\w/]/g;
+
+  /** Repo-relative paths in a markdown text: in backticks, link targets, after a `REV:` or in plain text. */
   function paths(text: string): string[] {
     const found = new Set<string>();
-    const re = /(?:^|[\s`([])((?:test|examples|docs|src|interfaces|scripts|\.github)\/[\w./@-]*[\w/])/gm;
-    for (const m of text.matchAll(re)) if (m[1] !== undefined) found.add(m[1]);
+    const re = /(?:^|[\s`([:])((?:test|examples|docs|src|interfaces|scripts|\.github)\/[\w./@-]*[\w/])/gm;
+    for (const m of text.replace(OLD_CITATION, "").matchAll(re)) if (m[1] !== undefined) found.add(m[1]);
     return [...found];
   }
+
+  test("0.1.x citations name commit ac28a30 of pzmarzly/varlink-js only", () => {
+    const text = readRepoFile("docs/MIGRATION.md");
+    assert.ok([...text.matchAll(OLD_CITATION)].length >= 3, "MIGRATION.md cites the 0.1.x files");
+    assert.ok(!/\bmaster:/.test(text), "cite the commit (ac28a30), not the moving master branch");
+    assert.deepEqual(
+      [...text.matchAll(/varlink-js@([0-9a-f]{7,40}):/g)].map((m) => m[1]).filter((rev) => rev !== "ac28a30"),
+      [],
+    );
+  });
 
   for (const doc of DOCS) {
     test(doc, () => {

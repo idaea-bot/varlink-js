@@ -3,7 +3,7 @@
 [Varlink](https://varlink.org/) ([UAPI.20](https://uapi-group.org/specifications/specs/varlink/)) for JavaScript
 runtimes: a client, a server (with `org.varlink.service` built in), an IDL parser, validator and formatter, a
 TypeScript code generator and a `varlink-js` CLI modelled on systemd's `varlinkctl`. Zero runtime dependencies, ESM
-only, Node.js ≥ 22.12 (Bun and Deno run the unit tests in CI; see [Runtimes](#runtimes)).
+only, Node.js ≥ 22.12 (Bun and Deno run the unit and regression tests in CI; see [Runtimes](#runtimes)).
 
 **Status: `1.0.0-alpha.0`, not published to npm yet.** This is a rewrite; the 0.1.x API is gone (see
 [docs/MIGRATION.md](docs/MIGRATION.md)). The design, with the reasons behind every rule, is in
@@ -103,21 +103,25 @@ server.addInterface(IDL, {
   },
 });
 
-// unix:/path (mode applies to unix sockets), unix:@name (Linux) or tcp:127.0.0.1:PORT
+// unix:/path (mode applies only there), unix:@name (Linux; no permissions) or tcp:127.0.0.1:PORT
 const listener = await listen(process.argv[2] ?? "tcp:127.0.0.1:0", { mode: 0o644 });
 server.serve(listener);
-console.log(`Listening on ${listener.address}`);
-
 const stop = (): void => {
   void server.shutdown().then(() => process.exit(0)); // graceful: running calls may finish (5 s deadline)
 };
 process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
+
+// Handlers first, then the line the caller waits for, so an early signal still shuts down cleanly.
+console.log(`Listening on ${listener.address}`);
 ```
 
-`listen()` binds exactly the address you pass. For a unix socket, `mode` is applied before the socket appears at its
-path (on a file system without hard links: right after `bind`); 0644 means only the owner can connect (connecting
-needs write permission).
+`listen()` binds exactly the address you pass. For a unix socket path, `mode` is applied before the socket appears at
+its path; 0644 means only the owner can connect (connecting needs write permission), and root, which ignores file
+permissions. Caveats: on a file system without hard links, or when the private directory's path would not fit in
+`sun_path`, the mode is applied right after `bind` (a short window with the umask's mode); and `mode` is silently
+ignored for `tcp:`, `unix:@` (abstract sockets have no permissions: any local user in the network namespace can
+connect) and `{ fd }` listeners.
 
 ### Calling it: `call`, `stream`, `collect`, a typed error
 
@@ -193,7 +197,10 @@ try {
 ```
 
 Each method of a typed client is callable (one reply) and has `.stream()`, `.collect()` and `.oneway()`. Typed calls
-always decode their replies against the IDL.
+decode their replies against the IDL as far as the connection's `validateReplies` allows: under the default `"off"`
+(which typed calls treat as `"warn"`) a valid reply is decoded to its type, but an invalid one is delivered raw and
+only reported to `onError` (reason `invalid-reply`); only an out-of-range integer still rejects. Use
+`connect(address, { validateReplies: "throw" })` if every reply must match its type.
 
 ### Reference server
 
@@ -206,10 +213,11 @@ node examples/client.ts unix:./org.example.reference.sock
 ```
 
 It implements `org.example.reference` (a plain method, a streaming method, typed errors, a method safe to call as
-oneway), refuses TCP hosts other than loopback (it never binds `0.0.0.0` or `::`), answers
-`GetInterfaceDescription` only from its registered interfaces (never from the file system), prints
-`Listening on <address>` and shuts down gracefully on SIGINT/SIGTERM with exit code 0. All of that is checked by
-`test/docs/examples.test.ts`.
+oneway that keeps at most 16 messages of at most 1 KiB), refuses TCP hosts other than loopback (it never binds
+`0.0.0.0` or `::`), refuses `unix:@` addresses (abstract sockets have no file permissions, so any local user could
+connect), answers `GetInterfaceDescription` only from its registered interfaces (never from the file system), prints
+`Listening on <address>` and shuts down gracefully on SIGINT/SIGTERM with exit code 0. Refused addresses exit with 2
+before anything is bound. All of that is checked by `test/docs/examples.test.ts`.
 
 ## Codegen
 
@@ -280,13 +288,14 @@ server.implement(OrgExampleNotes, {
 
 const listener = await listen(process.argv[2] ?? "tcp:127.0.0.1:0", { mode: 0o644 });
 server.serve(listener);
-console.log(`Listening on ${listener.address}`);
-
 const stop = (): void => {
   void server.shutdown().then(() => process.exit(0));
 };
 process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
+
+// Handlers first, then the line the caller waits for, so an early signal still shuts down cleanly.
+console.log(`Listening on ${listener.address}`);
 ```
 
 ## CLI
@@ -313,7 +322,8 @@ process.once("SIGTERM", stop);
 - Global options: `--json=pretty|short|off`, `-j`, `-q`, `--timeout=SECS` (a systemd time span, default 45 s,
   `infinity` for none). Unlike the library's stream timeout, the CLI's timeout covers the connect and the whole call,
   `--more` included, as in varlinkctl.
-- Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM.
+- Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM; `certify server` exits 0 after a
+  signal (it stops gracefully).
 - `--upgrade` is **not available yet** (M9, in progress); neither are `--push-fd` (M11), `serve` and
   `list-registry`.
 - Integers are lossless in the CLI (it uses `ints: "bigint"` internally): 2⁶³−1 and 2⁶⁴−1 round-trip.
@@ -324,13 +334,13 @@ process.once("SIGTERM", stop);
 
 | Kind | Example | Client | Server | Notes |
 |---|---|---|---|---|
-| unix path | `unix:/run/org.example.sock`, `/run/x.sock`, `./x.sock` | `connect` (`varlink-js/node`) | `listen` | `listen({ mode })` sets the socket's mode; an existing live socket is never replaced (`EADDRINUSE`). |
-| abstract unix | `unix:@org.example` | `connect` | `listen` | Linux only; elsewhere `OperationNotSupportedError`. |
+| unix path | `unix:/run/org.example.sock`, `/run/x.sock`, `./x.sock` | `connect` (`varlink-js/node`) | `listen` | `listen(address, { mode })` sets the socket's mode; an existing live socket is never replaced (`EADDRINUSE`). |
+| abstract unix | `unix:@org.example` | `connect` | `listen` | Linux only; elsewhere `OperationNotSupportedError`. No file permissions: `mode` is ignored and any local user in the network namespace can connect. |
 | tcp | `tcp:127.0.0.1:12345`, `tcp:[::1]:12345` | `connect` (`TCP_NODELAY`) | `listen` | Port 0 picks a free port (`listener.address` has the real one). Binds exactly the host given. |
-| exec | `exec:/usr/libexec/org.example.service` | `connect`, `connectExec` | the child: `listenFromEnv()` / `listenAuto()` | Spawns the service with a connected socket as fd 3 (`LISTEN_FDS=1`). Node only so far: skipped on Bun and Deno in CI. |
-| ssh | `ssh-unix:host:/run/x.sock` (alias `ssh:`), `ssh-exec:host:command` | `connect` | the remote side: `listenAuto()` with `SYSTEMD_VARLINK_LISTEN=-` | Runs `ssh` (or `$SYSTEMD_SSH`). Node only. CI uses a fake ssh; real ssh is not tested in CI. |
+| exec | `exec:/usr/libexec/org.example.service` | `connect`, `connectExec` | the child: `listenFromEnv()` / `listenAuto()` | Spawns the service with a connected socket as fd 3 (`LISTEN_FDS=1`). Tested on Node, Bun and Deno. |
+| ssh | `ssh-unix:host:/run/x.sock` (alias `ssh:`), `ssh-exec:host:command` | `connect` | the remote side: `listenAuto()` with `SYSTEMD_VARLINK_LISTEN=-` | Runs `ssh` (or `$SYSTEMD_SSH`). CI uses a fake ssh (on Node, Bun and Deno); real ssh is not tested in CI. |
 | inherited socket | fd from systemd | — | `listen({ fd })`, `listenFromEnv()` | Socket activation, see below. |
-| stdio | a command line | `connectBridge(argv)` | `listenStdio()` | Speaks varlink over a child's stdin/stdout / our own. Node only. |
+| stdio | a command line | `connectBridge(argv)` | `listenStdio()` | Speaks varlink over a child's stdin/stdout / our own. Tested on Node, Bun and Deno. |
 | WebSocket | `ws://host/…`, `wss://…`, `https://host/ws/services/<service>` | `connect`, `createPool` (`varlink-js/websocket`) | — | Needs `globalThis.WebSocket` or the `WebSocket` option. No server side. |
 | HTTP | `https://host/…` (a varlink HTTP bridge) | `createHttpClient` (`varlink-js/http`) | — | No oneway (rejects), no upgrade, one request per call. No server side. |
 | any `ByteChannel` | your own transport | `createConnection(channel)` | `server.handle(channel)`, `server.serve(listener)` | `varlink-js/testing` `pair()` gives an in-memory pair. |
@@ -347,20 +357,23 @@ subpaths above.
 | Open server connections (more are closed at once) | 4096 | `maxConnections` (server) | `test/docs/defaults.test.ts` |
 | Connections per UID | not implemented (needs peer credentials, M11) | — | — |
 | Call timeout (clock starts at the head of the reply queue) | 45 s, 0 = none | `timeout` (connection, or per call) | `test/docs/defaults.test.ts`, `test/unit/rpc/connection.test.ts` |
-| Connect phase (`connect()`) | the same `timeout` | `timeout`, `signal` | `test/unit/node/connect.test.ts` |
+| Connect phase (`connect()`) | the same `timeout` (45 s) | `timeout`, `signal` | `test/docs/defaults.test.ts`, `test/unit/node/connect.test.ts` |
 | Stream replies buffered unread (then reading pauses) | 64 | `highWaterMark` (connection) | `test/docs/defaults.test.ts`, `test/unit/rpc/connection.test.ts` |
-| `collect()` replies (more: `RangeError`, connection closed) | 1024 | `max` (per call) | `test/unit/rpc/connection.test.ts` |
+| `collect()` replies (more: `RangeError`, connection closed) | 1024 | `max` (per call) | `test/unit/rpc/connection.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
 | Pool connections | 8 | `max` (pool) | `test/docs/defaults.test.ts` |
 | Pool idle connection lifetime | 30 s, 0 = forever | `idleTimeout` (pool) | `test/docs/defaults.test.ts` |
 | Pool wait for a connection | 45 s, 0 = forever | `timeout` (pool, or per call) | `test/docs/defaults.test.ts` |
 | Graceful shutdown deadline | 5 s, 0 = none | `server.shutdown({ timeout })` | `test/docs/defaults.test.ts`, `test/unit/rpc/server.test.ts` |
 | Idle timeout of server connections | none (an idle client is never dropped) | — | `test/regression/e2e.test.ts` |
 | JSON nesting when decoding | 2048 levels | fixed | `test/unit/types/codec.test.ts` |
-| Value nesting when validating | 1024 levels (`MAX_VALUE_DEPTH`) | fixed | `test/docs/defaults.test.ts`, `test/unit/types/validators.test.ts` |
-| IDL type nesting | 64 levels (`MAX_TYPE_DEPTH`) | fixed | `test/docs/defaults.test.ts`, `test/unit/idl/errors.test.ts` |
+| Value nesting when validating | 1024 levels (`MAX_VALUE_DEPTH`) | fixed | `test/unit/types/validators.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
+| IDL type nesting | 64 levels (`MAX_TYPE_DEPTH`) | fixed | `test/unit/idl/errors.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
 | WebSocket bytes received but unread (then the socket is closed) | 64 MiB | `maxBufferedBytes` | `test/docs/defaults.test.ts` |
 | WebSocket `write()` resolves below this `bufferedAmount` | 1 MiB | `writeHighWaterMark` | `test/docs/defaults.test.ts` |
 | `LISTEN_FDS` accepted by `listenFromEnv()` | 1 … 1024 | — | `test/unit/node/activation.test.ts` |
+
+`test/docs/defaults.test.ts` creates each object without the option and checks that it enforces the default (for
+the sizes: exactly the default is accepted, one byte more is not), with a mocked clock for the times.
 
 Options go to `connect()`/`createConnection()` (connection), `createServer()` (server), `createPool()` (pool),
 `createHttpClient()` and `varlink-js/websocket` `connect()`. Each server connection handles one call at a time;
@@ -411,10 +424,15 @@ Error
 └─ IdlSyntaxError (a SyntaxError, varlink-js/idl)
 ```
 
-- An aborted call rejects with the signal's own reason (an `AbortError`/`TimeoutError` `DOMException`), not a
-  wrapper.
-- `isVarlinkError()` is a brand check, so it works even with two copies of the library loaded; each error class also
-  has a static `is(e)`.
+- An aborted call rejects with the signal's own reason (whatever was passed to `abort(reason)`; by default an
+  `AbortError` `DOMException`, a `TimeoutError` one for `AbortSignal.timeout()`), not a wrapper.
+- `isVarlinkError(e, name?)` and `isVarlinkLocalError(e, localName?)` are brand checks, so they work even with two
+  copies of the library loaded. The standard error classes, `InternalError` and generated error classes also have a
+  static `is(e)` (e.g. `MethodNotFoundError.is(e)`); the local error classes, `HttpBridgeError` and `IdlSyntaxError`
+  do not. Check a local error by its `localName`: `io.systemd.Disconnected` (`ConnectionClosedError`),
+  `io.systemd.TimedOut` (`CallTimeoutError`), `io.systemd.Protocol` (`ProtocolError`, `MessageTooLargeError`),
+  `org.varlink.service.InvalidParameter` (`ValidationError`, `IntegerRangeError`), `varlink-js.UpgradePending`,
+  `varlink-js.OperationNotSupported`, `varlink-js.HttpBridge`.
 - Clients map error replies to classes: the standard errors and `InternalError` always, generated classes once their
   interface is registered (`X.client(conn)` does that). Unknown names give a plain `VarlinkError` with the name and
   parameters intact.
@@ -447,8 +465,11 @@ generated descriptor must match its target's mode when the interface uses `int`.
 
 All from `varlink-js/node`:
 
-- `listenFromEnv()`: the sockets systemd passed (`LISTEN_FDS`, `LISTEN_PID`, the fds named `varlink` in
-  `LISTEN_FDNAMES`), or `null` if the process was not socket-activated; unsets the variables.
+- `await listenFromEnv()`: the sockets systemd passed (`LISTEN_FDS`, `LISTEN_PID`, the fds named `varlink` in
+  `LISTEN_FDNAMES`, or another name with `{ name }`), or `null` if the process was not socket-activated or no fd has
+  that name. systemd names an fd after its socket unit unless the unit sets `FileDescriptorName=varlink`, so without
+  that line you get `null`. Only when `LISTEN_FDNAMES` is absent is a single fd used whatever its name. Unsets the
+  variables.
 - `listenAuto()`: `listenFromEnv()` plus `$SYSTEMD_VARLINK_LISTEN` (an address, or `-` for stdio), merged into one
   listener, or `null`.
 - `listenStdio()`: one connection over stdin/stdout. A stdio-served process must exit when that connection ends
@@ -456,7 +477,8 @@ All from `varlink-js/node`:
 - `createServer({ exitOnIdle: ms })`: once serving, the server shuts down after `ms` without any open connection;
   `await server.closed` then exit.
 - Registry (`/run/varlink/registry`, systemd ≥ 260): `server.serve(listener, { registry: true })` publishes a unix
-  socket listener under its interface names and removes the entries at shutdown; `listRegistry()`,
+  socket listener under its interface names and removes the entries at shutdown (except for a socket-activated
+  `{ fd }` listener: the socket belongs to the service manager and outlives us, so its entries stay); `listRegistry()`,
   `resolveInterface(name)` (registry first, then `org.varlink.resolver`).
 
 Activation fds are not close-on-exec yet (needs the M11 native addon): children you spawn yourself inherit them.
@@ -468,8 +490,8 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
 |---|---|---|
 | Node.js 22, 24, 26 (latest of each) | `ci.yml` `test` | everything (`npm test`), plus `npm pack` and the consumer fixture |
 | Node.js 22.12.0 (the `engines` floor) | `ci.yml` `floor` | compiled `runtime-features` and `exports` tests, the packed tarball |
-| Bun (latest) | `runtimes.yml` `bun` | `test/unit` and `test/regression`; the spawn (`exec:`, ssh, bridge) and activation tests are skipped |
-| Deno 2 | `runtimes.yml` `deno` | the same as Bun |
+| Bun (latest) | `runtimes.yml` `bun` | `test/unit` and `test/regression` (on Linux), the spawn (`exec:`, fake ssh, bridge) and activation tests included. Skipped on Bun: the two abort/timeout-during-spawn tests of `test/unit/node/spawn.test.ts` (no `child_process` diagnostics channel), its bridge test that needs EOF from a still-running stdio server (`process.stdout.end()` sends no FIN), the "no timers once shut down" test of `test/unit/rpc/exit-on-idle.test.ts`, and the cross-copy `isVarlinkError` test of `test/regression/tooling.test.ts` (Bun's module cache ignores the query). The `listen({ fd })` tests of `test/unit/node/fd.test.ts` skip themselves on any runtime whose `net.Server` exposes no fd |
+| Deno 2 | `runtimes.yml` `deno` | the same suites. Skipped on Deno: the same stdio-EOF bridge test, and the "nonblocking" connected activation fd tests of `test/unit/node/connected-fd.test.ts` (a `net.Socket` has no real fd) |
 | Browsers | — | `varlink-js`, `varlink-js/websocket`, `varlink-js/http` and `varlink-js/idl` import nothing from Node (a lint rule and a typecheck without `@types/node` enforce it), but no browser test runs in CI |
 
 ## What is tested where
@@ -484,9 +506,9 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
 | The defaults in this README | `test/docs/defaults.test.ts` | `ci.yml` test |
 | unix and tcp `connect`/`listen`, socket mode | `test/unit/node/connect.test.ts`, `test/unit/node/listen.test.ts` | `ci.yml` test; bun, deno |
 | `unix:@` (Linux) | `test/unit/node/abstract.test.ts` | `ci.yml` test; bun, deno |
-| `exec:`, ssh (fake ssh), bridge | `test/unit/node/spawn.test.ts`, `test/unit/node/spawn-channel.test.ts` | `ci.yml` test only |
-| Socket activation, `listenAuto`, stdio | `test/unit/node/activation.test.ts` | `ci.yml` test only |
-| Real `systemd-socket-activate`, `varlinkctl exec:`, the registry via `varlinkctl` (each skips when its tool is not on `PATH`; they run on the `ubuntu-latest` runners) | `test/interop/vm/socket-activate.test.ts`, `test/interop/vm/varlinkctl-exec.test.ts`, `test/interop/vm/registry.test.ts` | `ci.yml` test |
+| `exec:`, ssh (fake ssh), bridge | `test/unit/node/spawn.test.ts`, `test/unit/node/spawn-channel.test.ts`, `test/unit/cli/call.test.ts` | `ci.yml` test; bun, deno (a few tests skipped, see [Runtimes](#runtimes)) |
+| Socket activation, `listenAuto`, stdio, `listen({ fd })` | `test/unit/node/activation.test.ts`, `test/unit/node/connected-fd.test.ts`, `test/unit/node/fd.test.ts` | `ci.yml` test; bun, deno (Deno skips the nonblocking connected-fd tests; the `listen({ fd })` tests skip themselves on a runtime whose `net.Server` exposes no fd) |
+| Real `systemd-socket-activate`, `varlinkctl exec:`, the registry via `varlinkctl` (each runs only when its tool is on `PATH` and skips silently otherwise; nothing makes CI fail if the runner lacks it) | `test/interop/vm/socket-activate.test.ts`, `test/interop/vm/varlinkctl-exec.test.ts`, `test/interop/vm/registry.test.ts` | `ci.yml` test |
 | `exitOnIdle` | `test/unit/rpc/exit-on-idle.test.ts` | `ci.yml` test; bun, deno (one test Node only) |
 | Registry, resolver | `test/unit/node/registry.test.ts`, `test/unit/node/registry-serve.test.ts`, `test/unit/node/resolver.test.ts` | `ci.yml` test; bun, deno |
 | WebSocket and HTTP clients | `test/unit/websocket/`, `test/unit/http/` | `ci.yml` test; bun, deno |
@@ -510,7 +532,9 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
   `ci.yml` job runs on Linux.
 - Byte-for-byte comparison of the CLI's output with varlinkctl: done by hand against systemd 255
   (`test/e2e/cli/varlinkctl/`).
-- Windows, browsers, and on Bun/Deno: spawning, activation, the CLI as a process, the examples.
+- Windows and browsers. On Bun and Deno: everything outside `test/unit` and `test/regression` (the CLI as a process
+  in `test/e2e`, the examples and docs checks in `test/docs`, `test/fuzz`, `test/interop`), plus the skips listed
+  under [Runtimes](#runtimes).
 
 ## Not yet implemented
 
@@ -520,7 +544,6 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
   started).
 - **No WebSocket or HTTP server**: those subpaths are clients only.
 - **HTTP mode has no oneway calls** (`HttpClient.oneway()` rejects with `OperationNotSupportedError`).
-- `exec:`, ssh, bridge and socket activation are untested on Bun and Deno.
 - The `org.varlink.resolver` client does `Resolve` and `GetInfo` only, untyped; there is no resolver server.
 
 ## Certification

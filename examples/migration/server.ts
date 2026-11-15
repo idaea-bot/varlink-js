@@ -17,6 +17,7 @@ method Echo(text: string) -> (text: string)
 
 method Log(message: string) -> ()
 
+# Streams. Without the annotation, a call without "more" would get the first tick as its only reply.
 # [Requires 'more' flag]
 method Ticks(count: int) -> (tick: int)
 `;
@@ -29,7 +30,8 @@ server.addInterface(IDL, {
     console.error(`log: ${input.message}`);
   },
   // was registerCallStream: ctx.notify() sends a reply with continues, the returned value is the final reply
-  // (an async generator works too: yield = reply with continues, return = final reply)
+  // (an async generator works too: yield = reply with continues, return = final reply). Declare such a method
+  // [Requires 'more' flag], as above: a call without `more` then gets ExpectedMore (0.1.x sent an error reply too).
   Ticks: async (input: { count: number }, ctx) => {
     for (let tick = 1; tick < input.count; tick++) await ctx.notify({ tick });
     return { tick: input.count };
@@ -39,8 +41,11 @@ server.addInterface(IDL, {
 // The server binds exactly what you pass: 127.0.0.1 here, not every interface.
 const listener = await listen(process.argv[2] ?? "tcp:127.0.0.1:12345");
 server.serve(listener); // was server.start()
-console.log(`Listening on ${listener.address}`); // was transport.address()
-
-process.once("SIGTERM", () => {
+const stop = (): void => {
   void server.shutdown().then(() => process.exit(0)); // was server.stop()
-});
+};
+process.once("SIGINT", stop); // Ctrl-C
+process.once("SIGTERM", stop);
+
+// Handlers first, then the line the caller waits for, so an early signal still shuts down cleanly.
+console.log(`Listening on ${listener.address}`); // was transport.address()

@@ -115,6 +115,21 @@ async function checkReferenceServer(address: string): Promise<void> {
     await conn.oneway("org.example.reference.Log", { message: "hello" });
     await conn.oneway("org.example.reference.Ping", { ping: "unanswered" });
     assert.deepEqual(await conn.call("org.example.reference.Messages"), { messages: ["hello"] });
+
+    // Log keeps at most 1 KiB per message (and 16 messages).
+    const tooLong = await rejectsWith(
+      conn.call("org.example.reference.Log", { message: "é".repeat(513) }), // 1026 bytes of UTF-8
+      (x) => isVarlinkError(x, "org.example.reference.MessageTooLong"),
+      "Log(1026 bytes)",
+    );
+    assert.deepEqual((tooLong as { parameters: unknown }).parameters, { max: 1024 });
+    await conn.call("org.example.reference.Log", { message: "x".repeat(1024) });
+    for (let i = 0; i < 20; i++) await conn.call("org.example.reference.Log", { message: String(i) });
+    const { messages } = (await conn.call("org.example.reference.Messages")) as { messages: string[] };
+    assert.deepEqual(
+      messages,
+      Array.from({ length: 16 }, (_, k) => String(k + 4)),
+    );
   });
 }
 
@@ -170,6 +185,23 @@ describe("examples/reference-server.ts", () => {
       assert.equal(r.code, 2, `${address}: ${r.stderr}`);
       assert.equal(r.stdout, "", address);
       assert.match(r.stderr, /^reference-server: (refusing to listen on|cannot listen on)/, address);
+    }
+  });
+
+  test("refuses abstract sockets (no file permissions) on every platform: exit 2, nothing bound", TIMEOUT, async () => {
+    // Refused before listen(), so the exit code is 2 on Linux too (elsewhere listen() would reject anyway).
+    const name = `vjdocs-ref-${String(process.pid)}`;
+    const r = await runExample("examples/reference-server.ts", [`--varlink=unix:@${name}`]);
+    assert.equal(r.code, 2, r.stderr);
+    assert.equal(r.stdout, "");
+    assert.match(
+      r.stderr,
+      /^reference-server: refusing to listen on unix:@: abstract sockets have no file permissions/,
+    );
+    assert.doesNotMatch(r.stderr, /unix:@name/, "the usage text no longer offers unix:@");
+    if (process.platform === "linux") {
+      // Nothing is bound: connecting to the name fails.
+      await assert.rejects(connect(`unix:@${name}`));
     }
   });
 });
@@ -245,6 +277,12 @@ describe("docs/MIGRATION.md samples (examples/migration)", () => {
           { tick: 2 },
           { tick: 3 },
         ]);
+        // [Requires 'more' flag]: without `more` the notify()-based stream answers ExpectedMore, not one tick.
+        await rejectsWith(
+          conn.call("org.example.migration.Ticks", { count: 3 }),
+          (x) => ExpectedMoreError.is(x),
+          "Ticks without more → ExpectedMore",
+        );
         await rejectsWith(
           conn.call("org.example.migration.Nope"),
           (x) => MethodNotFoundError.is(x),
@@ -253,6 +291,12 @@ describe("docs/MIGRATION.md samples (examples/migration)", () => {
       });
     });
     assert.match(output.stderr, /^log: logged oneway$/m);
+  });
+
+  test("server.ts: SIGINT (Ctrl-C) also shuts down gracefully with 0", TIMEOUT, async () => {
+    const server = await startServer("examples/migration/server.ts", ["tcp:127.0.0.1:0"]);
+    const r = await server.stop("SIGINT");
+    assert.equal(r.code, 0, r.stderr);
   });
 
   test("client.ts, errors.ts, streaming.ts, pool.ts against the reference server", TIMEOUT, async () => {
@@ -265,7 +309,7 @@ describe("docs/MIGRATION.md samples (examples/migration)", () => {
           'org.example.reference.NotFound {"word":"xyzzy"}',
           'org.varlink.service.MethodNotFound {"method":"org.example.reference.NoSuchMethod"}',
           "org.example.reference.NotFound",
-          "local error: ConnectionClosedError",
+          "local error: ConnectionClosedError (io.systemd.Disconnected)",
           "",
         ].join("\n"),
       );

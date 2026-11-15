@@ -145,12 +145,20 @@ export interface Fence {
   readonly snippet: string | undefined;
 }
 
-/** The fenced code blocks (``` only) of a markdown text. */
+/**
+ * The fenced code blocks of a markdown text. Only unindented ``` fences are allowed: a `~~~` fence, a fence of four
+ * or more backticks, or an indented fence throws, so no block can slip past the checks that read these fences.
+ */
 export function fences(markdown: string): Fence[] {
   const lines = markdown.split("\n");
   const result: Fence[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const open = /^```(\S*)/.exec(lines[i] ?? "");
+    const line = lines[i] ?? "";
+    const any = /^(\s*)(`{3,}|~{3,})/.exec(line);
+    if (any === null) continue;
+    if (any[1] !== "" || any[2] !== "```")
+      throw new Error(`line ${String(i + 1)}: only unindented \`\`\` fences are allowed, not ${JSON.stringify(line)}`);
+    const open = /^```(\S*)/.exec(line);
     if (open === null) continue;
     let end = i + 1;
     while (end < lines.length && lines[end] !== "```") end++;

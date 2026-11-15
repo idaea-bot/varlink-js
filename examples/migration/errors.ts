@@ -1,5 +1,5 @@
 // MIGRATION.md "Errors": `node examples/migration/errors.ts ADDRESS` (against examples/reference-server.ts).
-import { ConnectionClosedError, isVarlinkError, MethodNotFoundError, VarlinkError } from "../../src/index.ts";
+import { isVarlinkError, isVarlinkLocalError, MethodNotFoundError, VarlinkError } from "../../src/index.ts";
 import { connect } from "../../src/node/index.ts";
 
 const address = process.argv[2] ?? "tcp:127.0.0.1:12345";
@@ -29,9 +29,10 @@ try {
 }
 
 // Local failures are not VarlinkErrors: ConnectionClosedError, CallTimeoutError, ProtocolError, ValidationError, …
+// Check them by localName (a brand check, like isVarlinkError): ConnectionClosedError is io.systemd.Disconnected.
 try {
   await conn.call("org.example.reference.Ping", { ping: "too late" });
 } catch (e) {
-  if (!(e instanceof ConnectionClosedError)) throw e;
-  console.log(`local error: ${e.name}`);
+  if (!isVarlinkLocalError(e, "io.systemd.Disconnected")) throw e;
+  console.log(`local error: ${e.name} (${e.localName})`);
 }

@@ -5,3 +5,5 @@ pkg/
 coverage/
 *.tgz
 .DS_Store
+# examples/reference-server.ts default socket
+/org.example.reference.sock
