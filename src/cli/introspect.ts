@@ -2,16 +2,21 @@
 // verb_introspect: GetInfo / GetInterfaceDescription, printed as text or JSON.
 import { formatInterface, IdlSyntaxError, isInterfaceName, parseInterface, type Interface } from "../core/idl/index.ts";
 import { callOrFail, expectArgs, failureReason, jsonStyle, withTarget, type Context } from "./context.ts";
-import { CliError, escapeControls, type Deadline } from "./io.ts";
+import { CliError, escapeControls, onTty, type Deadline } from "./io.ts";
 import { formatJson } from "./json.ts";
 import type { Target } from "./target.ts";
 
 const GET_INFO = "org.varlink.service.GetInfo";
 const GET_INTERFACE_DESCRIPTION = "org.varlink.service.GetInterfaceDescription";
 
-/** Byte-order comparison of ASCII names (strcmp, as strv_sort does); sorted copy without duplicates. */
+/** A copy sorted in byte order of ASCII names (strcmp, as varlinkctl's strv_sort does); duplicates kept. */
+function sorted(names: readonly string[]): string[] {
+  return [...names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** {@link sorted} without duplicates (varlinkctl's strv_sort_uniq). */
 function sortUnique(names: readonly string[]): string[] {
-  return [...new Set(names)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return sorted([...new Set(names)]);
 }
 
 function stringField(reply: Record<string, unknown>, key: string): string {
@@ -61,7 +66,8 @@ export async function info(ctx: Context, listOnly: boolean): Promise<number> {
     await ctx.out(formatJson(listOnly ? reply["interfaces"] : reply, style));
     return 0;
   }
-  const interfaces = sortUnique(interfacesField(reply));
+  // varlinkctl's info and list-interfaces use strv_sort: duplicates stay.
+  const interfaces = sorted(interfacesField(reply));
   if (listOnly) {
     await ctx.out(interfaces.map((i) => `${escapeControls(i)}\n`).join(""));
     return 0;
@@ -145,14 +151,15 @@ export async function introspect(ctx: Context, listMethods: boolean): Promise<nu
   });
 
   if (listMethods) {
-    const sorted = sortUnique(methods);
+    const names = sortUnique(methods);
     if (style !== undefined) {
-      await ctx.out(formatJson(sorted, style));
+      await ctx.out(formatJson(names, style));
     } else {
-      // Marked only on a TTY, so the output stays parsable (shell completion), like varlinkctl.
-      const mark = ctx.io.stdout.isTTY;
+      // Marked only on a TTY (stdout and stderr, as on_tty()), so the output stays parsable (shell completion), like
+      // varlinkctl.
+      const mark = onTty(ctx.io);
       await ctx.out(
-        sorted.map((m) => `${escapeControls(m)}${mark && experimental.has(m) ? " (experimental)" : ""}\n`).join(""),
+        names.map((m) => `${escapeControls(m)}${mark && experimental.has(m) ? " (experimental)" : ""}\n`).join(""),
       );
     }
   }

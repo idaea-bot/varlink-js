@@ -1,6 +1,7 @@
 // `validate-idl`, `format` and `codegen` (DESIGN.md §4.14): the IDL tools over files or stdin (`-`).
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { generate, generateFromService, type GeneratedFile, type GenerateOptions } from "../codegen/index.ts";
 import { formatInterface, IdlSyntaxError, isInterfaceName, parseInterface, type Interface } from "../core/idl/index.ts";
 import { callFailure, callOrFail, expectArgs, failureReason, withTarget, type Context } from "./context.ts";
@@ -65,6 +66,26 @@ export async function validateIdl(ctx: Context): Promise<number> {
   return 0;
 }
 
+/**
+ * Replaces `file` with `text` atomically: a uniquely named temp file in the same directory (the original's mode),
+ * renamed over it, so a failure (ENOSPC, a crash) leaves the original whole. The temp file is removed on failure.
+ */
+async function replaceFile(file: string, text: string): Promise<void> {
+  // Through a symlink: the file it points to is replaced, not the link.
+  const target = await realpath(file);
+  const mode = (await stat(target)).mode & 0o7777;
+  const temp = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temp, text, { mode, flag: "wx" });
+    // writeFile's mode is filtered by the umask; set it exactly.
+    await chmod(temp, mode);
+    await rename(temp, target);
+  } catch (e) {
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw e;
+  }
+}
+
 /** `format [FILE…]`: print the canonical formatting; `--check` names the files that differ; `-i` rewrites them. */
 export async function format(ctx: Context): Promise<number> {
   const files = ctx.cli.args.length === 0 ? ["-"] : ctx.cli.args;
@@ -92,7 +113,7 @@ export async function format(ctx: Context): Promise<number> {
     } else if (ctx.cli.inPlace) {
       if (formatted !== input.text) {
         try {
-          await writeFile(file, formatted);
+          await replaceFile(file, formatted);
         } catch (e) {
           await ctx.err(`Failed to write '${file}': ${describeError(e)}`);
           status = 1;
@@ -179,10 +200,17 @@ export async function codegen(ctx: Context): Promise<number> {
       files.push(generateOrFail(input.name, input.text, options));
     }
   }
-  const seen = new Set<string>();
+  // Lowercased: on a case-insensitive file system (macOS, Windows) `a.B.ts` and `a.b.ts` are one file. Checked before
+  // anything is written.
+  const seen = new Map<string, string>();
   for (const f of files) {
-    if (seen.has(f.fileName)) throw new CliError(`codegen: interface ${f.interfaceName} is given more than once.`);
-    seen.add(f.fileName);
+    const other = seen.get(f.fileName.toLowerCase());
+    if (other === f.interfaceName) throw new CliError(`codegen: interface ${f.interfaceName} is given more than once.`);
+    if (other !== undefined)
+      throw new CliError(
+        `codegen: interfaces ${other} and ${f.interfaceName} would write the same file (case-insensitively).`,
+      );
+    seen.set(f.fileName.toLowerCase(), f.interfaceName);
   }
   if (out === undefined) {
     for (const f of files) await ctx.out(f.code);

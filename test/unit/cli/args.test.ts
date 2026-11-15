@@ -7,7 +7,7 @@ import { escapeControls } from "../../../src/cli/io.ts";
 import { formatJson } from "../../../src/cli/json.ts";
 import { USAGE } from "../../../src/cli/run.ts";
 import { jsonCodec } from "../../../src/index.ts";
-import { runCli } from "./helpers.ts";
+import { ESC, RLO, runCli } from "./helpers.ts";
 
 const SEE_HELP = "See 'varlink-js --help'.\n";
 const version = (
@@ -111,19 +111,73 @@ describe("parseCommandLine", () => {
     assert.deepEqual(parseCommandLine(["format", "-"]).args, ["-"]);
   });
 
-  test("--timeout values", () => {
-    assert.equal(parseTimeout("1"), 1000);
-    assert.equal(parseTimeout("1.5"), 1500);
-    assert.equal(parseTimeout("1.5s"), 1500);
-    assert.equal(parseTimeout("500ms"), 500);
-    assert.equal(parseTimeout("250us"), 0.25);
-    assert.equal(parseTimeout("2sec"), 2000);
-    assert.equal(parseTimeout("2min"), 120_000);
-    assert.equal(parseTimeout("1h"), 3_600_000);
-    assert.equal(parseTimeout(".5"), 500);
-    assert.equal(parseTimeout("infinity"), null);
-    assert.equal(parseTimeout(""), null);
-    for (const bad of ["-1", "1d", "1 2", "abc", "1e3", "0", "0.0s"]) assert.throws(() => parseTimeout(bad), bad);
+  test("--timeout values: systemd's parse_sec", () => {
+    const cases: [string, number | null][] = [
+      ["1", 1000],
+      ["1.5", 1500],
+      ["1.5s", 1500],
+      ["500ms", 500],
+      ["500 msec", 500],
+      ["250us", 0.25],
+      ["250usec", 0.25],
+      [`5${String.fromCharCode(0xb5)}s`, 0.005],
+      [`5${String.fromCharCode(0x3bc)}s`, 0.005],
+      ["2sec", 2000],
+      ["30seconds", 30_000],
+      ["1second", 1000],
+      ["2min", 120_000],
+      ["5m", 300_000],
+      ["2minutes", 120_000],
+      ["1minute", 60_000],
+      ["1h", 3_600_000],
+      ["1hr", 3_600_000],
+      ["2hours", 7_200_000],
+      ["1.5h", 5_400_000],
+      ["1d", 86_400_000],
+      ["2days", 172_800_000],
+      ["1w", 604_800_000],
+      ["1week", 604_800_000],
+      ["1M", 2_629_800_000],
+      ["1month", 2_629_800_000],
+      ["1y", 31_557_600_000],
+      ["1years", 31_557_600_000],
+      ["1min 30s", 90_000],
+      ["1min30s", 90_000],
+      ["  1h 1m 1s 1ms  ", 3_661_001],
+      ["1 2", 3000],
+      ["12.34 .56", 12_900],
+      ["12.34s.56", 12_900],
+      [".5", 500],
+      ["0.0000015s", 0.001],
+      ["infinity", null],
+      [" infinity ", null],
+      ["", null],
+    ];
+    for (const [text, ms] of cases) assert.equal(parseTimeout(text), ms, text);
+    for (const bad of [
+      "-1",
+      "abc",
+      "1e3",
+      "3.",
+      "3.s",
+      ".",
+      "1 x",
+      "12.34.56",
+      "5mins",
+      " ",
+      "infinity 1",
+      "+",
+      "2500ns",
+      "999ns",
+      "1500nsec",
+    ])
+      assert.throws(() => parseTimeout(bad), /^UsageError: Failed to parse --timeout= parameter/, bad);
+    // Out of range: at or above 2⁶⁴ − 1 µs.
+    assert.throws(() => parseTimeout("18446744073709551615us"), /Failed to parse/);
+    assert.equal(parseTimeout("18446744073709551614us"), Number(18446744073709551614n) / 1000);
+    // Zero after rounding down to whole microseconds.
+    for (const zero of ["0", "0.0s", "0ms", "0.0000001", "0.5us", "0 0"])
+      assert.throws(() => parseTimeout(zero), /^UsageError: Timeout cannot be zero\.$/, zero);
   });
 });
 
@@ -197,6 +251,17 @@ describe("escapeControls", () => {
     assert.equal(escapeControls("a\x00\x1b[0m\x7f\x85\x9fé\n\t"), "a\\x00\\x1b[0m\\x7f\\x85\\x9fé\\x0a\\x09");
     assert.equal(escapeControls("a\nb\tc\rd", "\n\t"), "a\nb\tc\\x0dd");
   });
+
+  test("U+2028, U+2029 and the bidi controls as \\uNNNN; other non-ASCII stays", () => {
+    const bidi = [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069];
+    for (const code of [0x2028, 0x2029, ...bidi]) {
+      const c = String.fromCharCode(code);
+      assert.equal(escapeControls(`a${c}b`), `a\\u${code.toString(16).padStart(4, "0")}b`, code.toString(16));
+      assert.equal(escapeControls(c, c), c);
+    }
+    const others = `é€😀${String.fromCharCode(0xa0, 0x200d, 0x2027, 0x202f, 0x2065, 0x206a)}`;
+    assert.equal(escapeControls(others), others);
+  });
 });
 
 describe("internal errors", () => {
@@ -212,5 +277,17 @@ describe("internal errors", () => {
     const d = await runCli(["call", "unix:/x", "a.b.C"], { stdin: throwing, env: { VARLINK_JS_DEBUG: "1" } });
     assert.equal(d.code, 1);
     assert.match(d.stderr, /^varlink-js: internal error: boom\nRangeError: boom\n\s+at /);
+  });
+
+  test("the VARLINK_JS_DEBUG stack is escaped too (newlines kept)", async () => {
+    const throwing = {
+      [Symbol.asyncIterator]: () => {
+        throw new RangeError(`a${ESC}[2Jb${RLO}c`);
+      },
+    };
+    const d = await runCli(["call", "unix:/x", "a.b.C"], { stdin: throwing, env: { VARLINK_JS_DEBUG: "1" } });
+    assert.equal(d.code, 1);
+    assert.match(d.stderr, /^varlink-js: internal error: a\\x1b\[2Jb\\u202ec\nRangeError: a\\x1b\[2Jb\\u202ec\n\s+at /);
+    assert.ok(!d.stderr.includes(ESC) && !d.stderr.includes(RLO));
   });
 });

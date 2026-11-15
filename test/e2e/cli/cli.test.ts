@@ -7,7 +7,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
-import { RS, startFixture, waitFor, type Fixture } from "../../unit/cli/helpers.ts";
+import { RS, rawServer, startFixture, waitFor, type Fixture } from "../../unit/cli/helpers.ts";
 
 const MAIN = fileURLToPath(new URL("../../../src/cli/main.ts", import.meta.url));
 const VERSION = (
@@ -190,6 +190,24 @@ describe("varlink-js (real process)", () => {
     const { code } = await c.exited;
     assert.equal(code, 0, c.stderr());
     assert.equal(c.stdout(), '{"parameters":{"value":"piped"}}\0');
+  });
+
+  test("bridge: the peer replies and closes while stdin stays open: exits 0 by itself", TIMEOUT, async () => {
+    const raw = await rawServer(['{"parameters":{"x":1}}']);
+    try {
+      const c = start(["bridge", raw.address]);
+      c.child.stdin.write(`${JSON.stringify({ method: "a.b.C", parameters: {} })}\0`);
+      await waitFor(() => c.stdout().includes("\0"), 20_000);
+      // The child's stdin is never ended: only the peer's EOF can end the bridge (a hang fails by the test timeout).
+      await raw.close();
+      const { code, signal } = await c.exited;
+      assert.equal(signal, null);
+      assert.equal(code, 0, c.stderr());
+      assert.equal(c.stdout(), '{"parameters":{"x":1}}\0');
+      assert.equal(c.stderr(), "");
+    } finally {
+      await raw.close();
+    }
   });
 
   test("certify client ↔ certify server, both as children", TIMEOUT, async () => {

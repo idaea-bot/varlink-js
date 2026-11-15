@@ -42,10 +42,13 @@ describe("info", () => {
     const reply = JSON.parse(short.stdout) as { vendor: string; interfaces: string[] };
     assert.equal(reply.vendor, "varlink-js tests");
     assert.equal(short.stdout.split("\n").length, 2);
-    const pretty = await runCli(["-j", "info", fx.tcp], { stdoutTTY: true });
+    const pretty = await runCli(["-j", "info", fx.tcp], { stdoutTTY: true, stderrTTY: true });
     assert.ok(pretty.stdout.startsWith('{\n\t"vendor" : "varlink-js tests",\n'), pretty.stdout);
     const auto = await runCli(["info", fx.tcp, "-j"]);
     assert.equal(auto.stdout, short.stdout);
+    // -j is pretty only when stdout and stderr are TTYs (on_tty()).
+    const halfTty = await runCli(["info", fx.tcp, "-j"], { stdoutTTY: true, stderrTTY: false });
+    assert.equal(halfTty.stdout, short.stdout);
     const off = await runCli(["info", fx.tcp, "--json=off"]);
     assert.ok(off.stdout.startsWith("    Vendor: "));
   });
@@ -66,6 +69,36 @@ describe("info", () => {
       assert.ok(r.stdout.includes("    Vendor: v\\x1b[31m\n"));
       assert.ok(r.stdout.includes("   Product: p\\x0a2\n"));
       assert.ok(!r.stdout.includes(ESC));
+    } finally {
+      await raw.close();
+    }
+  });
+
+  test("info and list-interfaces keep duplicate names (varlinkctl's strv_sort)", async () => {
+    const info = { vendor: "v", product: "p", version: "1", url: "u", interfaces: ["b.c", "a.b", "b.c"] };
+    const raw = await rawServer([JSON.stringify({ parameters: info }), JSON.stringify({ parameters: info })]);
+    try {
+      const table = await runCli(["info", raw.address]);
+      assert.equal(table.code, 0, table.stderr);
+      assert.ok(table.stdout.endsWith("Interfaces: a.b\n            b.c\n            b.c\n"), table.stdout);
+      const list = await runCli(["list-interfaces", raw.address]);
+      assert.equal(list.code, 0, list.stderr);
+      assert.equal(list.stdout, "a.b\nb.c\nb.c\n");
+    } finally {
+      await raw.close();
+    }
+  });
+
+  test("a number out of range in the reply: exit 1", async () => {
+    const raw = await rawServer(['{"parameters":{"vendor":"v","n":1e400}}']);
+    try {
+      const r = await runCli(["info", raw.address, "--json=short"]);
+      assert.equal(r.code, 1);
+      assert.equal(r.stdout, "");
+      assert.equal(
+        r.stderr,
+        "Method call org.varlink.service.GetInfo() failed: reply contains a number out of range\n",
+      );
     } finally {
       await raw.close();
     }
@@ -103,11 +136,34 @@ describe("list-methods", () => {
     assert.ok(lines.includes("org.example.cli.Echo"));
     assert.ok(lines.includes("org.example.cli.Preview"));
     assert.ok(lines.includes("org.varlink.service.GetInfo"));
-    const tty = await runCli(["list-methods", fx.unix], { stdoutTTY: true });
+    const tty = await runCli(["list-methods", fx.unix], { stdoutTTY: true, stderrTTY: true });
     const ttyLines = tty.stdout.trimEnd().split("\n");
     assert.ok(ttyLines.includes("org.example.cli.Preview (experimental)"));
     assert.ok(ttyLines.includes("org.example.preview.Try (experimental)"));
     assert.ok(ttyLines.includes("org.example.cli.Echo"));
+    // A TTY is stdout and stderr (on_tty()): with either redirected, no marks.
+    for (const [stdoutTTY, stderrTTY] of [
+      [true, false],
+      [false, true],
+    ] as const) {
+      const half = await runCli(["list-methods", fx.unix], { stdoutTTY, stderrTTY });
+      assert.equal(half.stdout, r.stdout, `stdout TTY ${String(stdoutTTY)}, stderr TTY ${String(stderrTTY)}`);
+    }
+  });
+
+  test("duplicates in GetInfo's interfaces are asked once (sorted, unique)", async () => {
+    const info = { vendor: "v", product: "p", version: "1", url: "u", interfaces: ["b.c", "a.b", "b.c"] };
+    const ab = { description: "interface a.b\n\nmethod X() -> ()\n" };
+    const bc = { description: "interface b.c\n\nmethod Y() -> ()\n" };
+    const raw = await rawServer([info, ab, bc].map((parameters) => JSON.stringify({ parameters })));
+    try {
+      const r = await runCli(["list-methods", raw.address]);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, "a.b.X\nb.c.Y\n");
+      assert.equal(raw.received(), 3);
+    } finally {
+      await raw.close();
+    }
   });
 
   test("given interfaces; JSON: one array", async () => {

@@ -18,13 +18,22 @@ function writeSocket(socket: Socket, chunk: Uint8Array): Promise<void> {
 /** Pipes until the peer's EOF (resolves), a socket error, a stdout failure or an abort (rejects). */
 function pipe(ctx: Context, socket: Socket, signal: AbortSignal | undefined): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    // An object, so that TypeScript does not narrow the flag inside the async closures below.
-    const state = { done: false };
+    // An object, so that TypeScript does not narrow the flags inside the async closures below.
+    const state = { done: false, stdinDone: false };
     let lastWrite: Promise<void> = Promise.resolve();
+    const input = ctx.io.stdin[Symbol.asyncIterator]();
     const finish = (error?: unknown): void => {
       if (state.done) return;
       state.done = true;
       signal?.removeEventListener("abort", onAbort);
+      // Stopped before stdin's EOF (the peer ended first, an error, a signal): release stdin, so an in-process caller
+      // is left with no pending read.
+      if (!state.stdinDone)
+        try {
+          void input.return?.().catch(() => undefined);
+        } catch {
+          // Nothing more to release.
+        }
       if (error === undefined) resolve();
       // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- whatever failed, as is
       else reject(error);
@@ -65,7 +74,6 @@ function pipe(ctx: Context, socket: Socket, signal: AbortSignal | undefined): Pr
     });
 
     void (async () => {
-      const input = ctx.io.stdin[Symbol.asyncIterator]();
       try {
         for (;;) {
           const r = await abortable(input.next(), signal);
@@ -73,6 +81,7 @@ function pipe(ctx: Context, socket: Socket, signal: AbortSignal | undefined): Pr
           if (r.done === true) break;
           await writeSocket(socket, r.value);
         }
+        state.stdinDone = true;
         socket.end();
       } catch (e) {
         if (!state.done) finish(signal?.aborted === true ? signal.reason : new CliError(`bridge: ${describeError(e)}`));

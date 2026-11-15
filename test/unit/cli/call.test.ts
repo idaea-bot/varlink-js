@@ -25,12 +25,14 @@ for (const transport of ["unix", "tcp"] as const) {
       assert.equal(r.stderr, "");
     });
 
-    test("pretty JSON (sd-json format) when stdout is a TTY", async () => {
-      const r = await runCli(["call", addr(), "org.example.cli.Echo", '{"value":{"a":[1,{}],"b":[]}}'], {
-        stdoutTTY: true,
-      });
+    test("pretty JSON (sd-json format) on a TTY (stdout and stderr, as on_tty())", async () => {
+      const args = ["call", addr(), "org.example.cli.Echo", '{"value":{"a":[1,{}],"b":[]}}'];
+      const r = await runCli(args, { stdoutTTY: true, stderrTTY: true });
       assert.equal(r.code, 0, r.stderr);
       assert.equal(r.stdout, '{\n\t"value" : {\n\t\t"a" : [\n\t\t\t1,\n\t\t\t{}\n\t\t],\n\t\t"b" : []\n\t}\n}\n');
+      // `call … 2>log` on a terminal: short, like varlinkctl.
+      const redirected = await runCli(args, { stdoutTTY: true, stderrTTY: false });
+      assert.equal(redirected.stdout, '{"value":{"a":[1,{}],"b":[]}}\n');
     });
 
     test("--more: JSON-SEQ, one record per reply, each written on its own", async () => {
@@ -114,6 +116,28 @@ describe("call: parameters", () => {
     assert.match(s.stderr, /^Failed to parse parameters at <stdin>: not a JSON object\n$/);
     const u = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], { stdin: new Uint8Array([0x7b, 0xff, 0x7d]) });
     assert.match(u.stderr, /not valid UTF-8/);
+  });
+
+  test("stdin parameters above 16 MiB: `too large`, exit 1, reading stops", async () => {
+    let pulled = 0;
+    const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+    const endless: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          pulled++;
+          return Promise.resolve({ done: false, value: chunk });
+        },
+      }),
+    };
+    const r = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], { stdin: endless });
+    assert.equal(r.code, 1);
+    assert.equal(r.stderr, "Failed to parse parameters at <stdin>: too large (more than 16777216 bytes)\n");
+    assert.equal(pulled, 17);
+    // Exactly 16 MiB is fine (blank: {}, then the connect fails).
+    const limit = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], {
+      stdin: new Uint8Array(16 * 1024 * 1024).fill(0x20),
+    });
+    assert.match(limit.stderr, /^Failed to connect to /);
   });
 
   test("an invalid method name is rejected before connecting", async () => {
@@ -248,6 +272,26 @@ describe("call: local failures", () => {
     assert.match(r.stderr, /^Method call org\.example\.cli\.Monitor\(\) failed: timed out after 0\.15s\n$/);
   });
 
+  test("a number out of range in a reply (1e400 → Infinity): exit 1, nothing printed", async () => {
+    const cases: [string[], string][] = [
+      [[], '{"parameters":{"x":[1,1e400]}}'],
+      [["--collect"], '{"parameters":{"x":-1e999}}'],
+      [["--more"], '{"parameters":{"x":1e400}}'],
+      [[], '{"error":"org.example.other.Broken","parameters":{"x":1e400}}'],
+    ];
+    for (const [flags, reply] of cases) {
+      const raw = await rawServer([reply]);
+      try {
+        const r = await runCli(["call", ...flags, raw.address, "a.b.C", "{}"]);
+        assert.equal(r.code, 1, reply);
+        assert.equal(r.stdout, "", reply);
+        assert.equal(r.stderr, "Method call a.b.C() failed: reply contains a number out of range\n", reply);
+      } finally {
+        await raw.close();
+      }
+    }
+  });
+
   test("a peer that breaks the protocol", async () => {
     const raw = await rawServer(["not json"]);
     try {
@@ -293,22 +337,31 @@ describe("call: signals and EPIPE", () => {
 
   test("SIGTERM gives 143", async () => {
     const controller = new AbortController();
-    setTimeout(() => {
-      controller.abort("SIGTERM");
-    }, 50);
-    const r = await runCli(["call", fx.unix, "org.example.cli.Hang", "{}"], { signal: controller.signal });
+    const hangs = fx.hangs;
+    const p = runCli(["call", fx.unix, "org.example.cli.Hang", "{}"], { signal: controller.signal });
+    // Signal once the call is in flight (not during the connect).
+    await waitFor(() => fx.hangs > hangs);
+    controller.abort("SIGTERM");
+    const r = await p;
     assert.equal(r.code, 143);
+    assert.equal(r.stderr, "");
   });
 
   test("a signal while reading stdin parameters", async () => {
     const controller = new AbortController();
+    let reading = false;
     const never: AsyncIterable<Uint8Array> = {
-      [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => undefined) }),
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          reading = true;
+          return new Promise(() => undefined);
+        },
+      }),
     };
-    setTimeout(() => {
-      controller.abort("SIGINT");
-    }, 20);
-    const r = await runCli(["call", fx.unix, "a.b.C"], { stdin: never, signal: controller.signal });
+    const p = runCli(["call", fx.unix, "a.b.C"], { stdin: never, signal: controller.signal });
+    await waitFor(() => reading);
+    controller.abort("SIGINT");
+    const r = await p;
     assert.equal(r.code, 130);
   });
 

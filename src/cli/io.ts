@@ -1,5 +1,6 @@
 // The CLI's I/O seam (DESIGN.md §4.14): run() sees only a CliIo, never `process`, so it runs in-process under Node,
 // Bun and Deno (tests pass a fake one; main.ts passes nodeIo()). Plus the small helpers every command shares.
+import { DEFAULT_MAX_MESSAGE_SIZE } from "../core/protocol/index.ts";
 
 /** Standard input: chunks of bytes. */
 export interface CliInput extends AsyncIterable<Uint8Array> {
@@ -41,20 +42,50 @@ export class UsageError extends Error {
   override readonly name: string = "UsageError";
 }
 
+/** Whether the CLI runs on a terminal: stdout and stderr both TTYs (systemd's on_tty()). */
+export function onTty(io: CliIo): boolean {
+  return io.stdout.isTTY && io.stderr.isTTY;
+}
+
 /** Exit status for a signal: 128 + its number (SIGINT 2 → 130, SIGTERM 15 → 143), like a shell reports it. */
 export function signalExitCode(reason: unknown): number {
   return reason === "SIGTERM" ? 143 : 130;
 }
 
+/** A global regex character class of the given code points and inclusive ranges (as codegen's codePointClass). */
+function codePointClass(codes: readonly (number | readonly [number, number])[]): RegExp {
+  const hex = (c: number): string => "\\u" + c.toString(16).padStart(4, "0");
+  const items = codes.map((c) => (typeof c === "number" ? hex(c) : `${hex(c[0])}-${hex(c[1])}`));
+  return new RegExp(`[${items.join("")}]`, "g");
+}
+
 /**
- * `s` with C0 controls, DEL and C1 controls written as `\xNN`, so peer-controlled text cannot drive the terminal.
- * Characters in `keep` (e.g. "\n\t" for IDL text) stay as they are.
+ * C0 controls, DEL, C1 controls, U+2028/U+2029 and the Bidi_Control characters: codegen's CONTROLS class
+ * (src/codegen/generate.ts) plus the line and paragraph separators.
+ */
+const CONTROLS = codePointClass([
+  [0, 0x1f],
+  [0x7f, 0x9f],
+  0x061c,
+  0x200e,
+  0x200f,
+  0x2028,
+  0x2029,
+  [0x202a, 0x202e],
+  [0x2066, 0x2069],
+]);
+
+/**
+ * `s` with C0 controls, DEL and C1 controls written as `\xNN`, and U+2028/U+2029 and the bidi controls as `\uNNNN`,
+ * so peer-controlled text cannot drive the terminal or reorder what it shows. Characters in `keep` (e.g. "\n\t" for
+ * IDL text) stay as they are.
  */
 export function escapeControls(s: string, keep = ""): string {
-  // eslint-disable-next-line no-control-regex -- matching control characters is the point
-  return s.replace(/[\x00-\x1f\x7f-\x9f]/g, (c) =>
-    keep.includes(c) ? c : `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`,
-  );
+  return s.replace(CONTROLS, (c) => {
+    if (keep.includes(c)) return c;
+    const code = c.charCodeAt(0);
+    return code < 0x100 ? `\\x${code.toString(16).padStart(2, "0")}` : `\\u${code.toString(16).padStart(4, "0")}`;
+  });
 }
 
 /** A one-line description of an error for stderr (unescaped): its message, plus its cause's if it has one. */
@@ -112,8 +143,19 @@ export function aborted(signal: AbortSignal | undefined): Promise<void> {
   });
 }
 
-/** All of `input` (an abort of `signal` rejects with its reason and stops reading). */
-export async function readAll(input: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<Uint8Array> {
+/** Most bytes read from stdin (parameters, an IDL): the protocol's message limit, 16 MiB. */
+export const MAX_INPUT_BYTES: number = DEFAULT_MAX_MESSAGE_SIZE;
+
+/**
+ * All of `input` (an abort of `signal` rejects with its reason and stops reading).
+ *
+ * @throws {CliError} `too large (more than N bytes)` past `maxBytes` (reading stops).
+ */
+export async function readAll(
+  input: AsyncIterable<Uint8Array>,
+  signal?: AbortSignal,
+  maxBytes: number = MAX_INPUT_BYTES,
+): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let length = 0;
   const iterator = input[Symbol.asyncIterator]();
@@ -123,6 +165,7 @@ export async function readAll(input: AsyncIterable<Uint8Array>, signal?: AbortSi
       if (r.done === true) break;
       chunks.push(r.value);
       length += r.value.length;
+      if (length > maxBytes) throw new CliError(`too large (more than ${String(maxBytes)} bytes)`);
     }
   } catch (e) {
     void iterator.return?.().catch(() => undefined);

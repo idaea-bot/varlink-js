@@ -3,8 +3,17 @@
 import { parseAddress, type AddressSpec } from "../core/address/index.ts";
 import { CallTimeoutError, isVarlinkError } from "../core/errors/index.ts";
 import type { CommandLine } from "./args.ts";
-import { CliError, describeError, escapeControls, startDeadline, UsageError, type CliIo, type Deadline } from "./io.ts";
-import type { JsonStyle } from "./json.ts";
+import {
+  CliError,
+  describeError,
+  escapeControls,
+  onTty,
+  startDeadline,
+  UsageError,
+  type CliIo,
+  type Deadline,
+} from "./io.ts";
+import { hasNonFinite, type JsonStyle } from "./json.ts";
 import { openTarget, type Target } from "./target.ts";
 
 /** varlinkctl's (sd-varlink's) default timeout: 45 s. */
@@ -31,13 +40,14 @@ export function createContext(io: CliIo, cli: CommandLine): Context {
 }
 
 /**
- * The JSON style of a command's output: `--json=pretty|short`, `-j` (pretty on a TTY, else short); `off` or nothing →
+ * The JSON style of a command's output: `--json=pretty|short`, `-j` (pretty when stdout and stderr are TTYs, else
+ * short); `off` or nothing →
  * `undefined` (text), unless `jsonByDefault` (call: varlinkctl defaults to `-j` there, and treats `off` like it too).
  */
 export function jsonStyle(ctx: Context, jsonByDefault = false): JsonStyle | undefined {
   let mode = ctx.cli.json;
   if (jsonByDefault && (mode === undefined || mode === "off")) mode = "auto";
-  if (mode === "auto") return ctx.io.stdout.isTTY ? "pretty" : "short";
+  if (mode === "auto") return onTty(ctx.io) ? "pretty" : "short";
   return mode === "pretty" || mode === "short" ? mode : undefined;
 }
 
@@ -82,7 +92,17 @@ export function callFailure(method: string, error: unknown, dl: Deadline): CliEr
   return new CliError(`Method call ${method}() failed: ${why}`);
 }
 
-/** A call whose failure (error reply or local) is a {@link callFailure}. */
+/**
+ * `value` (a reply, or an error reply's parameters) when it can be printed as JSON.
+ *
+ * @throws {CliError} `Method call METHOD() failed: reply contains a number out of range` for a non-finite number.
+ */
+export function printable<T>(method: string, value: T): T {
+  if (hasNonFinite(value)) throw new CliError(`Method call ${method}() failed: reply contains a number out of range`);
+  return value;
+}
+
+/** A call whose failure (error reply or local, or a {@link printable} failure) is a {@link callFailure}. */
 export async function callOrFail(
   target: Target,
   dl: Deadline,
@@ -90,11 +110,13 @@ export async function callOrFail(
   parameters: Record<string, unknown>,
   service?: string,
 ): Promise<Record<string, unknown>> {
+  let reply: Record<string, unknown>;
   try {
-    return await target.call(method, parameters, service);
+    reply = await target.call(method, parameters, service);
   } catch (e) {
     throw callFailure(method, e, dl);
   }
+  return printable(method, reply);
 }
 
 /** Checks the number of positional arguments. @throws {UsageError} "Too few/many arguments." */

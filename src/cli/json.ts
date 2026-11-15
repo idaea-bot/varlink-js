@@ -8,12 +8,22 @@ export type JsonStyle = "pretty" | "short";
 /** RFC 7464 record separator, written before each JSON-SEQ record. */
 export const RS = "\x1e";
 
+/**
+ * Whether `value` holds a non-finite number: a peer's `1e400` decodes to Infinity, which JSON cannot spell (the
+ * commands fail on such a reply instead of printing it).
+ */
+export function hasNonFinite(value: unknown): boolean {
+  if (typeof value === "number") return !Number.isFinite(value);
+  if (typeof value !== "object" || value === null) return false;
+  return (Array.isArray(value) ? (value as unknown[]) : Object.values(value)).some(hasNonFinite);
+}
+
 function scalar(value: unknown): string {
   switch (typeof value) {
     case "bigint":
       return value.toString();
     case "number":
-      // Non-finite numbers never come from the codec; JSON has no spelling for them.
+      // Replies are checked with hasNonFinite first; JSON has no spelling for these.
       return Number.isFinite(value) ? JSON.stringify(value) : "null";
     case "string":
     case "boolean":

@@ -4,7 +4,9 @@ import { readFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { CERTIFICATION_IDL } from "../../../src/cli/certification-idl.ts";
 import { readCertificationIdl } from "../../../src/cli/certification.ts";
-import { rawServer, runCli, startFixture, waitFor, type CliResult, type Fixture } from "./helpers.ts";
+import { ESC, RLO, rawServer, runCli, startFixture, waitFor, type CliResult, type Fixture } from "./helpers.ts";
+
+const BEL = String.fromCharCode(0x07);
 
 test("the embedded IDL equals interfaces/org.varlink.certification.varlink byte for byte", async () => {
   const file = readFileSync(new URL("../../../interfaces/org.varlink.certification.varlink", import.meta.url));
@@ -73,6 +75,27 @@ describe("certify", () => {
     const refused = await runCli(["certify", "client", "unix:/nonexistent/x"]);
     assert.equal(refused.code, 1);
     assert.match(refused.stderr, /^Failed to connect to unix:\/nonexistent\/x: /);
+  });
+
+  test("peer-controlled text in the client's lines is escaped (no raw control or bidi characters)", async () => {
+    const C1_CSI = String.fromCharCode(0x9b);
+    const evil = `id${ESC}]52;c;cHduZWQ=${BEL}${ESC}[2J${C1_CSI}31m${RLO}gnp.exe`;
+    const raw = await rawServer([
+      JSON.stringify({ parameters: { client_id: evil } }),
+      JSON.stringify({ error: `org.example.${ESC}[2J${RLO}Evil` }),
+    ]);
+    try {
+      const r = await runCli(["certify", "client", raw.address]);
+      assert.equal(r.code, 1);
+      assert.equal(r.stdout, "client_id: id\\x1b]52;c;cHduZWQ=\\x07\\x1b[2J\\x9b31m\\u202egnp.exe\n");
+      assert.equal(r.stderr, "Certification failed: org.example.\\x1b[2J\\u202eEvil {}\n");
+      for (const c of [ESC, BEL, C1_CSI, RLO]) {
+        assert.ok(!r.stdout.includes(c), `stdout has U+${c.charCodeAt(0).toString(16)}`);
+        assert.ok(!r.stderr.includes(c), `stderr has U+${c.charCodeAt(0).toString(16)}`);
+      }
+    } finally {
+      await raw.close();
+    }
   });
 
   test("--timeout bounds the client run", async () => {

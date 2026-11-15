@@ -11,6 +11,8 @@ import { listen, type NodeListener } from "../../../src/node/index.ts";
 
 export const RS = "\x1e";
 export const ESC: string = String.fromCharCode(0x1b);
+/** U+202E RIGHT-TO-LEFT OVERRIDE, a bidi control. */
+export const RLO: string = String.fromCharCode(0x202e);
 
 export const IDL = `# A test service for the CLI.
 interface org.example.cli
@@ -132,12 +134,16 @@ export interface FakeIoOptions {
   stdin?: string | Uint8Array | AsyncIterable<Uint8Array>;
   stdinTTY?: boolean;
   stdoutTTY?: boolean;
+  /** Default: as stdoutTTY (a terminal is stdout and stderr both TTYs). */
+  stderrTTY?: boolean;
   env?: Record<string, string>;
   /** stdout writes accepted before every further write rejects with BrokenPipeError. */
   stdoutBreaksAfter?: number;
   signal?: AbortSignal;
   /** Called with stdout's text so far after each write. */
   onStdout?: (text: string) => void;
+  /** Awaited by each stdout write before it is recorded (a slow or blocked reader). */
+  beforeStdoutWrite?: (data: Uint8Array) => Promise<void>;
 }
 
 /** A fake CliIo recording stdout and stderr. */
@@ -191,12 +197,14 @@ export function fakeIo(options: FakeIoOptions = {}): FakeIo {
         if (options.stdoutBreaksAfter !== undefined && writes >= options.stdoutBreaksAfter)
           throw new BrokenPipeError("write EPIPE");
         writes++;
-        stdoutChunks.push(bytesOf(data));
+        const bytes = bytesOf(data);
+        await options.beforeStdoutWrite?.(bytes);
+        stdoutChunks.push(bytes);
         options.onStdout?.(decoder.decode(concat(stdoutChunks)));
       },
     },
     stderr: {
-      isTTY: false,
+      isTTY: options.stderrTTY ?? options.stdoutTTY ?? false,
       write: async (data) => {
         await Promise.resolve();
         stderrChunks.push(bytesOf(data));
@@ -301,4 +309,47 @@ export async function waitFor(predicate: () => boolean, ms = 5000): Promise<void
     if (Date.now() - start > ms) throw new Error("waitFor: timed out");
     await sleep(5);
   }
+}
+
+/**
+ * Polls `read` every 5 ms until its value stayed the same for `quietMs` (or `ms` passed: throws); returns that value.
+ * For "it stopped": a progress counter that no longer moves.
+ */
+export async function waitForStable(read: () => number, quietMs = 300, ms = 20_000): Promise<number> {
+  const start = Date.now();
+  let value = read();
+  let since = Date.now();
+  for (;;) {
+    await sleep(5);
+    const now = read();
+    if (now !== value) {
+      value = now;
+      since = Date.now();
+    } else if (Date.now() - since >= quietMs) {
+      return value;
+    }
+    if (Date.now() - start > ms) throw new Error("waitForStable: timed out");
+  }
+}
+
+/** The test pattern byte at `offset` of a long stream (not periodic at chunk sizes, so reordering shows). */
+export function patternByte(offset: number): number {
+  return (offset * 31 + Math.floor(offset / 65_521)) & 0xff;
+}
+
+/** `length` pattern bytes starting at `offset`. */
+export function pattern(offset: number, length: number): Uint8Array {
+  const out = new Uint8Array(length);
+  for (let i = 0; i < length; i++) out[i] = patternByte(offset + i);
+  return out;
+}
+
+/** Whether `chunks` (in order) are exactly the first `total` pattern bytes. */
+export function isPattern(chunks: readonly Uint8Array[], total: number): boolean {
+  let offset = 0;
+  for (const c of chunks) {
+    for (let i = 0; i < c.length; i++) if (c[i] !== patternByte(offset + i)) return false;
+    offset += c.length;
+  }
+  return offset === total;
 }

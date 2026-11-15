@@ -8,6 +8,7 @@ import { createContext, type Context } from "./context.ts";
 import { codegen, format, validateIdl } from "./idl.ts";
 import { info, introspect } from "./introspect.ts";
 import {
+  abortable,
   BrokenPipeError,
   CliError,
   describeError,
@@ -51,7 +52,7 @@ Options:
   -j                           Same as --json=pretty on a terminal, --json=short otherwise
   -q --quiet                   Do not print replies (call), the formatting (validate-idl) or paths (codegen)
      --timeout=SECS            Time limit for the connect and the whole call (default 45s; 'infinity' for none;
-                               units us, ms, s, sec, min, h)
+                               a systemd time span: seconds, or e.g. 500ms, 1.5h, '1min 30s')
 call:
      --more                    Request multiple replies, printed as JSON-SEQ as they arrive
   -E                           Same as --more --timeout=infinity
@@ -68,7 +69,8 @@ codegen:
      --address=ADDRESS         Fetch the interfaces from a running service
 
 ADDRESS: unix:/path, /path, ./path, unix:@abstract (Linux), tcp:host:port, ws(s)://…, http(s)://… (HTTP bridge).
-Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM.
+Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM ('certify server': 0, it stops
+gracefully).
 `;
 
 function dispatch(ctx: Context, cli: CommandLine): Promise<number> {
@@ -116,15 +118,22 @@ export async function run(argv: readonly string[], io: CliIo): Promise<number> {
   try {
     const cli = parseCommandLine(argv);
     if (cli.help || cli.command === "help") {
-      await io.stdout.write(USAGE);
+      await abortable(io.stdout.write(USAGE), io.signal);
       return 0;
     }
     if (cli.version) {
-      await io.stdout.write(`${VERSION}\n`);
+      await abortable(io.stdout.write(`${VERSION}\n`), io.signal);
       return 0;
     }
     if (cli.command === undefined) throw new UsageError("Command verb required.");
-    return await dispatch(createContext(io, cli), cli);
+    const running = dispatch(createContext(io, cli), cli);
+    // The network commands watch io.signal themselves (they close their connections first; `certify server` exits
+    // 0). The local ones do not: the first signal stops them here (whatever is in flight finishes unobserved).
+    const local =
+      cli.command === "validate-idl" ||
+      cli.command === "format" ||
+      (cli.command === "codegen" && cli.address === undefined);
+    return await (local ? abortable(running, io.signal) : running);
   } catch (e) {
     if (e instanceof BrokenPipeError) return 0;
     if (io.signal?.aborted === true) return signalExitCode(io.signal.reason);
@@ -138,7 +147,7 @@ export async function run(argv: readonly string[], io: CliIo): Promise<number> {
     }
     await writeErr(io, `varlink-js: internal error: ${escapeControls(describeError(e))}\n`);
     if (io.env["VARLINK_JS_DEBUG"] !== undefined && e instanceof Error && e.stack !== undefined)
-      await writeErr(io, `${e.stack}\n`);
+      await writeErr(io, `${escapeControls(e.stack, "\n")}\n`);
     return 1;
   }
 }

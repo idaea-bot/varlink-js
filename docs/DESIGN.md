@@ -1255,23 +1255,32 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
 
 | Command | Does |
 |---|---|
-| `info`, `list-interfaces ADDRESS` | GetInfo: varlinkctl's vertical table (labels right-aligned, interfaces sorted, continuation lines aligned) / sorted names; JSON: the reply / its `interfaces` |
-| `list-methods`, `introspect ADDRESS [IFACE…]` | none = all of GetInfo's (sorted, unique); names checked before connecting; `list-methods` sorted unique `iface.Method`, ` (experimental)` only on a TTY; `introspect` text = `formatInterface` per interface, blank line between, unparsable → warning + raw text; JSON: the reply objects, JSON-SEQ when more than one |
+| `info`, `list-interfaces ADDRESS` | GetInfo: varlinkctl's vertical table (labels right-aligned, interfaces sorted with duplicates kept like `strv_sort`, continuation lines aligned) / sorted names (duplicates kept); JSON: the reply / its `interfaces` |
+| `list-methods`, `introspect ADDRESS [IFACE…]` | none = all of GetInfo's (sorted, unique: `strv_sort_uniq`); names checked before connecting; `list-methods` sorted unique `iface.Method`, ` (experimental)` only on a TTY (stdout and stderr, `on_tty()`); `introspect` text = `formatInterface` per interface, blank line between, unparsable → warning + raw text; JSON: the reply objects, JSON-SEQ when more than one |
 | `call ADDRESS METHOD [PARAMS]` | PARAMS or stdin (absent or `-`; blank = `{}`; the TTY notice unless `-q`); `--more` (JSON-SEQ, one awaited write per reply), `-E`, `--collect` (one array), `--oneway` (exit once written), `--graceful=ERROR`, `-q`; the three modes are mutually exclusive |
-| `validate-idl [FILE]`, `format [FILE…]` | stdin when absent or `-`; errors `FILE:LINE:COL: reason` (`<stdin>`); `format --check` (names the non-canonical files on stderr), `-i` |
-| `codegen FILE…`, `codegen --address ADDR IFACE…` | `generate()` / `generateFromService`; `-o DIR` writes `<DIR>/<iface>.ts` (paths on stderr unless `-q`), else one input to stdout; `--ints`, `--import-path` |
-| `bridge ADDRESS` | raw bytes stdin ↔ socket (`openSocket` of `src/node/connect.ts`), unix/abstract/tcp only; stdin EOF half-closes, peer EOF ends it (0) |
-| `certify server\|client ADDRESS` | `Listening on <address>` (real port for `:0`), graceful stop on SIGINT/SIGTERM (0) / every step, `Certification passed` |
+| `validate-idl [FILE]`, `format [FILE…]` | stdin when absent or `-`; errors `FILE:LINE:COL: reason` (`<stdin>`); `format --check` (names the non-canonical files on stderr), `-i` (atomic: a uniquely named temp file in the same directory with the original's mode, renamed over it — through a symlink, its target; removed on failure) |
+| `codegen FILE…`, `codegen --address ADDR IFACE…` | `generate()` / `generateFromService`; `-o DIR` writes `<DIR>/<iface>.ts` (paths on stderr unless `-q`), else one input to stdout; output names that clash case-insensitively (`a.B`/`a.b` on macOS) fail before anything is written; `--ints`, `--import-path` |
+| `bridge ADDRESS` | raw bytes stdin ↔ socket (`openSocket` of `src/node/connect.ts`), unix/abstract/tcp only; one chunk at a time both ways (the socket paused while a stdout write is pending; the next stdin chunk pulled once the socket took the last); stdin EOF half-closes, peer EOF ends it (0; stdin's iterator is `return()`ed) |
+| `certify server\|client ADDRESS` | `Listening on <address>` (real port for `:0`), graceful stop on SIGINT/SIGTERM (0) / every step (escaped: `client_id` and replies are the peer's), `Certification passed` |
 
 - **Options**: `node:util` `parseArgs`, one table per command plus the global ones (`-h`, `-V`, `--json=`, `-j`,
   `-q`); options anywhere (a lenient pass over the union of the tables finds the command, then a strict pass with
   its table; `--j`/`--E` rejected). Order counts like varlinkctl (`-E --timeout=5` has a timeout, `--timeout=5 -E`
-  none). `--timeout`: seconds, decimals, units `us ms s sec min h`, `infinity`/empty = none, 0 is an error; default
-  45 s; it bounds the connect and the whole call, `--more` included (sd-varlink's semantics: the CLI runs its own
+  none). `--timeout`: empty = none, else systemd's `parse_sec` (time-util.c): a sum of `NUMBER[.DIGITS][ ]UNIT`
+  terms (`1min 30s`, `1.5h`; a bare number is seconds; units by first prefix match in its table order, `seconds
+  second sec s`, `minutes minute min m`, `months month M` (30.44 d), `msec ms`, `hours hour hr h`, `days day d`,
+  `weeks week w`, `years year y` (365.25 d), `usec us µs μs`; not `nsec ns`, which are parse_nsec's), `infinity` = none; whole
+  microseconds, rounded down per term and fraction digit like `parse_time`, ≥ 2⁶⁴−1 µs fails to parse, and zero
+  after rounding is "Timeout cannot be zero."; the deadline is µs/1000 ms (fractional, the timers make it ≥ 1 ms);
+  default 45 s; it bounds the connect and the whole call, `--more` included (sd-varlink's semantics: the CLI runs its own
   deadline and sets the library's timeouts to 0, §5.1's stream timeout does not apply); beyond 2³¹−1 ms it means none.
 - **Output**: `pretty` = sd-json's (TAB, `"key" : value`, `{}`/`[]`, final LF), `short` = minimal + LF, `-j` =
-  pretty on a TTY. `call` defaults to `-j` (varlinkctl.c ~900), also for `--json=off`; the others print text unless
-  asked. Strings as `JSON.stringify`, numbers as JS prints them, bigints as integer literals.
+  pretty on a TTY (stdout and stderr both TTYs, systemd's `on_tty()`). `call` defaults to `-j` (varlinkctl.c ~900),
+  also for `--json=off`; the others print text unless asked. Strings as `JSON.stringify`, numbers as JS prints them,
+  bigints as integer literals. A reply (or error reply's parameters) holding a non-finite number (a peer's `1e400`
+  decodes to Infinity) is not printed: `Method call M() failed: reply contains a number out of range`, exit 1.
+- **Input limits**: stdin (parameters, an IDL) is read up to 16 MiB (`DEFAULT_MAX_MESSAGE_SIZE`); more is `… too
+  large (more than 16777216 bytes)`, exit 1, and reading stops.
 - **Target** (`target.ts`): `parseAddress`; `websocket` → `varlink-js/websocket` `connect`, `http` →
   `createHttpClient` (oneway → its `OperationNotSupportedError`; introspection goes to the named interface's service,
   or with none to the bridge's only service — several → a clear error), anything else → `varlink-js/node` `connect`
@@ -1283,10 +1292,14 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   --help'.`). Error reply: parameters on stdout (current format, SEQ under `--more`) unless `-q`, `Method call M()
   failed: NAME` (ExpectedMore: varlinkctl's text); local failures `Failed to connect to ADDRESS: …` / `Method call
   M() failed: <message>`; internal errors one line (`varlink-js: internal error: …`, the stack only with
-  `VARLINK_JS_DEBUG`). Stderr and text output escape C0/DEL/C1 as `\xNN` (IDL text keeps LF and TAB).
+  `VARLINK_JS_DEBUG`, escaped too, LF kept). Stderr and text output (the `certify client` lines included) escape
+  C0/DEL/C1 as `\xNN` and U+2028/U+2029 and the bidi controls (U+061C, U+200E/F, U+202A–E, U+2066–9; codegen's class)
+  as `\uNNNN` (IDL text keeps LF and TAB).
 - **Signals, EPIPE**: main.ts turns the first SIGINT/SIGTERM into `io.signal` (reason = the signal name; a second
   one exits at once); `run` closes the connection and returns 130/143 (stdin reads, connects, calls, `bridge` all
-  watch it; `certify server` shuts down and returns 0). A stdout write failing with EPIPE (`| head -1`) is a
+  watch it; `certify server` shuts down and returns 0, as USAGE says). The local commands (`validate-idl`, `format`,
+  `codegen FILE…`, help, version) are raced with the signal in `run`, so the first one stops them too (what is in
+  flight finishes unobserved). A stdout write failing with EPIPE (`| head -1`) is a
   `BrokenPipeError`: the command stops, closes, exits 0, prints nothing. `node-io.ts` opens stdin only when read and
   destroys it at the end, so the process always exits by itself.
 - **Differences from varlinkctl**: no colours, no pager, no `--no-ask-password`/polkit, no `sd_notify`
@@ -1313,9 +1326,13 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
 - **Tests**: `test/unit/cli/` (in-process `run()` with a fake `CliIo` against a service on a unix socket and
   `tcp:127.0.0.1:0`, a raw socket peer for hostile bytes, and the M10 bridge fixture for one WebSocket and one HTTP
   call; Node, Bun, Deno): every command and option, usage errors, goldens of both JSON styles, SEQ framing, int
-  precision, timeouts, `--graceful`, signals, EPIPE, escaping. `test/e2e/cli/` spawns `node src/cli/main.ts`
-  (`--version`, info, call, SEQ bytes, oneway, piped stdin, exit codes, EPIPE after closing its stdout, SIGINT →
-  130, SIGTERM → 143, bridge as a byte pipe, `certify client` ↔ `certify server` as two children).
+  precision, timeouts (the `parse_sec` table), `--graceful`, signals (sent once the phase under test is reached:
+  polled, no fixed delays), EPIPE, escaping, non-finite replies, the 16 MiB stdin cap, atomic `format -i`, bridge
+  backpressure both ways (32 MiB against a blocked stdout / a peer that does not read: the other side stalls —
+  polled until its progress counter stops — then everything arrives intact). `test/e2e/cli/` spawns `node
+  src/cli/main.ts` (`--version`, info, call, SEQ bytes, oneway, piped stdin, exit codes, EPIPE after closing its
+  stdout, SIGINT → 130, SIGTERM → 143, bridge as a byte pipe, bridge exiting by itself when the peer closes while
+  its stdin stays open, `certify client` ↔ `certify server` as two children).
 
 ---
 

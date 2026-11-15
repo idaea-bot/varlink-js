@@ -2,7 +2,7 @@
 // parsed losslessly; one reply, `--more` (JSON-SEQ, flushed per record), `--collect` (one array) or `--oneway`.
 import { isVarlinkError, jsonCodec } from "../index.ts";
 import { isQualifiedName } from "./args.ts";
-import { callFailure, expectArgs, jsonStyle, parseAddressArg, withTarget, type Context } from "./context.ts";
+import { callFailure, expectArgs, jsonStyle, parseAddressArg, printable, withTarget, type Context } from "./context.ts";
 import { BrokenPipeError, CliError, decodeUtf8, describeError, readAll, type Deadline } from "./io.ts";
 import { formatJson, type JsonStyle } from "./json.ts";
 
@@ -22,7 +22,13 @@ async function readParameters(ctx: Context, text: string | undefined): Promise<P
         "Expecting method call parameter JSON object on standard input. (Provide empty string or {} for no parameters.)",
       );
     source = "<stdin>";
-    const bytes = await readAll(ctx.io.stdin, ctx.io.signal);
+    let bytes: Uint8Array;
+    try {
+      bytes = await readAll(ctx.io.stdin, ctx.io.signal);
+    } catch (e) {
+      if (e instanceof CliError) throw new CliError(`Failed to parse parameters at <stdin>: ${e.message}`);
+      throw e;
+    }
     try {
       raw = decodeUtf8(bytes);
     } catch {
@@ -57,9 +63,10 @@ async function failed(
   style: JsonStyle,
   seq: boolean,
 ): Promise<number> {
-  if (error instanceof BrokenPipeError) throw error;
+  if (error instanceof BrokenPipeError || error instanceof CliError) throw error;
   if (!isVarlinkError(error)) throw callFailure(method, error, dl);
   const name = error.error;
+  const parameters = printable(method, error.parameters);
   const graceful = ctx.cli.graceful.includes(name);
   if (graceful) {
     if (!ctx.cli.quiet) await ctx.err(`Method call ${method}() returned expected error: ${name}`);
@@ -68,7 +75,7 @@ async function failed(
   } else {
     await ctx.err(`Method call ${method}() failed: ${name}`);
   }
-  if (!ctx.cli.quiet) await ctx.out(formatJson(error.parameters, style, seq));
+  if (!ctx.cli.quiet) await ctx.out(formatJson(parameters, style, seq));
   return graceful ? 0 : 1;
 }
 
@@ -96,8 +103,10 @@ export async function call(ctx: Context): Promise<number> {
         return 0;
       case "more":
         try {
-          for await (const reply of target.stream(method, parameters))
+          for await (const reply of target.stream(method, parameters)) {
+            printable(method, reply);
             if (!quiet) await ctx.out(formatJson(reply, style, true));
+          }
         } catch (e) {
           return failed(ctx, method, e, dl, style, true);
         }
@@ -109,6 +118,7 @@ export async function call(ctx: Context): Promise<number> {
         } catch (e) {
           return failed(ctx, method, e, dl, style, false);
         }
+        printable(method, replies);
         if (!quiet) await ctx.out(formatJson(replies, style));
         return 0;
       }
@@ -119,6 +129,7 @@ export async function call(ctx: Context): Promise<number> {
         } catch (e) {
           return failed(ctx, method, e, dl, style, false);
         }
+        printable(method, reply);
         if (!quiet) await ctx.out(formatJson(reply, style));
         return 0;
       }

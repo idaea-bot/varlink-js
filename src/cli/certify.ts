@@ -7,7 +7,7 @@ import {
   runCertificationClient,
 } from "./certification.ts";
 import { deadline, expectArgs, failureReason, parseAddressArg, type Context } from "./context.ts";
-import { aborted, CliError, describeError, UsageError } from "./io.ts";
+import { aborted, CliError, describeError, escapeControls, UsageError } from "./io.ts";
 
 /** `certify server ADDRESS`: listens until io.signal aborts (SIGINT/SIGTERM), then shuts down gracefully, exit 0. */
 async function server(ctx: Context, address: string): Promise<number> {
@@ -57,7 +57,8 @@ async function client(ctx: Context, address: string): Promise<number> {
       await runCertificationClient(conn, (line) => {
         if (!ctx.cli.quiet)
           lines = lines
-            .then(() => (writeError === undefined ? ctx.out(`${line}\n`) : undefined))
+            // The lines carry peer-controlled text (client_id, replies): escaped like all text output.
+            .then(() => (writeError === undefined ? ctx.out(`${escapeControls(line)}\n`) : undefined))
             .catch((e: unknown) => {
               writeError ??= e instanceof Error ? e : new Error(String(e));
             });
