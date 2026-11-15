@@ -1,0 +1,93 @@
+# Release to npm on a version tag (DESIGN §8, M12).
+#
+# NOT RUN YET. Publishing is Pawel's decision (DESIGN §9 Q1). Three guards keep this from publishing by accident:
+#   1. It only runs in pzmarzly/varlink-js (the `if:` on both jobs), never in a fork.
+#   2. The publish job uses the `npm-release` environment. Before the first release, create that environment
+#      in the repository settings with "Required reviewers" (Pawel) and add the NPM_TOKEN secret to it, or set
+#      up npm trusted publishing for this workflow and leave NPM_TOKEN unset. GitHub creates a referenced
+#      environment WITHOUT protection rules if it does not exist, so create it first.
+#   3. The tag must equal "v" + package.json "version"; prereleases (a version with "-") go to the `next`
+#      dist-tag, never `latest`.
+#
+# To release (after Pawel's OK): bump "version" in package.json, commit, `git tag v<version>`, push the tag,
+# then approve the deployment in the Actions tab.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify tag, lint, typecheck, test, pack
+    if: github.repository == 'pzmarzly/varlink-js'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          check-latest: true
+          cache: npm
+      - name: Tag matches package.json version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match package.json version $version"
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: mkdir -p pkg && npm pack --pack-destination pkg
+      - run: node test/fixtures/consumer/run.js --tarball pkg/varlink-js-*.tgz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: pkg/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm (manual approval)
+    needs: verify
+    if: github.repository == 'pzmarzly/varlink-js'
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-release
+      url: https://www.npmjs.com/package/varlink-js
+    permissions:
+      contents: read
+      id-token: write # npm provenance / trusted publishing
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          check-latest: true
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          name: package
+          path: pkg
+      - name: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          tarball="$(ls pkg/varlink-js-*.tgz)"
+          version="${tarball#pkg/varlink-js-}"
+          version="${version%.tgz}"
+          case "$version" in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+          npm publish "$tarball" --provenance --access public --tag "$dist_tag"
