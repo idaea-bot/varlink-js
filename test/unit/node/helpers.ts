@@ -1,5 +1,5 @@
 // Shared helpers for the Node adapter tests: temp dirs and connected socket pairs.
-import { lstat, mkdtemp, readlink, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -93,14 +93,41 @@ export async function realpathOf(path: string): Promise<string> {
   }
 }
 
+const IS_BUN = process.versions.bun !== undefined;
+const IS_DENO = "Deno" in globalThis;
+
 /**
- * Why the spawn/activation tests skip on this runtime, or false on Node. Under Bun and Deno the spawned-child paths
- * (exec: socketpair at fd 3, child fixtures, stdio bridges) fail in their node:child_process compat (M8; follow-up
- * card for Bun/Deno support).
+ * The argv that runs the `.ts` fixture `script` with the runtime running the tests: `node script`, `bun script`, or
+ * `deno run -A --no-check script`. Deno rewrites a bare `deno script` into `deno run -A …` only when `execPath` is
+ * an element of the argv it spawns. It cannot do that inside a shell script or a `#!` line, where a bare
+ * `deno script` would run without permissions.
  */
-export const SPAWN_SKIP: string | false =
-  process.versions.bun !== undefined
-    ? "Bun: spawned-child transports and activation are Node-only for now (M8 follow-up)"
-    : "Deno" in globalThis
-      ? "Deno: spawned-child transports and activation are Node-only for now (M8 follow-up)"
-      : false;
+export function childCommand(script: string): string[] {
+  return [process.execPath, ...(IS_DENO ? ["run", "-A", "--no-check"] : []), script];
+}
+
+/** Writes an executable `#!/bin/sh` script at `path` that execs {@link childCommand}(script) with its arguments. */
+export async function writeWrapper(path: string, script: string): Promise<string> {
+  const words = childCommand(script).map((w) => `"${w}"`);
+  await writeFile(path, `#!/bin/sh\nexec ${words.join(" ")} "$@"\n`);
+  await chmod(path, 0o755);
+  return path;
+}
+
+/**
+ * Bun 1.4.4: `node:child_process` does not publish the `child_process` diagnostics channel, so a test cannot run
+ * code at the moment of the spawn (the abort/timeout-during-spawn tests).
+ */
+export const BUN_NO_SPAWN_DIAGNOSTICS: string | false = IS_BUN
+  ? "Bun 1.4.4: node:child_process does not publish the child_process diagnostics channel (no hook at the spawn)"
+  : false;
+
+/**
+ * Bun 1.4.4 and Deno 2.9.8: `process.stdout.end()` on a socket stdout sends no FIN, so a stdio server's peer sees EOF
+ * only when the process exits (the must-exit rule of `listenStdio` covers it), never while it keeps running.
+ */
+export const STDOUT_END_NO_FIN: string | false = IS_BUN
+  ? "Bun 1.4.4: process.stdout.end() on a socket stdout sends no FIN (EOF only at exit)"
+  : IS_DENO
+    ? "Deno 2.9.8: process.stdout.end() on a socket stdout sends no FIN (EOF only at exit)"
+    : false;

@@ -18,14 +18,29 @@ interface PendingRead {
   reject(error: unknown): void;
 }
 
-/** A stream's `close` as a promise (resolved at once if it already closed). */
-function whenClosed(stream: Readable | Writable): Promise<void> {
-  if (stream.closed) return Promise.resolve();
-  return new Promise((resolve) => {
+/**
+ * Deno (checked on 2.9.8): `process.stdin` is a Duplex with `emitClose: false`. `destroy()` sets its `closed` flag
+ * but never emits `close`. On Deno, `closed` is also checked right after our own `destroy()` (on Node a destroyed
+ * socket sets `closed` before its fd is closed, so there only the event counts).
+ */
+const CLOSE_MAY_NOT_EMIT = "Deno" in globalThis;
+
+/** A stream's `close` as a promise (resolved at once if it already closed); `check()` re-reads `closed`. */
+function whenClosed(stream: Readable | Writable): { promise: Promise<void>; check(): void } {
+  if (stream.closed) return { promise: Promise.resolve(), check: () => undefined };
+  let done: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    done = resolve;
     stream.once("close", () => {
       resolve();
     });
   });
+  return {
+    promise,
+    check: () => {
+      if (stream.closed) done();
+    },
+  };
 }
 
 class NodeStreamsChannel implements ByteChannel {
@@ -37,6 +52,8 @@ class NodeStreamsChannel implements ByteChannel {
   /** Rejecters of writes whose callback has not fired yet: a `close` of the writable rejects them. */
   readonly #writes = new Set<(error: unknown) => void>();
   readonly #onClose: (() => void | Promise<void>) | undefined;
+  /** Resolves the close of a stream whose `closed` is set (see {@link CLOSE_MAY_NOT_EMIT}). */
+  readonly #checkClosed: () => void;
   #hook: Promise<void> | undefined;
   #reader: PendingRead | undefined;
   /** The readable ended or closed: nothing more to read once the chunks are drained. */
@@ -89,7 +106,11 @@ class NodeStreamsChannel implements ByteChannel {
     });
     if (readable.closed || readable.destroyed) this.#eof = true;
     if (writable.closed || writable.destroyed || writable.writableEnded) this.#writeShut = true;
-    this.closed = Promise.all([whenClosed(readable), whenClosed(writable)]).then(() => this.#runHook());
+    const closes = [whenClosed(readable), whenClosed(writable)];
+    this.#checkClosed = () => {
+      for (const c of closes) c.check();
+    };
+    this.closed = Promise.all(closes.map((c) => c.promise)).then(() => this.#runHook());
   }
 
   read(): Promise<ReadChunk | null> {
@@ -145,6 +166,7 @@ class NodeStreamsChannel implements ByteChannel {
     void this.#runHook();
     this.#readable.destroy();
     this.#writable.destroy();
+    if (CLOSE_MAY_NOT_EMIT) this.#checkClosed();
   }
 
   /** Runs `onClose` once; never rejects. */

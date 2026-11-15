@@ -467,10 +467,26 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
   (Playwright smoke test not done; M10 leftover).
   M8 on Bun/Deno: the registry, resolver, `mergeListeners`, `/proc` parser, stdio and `listen({fd}, {address})` tests
   run on both (Bun on macOS refuses `realpath()` of a socket with `EOPNOTSUPP`; the registry resolves such paths by
-  hand). The spawned-child paths — `exec:`, `connectBridge`, the ssh kinds and the activated-child fixtures — fail
-  in both runtimes' `node:child_process` compat (Bun: the child's fd-3 socketpair connection closes at once; Deno:
-  child fixtures and `exec:` children) and are skipped there (`SPAWN_SKIP` in `test/unit/node/helpers.ts`): Node
-  only for now, tracked by an M8 follow-up card.
+  hand). The spawned-child paths (`exec:` in both socket modes, `connectBridge`, the ssh kinds, and `listenFromEnv`
+  /`listenAuto` in an activated child) run on both too (checked on Bun 1.4.4 and Deno 2.9.8, macOS). The tests start
+  fixtures through `childCommand()` (`deno run -A --no-check` on Deno: a bare `deno script` inside a shell script
+  or a `#!` line would run without permissions). Runtime workarounds in `src/node`:
+  - Bun: `new net.Socket({ fd })` on an inherited socket fd never reads or writes, so a connected activation fd goes
+    through fs streams there. On that path `end()` sends no FIN (the peer sees EOF when the channel closes the fd).
+  - Deno: `process.stdin` never emits `close` after `destroy()` (it only sets `closed`). The streams channel checks
+    `closed` after its own `destroy()`, so `Connection.closed`/`server.closed` of a stdio server resolve.
+  - Deno: `spawn()` fails with `EBADF` when one fd fills two stdio slots, so the `/dev/null` cover of inherited
+    activation fds opens one `/dev/null` per slot.
+
+  Still skipped, as genuine runtime gaps (constants in `test/unit/node/helpers.ts`):
+  - Bun and Deno (`STDOUT_END_NO_FIN`): `process.stdout.end()` on a socket stdout sends no FIN, so a stdio server's
+    peer sees EOF only when the process exits. The must-exit rule of `listenStdio` covers it. The skipped test is
+    the bridge `--hold` one.
+  - Bun (`BUN_NO_SPAWN_DIAGNOSTICS`): `node:child_process` does not publish the `child_process` diagnostics
+    channel, which the abort/timeout-during-spawn tests use to act at the moment of the spawn. The code path itself
+    is portable.
+  - Bun: `process.getActiveResourcesInfo()` lists no timers, so the exit-on-idle "no timers once shut down" test is
+    skipped there (Deno 2.9.8 lists them).
 - **Browser**: `varlink-js/websocket` (WebSocket mode against systemd's `varlink-http-bridge` or any
   UAPI bridge). It's standardised now, so it is worth doing. No fds, as the spec says.
 - **fd passing / peer credentials**: no JS runtime exposes `SCM_RIGHTS` or `SO_PEERCRED`. Plan: a

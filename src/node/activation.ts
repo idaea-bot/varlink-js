@@ -1,7 +1,7 @@
 // Socket activation (DESIGN.md §5.8): listeners from LISTEN_FDS/LISTEN_FDNAMES, SYSTEMD_VARLINK_LISTEN, stdio.
 // Reference: sd-daemon.c (sd_listen_fds, sd_listen_fds_with_names), sd-varlink.c (sd_varlink_server_listen_name,
 // sd_varlink_server_listen_auto).
-import { lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { closeSync, createReadStream, createWriteStream, lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { Socket } from "node:net";
 import { formatAddress, type AddressSpec } from "../core/address/parse.ts";
 import { OperationNotSupportedError } from "../core/errors/local.ts";
@@ -194,10 +194,29 @@ class OneShotListener implements Listener {
   }
 }
 
+/**
+ * Bun (checked on 1.4.4): `new net.Socket({ fd })` on an inherited socket fd never reads or writes (it gets no
+ * handle, and the process exits as if nothing were pending), but fs streams over the fd work. So on Bun a connected fd
+ * goes through fs streams instead. There `end()` cannot shut the socket down (the peer sees EOF only once the fd is
+ * closed), and the channel's close closes the fd.
+ */
+const FD_SOCKET_INERT = process.versions.bun !== undefined;
+
+/** The channel over a connected activation fd. */
+function connectedChannel(fd: number): ByteChannel {
+  if (!FD_SOCKET_INERT) return fromNodeSocket(new Socket({ fd, readable: true, writable: true, allowHalfOpen: true }));
+  const readable = createReadStream("", { fd, autoClose: false });
+  const writable = createWriteStream("", { fd, autoClose: false });
+  return fromNodeStreams(readable, writable, {
+    onClose: () => {
+      closeSync(fd);
+    },
+  });
+}
+
 /** A connected activation fd: one channel over it. */
 function connectedListener(fd: number, address: string | undefined): Listener {
-  const socket = new Socket({ fd, readable: true, writable: true, allowHalfOpen: true });
-  const channel = fromNodeSocket(socket);
+  const channel = connectedChannel(fd);
   return new OneShotListener(
     address ?? `fd:${String(fd)}`,
     () => channel,

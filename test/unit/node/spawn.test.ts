@@ -11,7 +11,7 @@ import { CallTimeoutError } from "../../../src/core/errors/index.ts";
 import { connect, connectBridge, connectExec, listen } from "../../../src/node/index.ts";
 import { openBridge, openSpawned, splitCommandLine } from "../../../src/node/spawn.ts";
 import { createServer, type Connection } from "../../../src/rpc/index.ts";
-import { tempDir, SPAWN_SKIP } from "./helpers.ts";
+import { BUN_NO_SPAWN_DIAGNOSTICS, childCommand, STDOUT_END_NO_FIN, tempDir, writeWrapper } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "activation-child.ts");
@@ -27,14 +27,13 @@ interface PingReply {
 const ping = async (conn: Connection): Promise<PingReply> =>
   (await conn.call("org.example.child.Ping")) as unknown as PingReply;
 
-/** An executable `#!/bin/sh` wrapper that runs the child fixture with node (exec: needs one executable path). */
+/** The child fixture's argv under this runtime (bridges, ssh-exec). */
+const CHILD_ARGV = childCommand(CHILD);
+
+/** An executable `#!/bin/sh` wrapper that runs the child fixture with our runtime (exec: needs one executable path). */
 async function wrapper(): Promise<string> {
   const path = join(dir(), "child.sh");
-  if (!existsSync(path)) {
-    await writeFile(path, `#!/bin/sh\nexec "${process.execPath}" "${CHILD}" "$@"\n`);
-    await chmod(path, 0o755);
-  }
-  return path;
+  return existsSync(path) ? path : writeWrapper(path, CHILD);
 }
 
 const gone = (pid: number): boolean => {
@@ -54,7 +53,7 @@ const exitOf = (child: { once(ev: "exit", cb: (code: number | null, signal: stri
     });
   });
 
-describe("exec:", { skip: SPAWN_SKIP }, () => {
+describe("exec:", () => {
   // The child runs listenAuto() with the default accept: "auto" everywhere (off Linux the hint says "connected").
   test("connected (default): LISTEN_* for the child, unset by listenAuto; the child is gone after close", async () => {
     const cmd = await wrapper();
@@ -183,34 +182,42 @@ describe("exec:", { skip: SPAWN_SKIP }, () => {
   });
 
   for (const socket of ["connected", "listening"] as const)
-    test(`${socket}: an abort while the child is being spawned kills it (and removes the private directory)`, async () => {
+    test(
+      `${socket}: an abort while the child is being spawned kills it (and removes the private directory)`,
+      { skip: BUN_NO_SPAWN_DIAGNOSTICS },
+      async () => {
+        const cmd = await wrapper();
+        const ac = new AbortController();
+        const reason = new Error("stop");
+        const result = await withSpawnHook(
+          () => {
+            ac.abort(reason);
+          },
+          () => connectExec(cmd, { socket, signal: ac.signal }),
+        );
+        assert.equal(result.error, reason);
+        assert.notEqual((await result.exit).signal, null, "killed, not exited on its own");
+        assert.deepEqual(result.tmp, [], "no private directory left");
+      },
+    );
+
+  test(
+    "listening: the timeout expiring during the connect phase kills the child",
+    { skip: BUN_NO_SPAWN_DIAGNOSTICS },
+    async () => {
       const cmd = await wrapper();
-      const ac = new AbortController();
-      const reason = new Error("stop");
       const result = await withSpawnHook(
         () => {
-          ac.abort(reason);
+          // Overrun the 50 ms timeout synchronously, right at the spawn: the timer fires before the connect completes.
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120);
         },
-        () => connectExec(cmd, { socket, signal: ac.signal }),
+        () => connectExec(cmd, { socket: "listening", timeout: 50 }),
       );
-      assert.equal(result.error, reason);
-      assert.notEqual((await result.exit).signal, null, "killed, not exited on its own");
-      assert.deepEqual(result.tmp, [], "no private directory left");
-    });
-
-  test("listening: the timeout expiring during the connect phase kills the child", async () => {
-    const cmd = await wrapper();
-    const result = await withSpawnHook(
-      () => {
-        // Overrun the 50 ms timeout synchronously, right at the spawn: the timer fires before the connect completes.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120);
-      },
-      () => connectExec(cmd, { socket: "listening", timeout: 50 }),
-    );
-    assert.ok(result.error instanceof CallTimeoutError, String(result.error));
-    assert.notEqual((await result.exit).signal, null);
-    assert.deepEqual(result.tmp, []);
-  });
+      assert.ok(result.error instanceof CallTimeoutError, String(result.error));
+      assert.notEqual((await result.exit).signal, null);
+      assert.deepEqual(result.tmp, []);
+    },
+  );
 });
 
 /**
@@ -252,9 +259,9 @@ async function withSpawnHook(
   }
 }
 
-describe("bridge", { skip: SPAWN_SKIP }, () => {
+describe("bridge", () => {
   test("varlink over the child's stdio (SYSTEMD_VARLINK_LISTEN=- via env(1))", async () => {
-    const conn = await connectBridge(["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", process.execPath, CHILD], {
+    const conn = await connectBridge(["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", ...CHILD_ARGV], {
       env: { ...process.env, SYSTEMD_VARLINK_LISTEN: "/nonexistent/x", LISTEN_PID: "1" },
     });
     const reply = await ping(conn);
@@ -266,7 +273,7 @@ describe("bridge", { skip: SPAWN_SKIP }, () => {
   });
 
   test("the child exits on its own after our end() (exit-on-idle over stdio)", async () => {
-    const ch = await openBridge(["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", process.execPath, CHILD], {}, never);
+    const ch = await openBridge(["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", ...CHILD_ARGV], {}, never);
     const exited = exitOf(ch.child);
     await ch.write(new TextEncoder().encode('{"method":"org.example.child.Ping"}\0'));
     await ch.end();
@@ -278,27 +285,31 @@ describe("bridge", { skip: SPAWN_SKIP }, () => {
     await ch.closed;
   });
 
-  test("a stdio server closing its connection sends EOF while the process still runs", async () => {
-    // --hold: the child stays alive after its server closed, so EOF can only come from closing the channel.
-    const ch = await openBridge(
-      ["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", process.execPath, CHILD, "--hold"],
-      { killTimeout: 0 },
-      never,
-    );
-    await ch.write(new TextEncoder().encode('{"method":"org.example.child.Ping"}\0'));
-    await ch.end();
-    let eof = false;
-    const read = (async () => {
-      while ((await ch.read()) !== null);
-      eof = true;
-    })();
-    const deadline = new Promise((r) => setTimeout(r, 5000).unref());
-    await Promise.race([read, deadline]);
-    assert.ok(eof, "EOF before the child exited");
-    assert.equal(ch.child.exitCode, null, "the child is still running");
-    ch.close();
-    await ch.closed;
-  });
+  test(
+    "a stdio server closing its connection sends EOF while the process still runs",
+    { skip: STDOUT_END_NO_FIN },
+    async () => {
+      // --hold: the child stays alive after its server closed, so EOF can only come from closing the channel.
+      const ch = await openBridge(
+        ["/usr/bin/env", "SYSTEMD_VARLINK_LISTEN=-", ...CHILD_ARGV, "--hold"],
+        { killTimeout: 0 },
+        never,
+      );
+      await ch.write(new TextEncoder().encode('{"method":"org.example.child.Ping"}\0'));
+      await ch.end();
+      let eof = false;
+      const read = (async () => {
+        while ((await ch.read()) !== null);
+        eof = true;
+      })();
+      const deadline = new Promise((r) => setTimeout(r, 5000).unref());
+      await Promise.race([read, deadline]);
+      assert.ok(eof, "EOF before the child exited");
+      assert.equal(ch.child.exitCode, null, "the child is still running");
+      ch.close();
+      await ch.closed;
+    },
+  );
 
   test("errors", async () => {
     await assert.rejects(connectBridge([]), TypeError);
@@ -306,16 +317,15 @@ describe("bridge", { skip: SPAWN_SKIP }, () => {
   });
 });
 
-describe("ssh (fake ssh binary)", { skip: SPAWN_SKIP }, () => {
+describe("ssh (fake ssh binary)", () => {
   /** A fake ssh: logs its argv as a JSON line, then `-W path host` → pipes stdio to the unix socket, else runs the
-   *  words after the host. */
+   *  words after the host. A `/bin/sh` wrapper runs the script with our runtime. */
   async function fakeSsh(): Promise<{ ssh: string; log: string; env: Record<string, string | undefined> }> {
-    const ssh = join(dir(), "fake-ssh.mjs");
+    const script = join(dir(), "fake-ssh.mjs");
     const log = join(dir(), "ssh.log");
     await writeFile(
-      ssh,
-      `#!${process.execPath}
-import { appendFileSync } from "node:fs";
+      script,
+      `import { appendFileSync } from "node:fs";
 import { connect } from "node:net";
 import { spawn } from "node:child_process";
 const args = process.argv.slice(2);
@@ -332,7 +342,7 @@ if (args[0] === "-W") {
 }
 `,
     );
-    await chmod(ssh, 0o755);
+    const ssh = await writeWrapper(join(dir(), "fake-ssh"), script);
     await writeFile(log, "");
     return { ssh, log, env: { ...process.env, FAKE_SSH_LOG: log } };
   }
@@ -363,7 +373,8 @@ if (args[0] === "-W") {
 
   test("ssh-exec: runs `ssh -e none -T <host> env SYSTEMD_VARLINK_LISTEN=- <words…>`", async () => {
     const fake = await fakeSsh();
-    const conn = await connect(`ssh-exec:user@host:'${process.execPath}' "${CHILD}" --name=x\\tz`, {
+    const words = CHILD_ARGV.map((w) => `'${w}'`).join(" ");
+    const conn = await connect(`ssh-exec:user@host:${words} --name=x\\tz`, {
       spawn: { ssh: fake.ssh, env: fake.env },
     });
     const reply = await ping(conn);
@@ -375,8 +386,7 @@ if (args[0] === "-W") {
       "user@host",
       "env",
       "SYSTEMD_VARLINK_LISTEN=-",
-      process.execPath,
-      CHILD,
+      ...CHILD_ARGV,
       "--name=x\tz",
     ]);
     await conn.close();
@@ -388,7 +398,7 @@ if (args[0] === "-W") {
     const saved = process.env.SYSTEMD_SSH;
     process.env.SYSTEMD_SSH = fake.ssh;
     try {
-      const conn = await connect(`ssh-exec:h:${process.execPath} ${CHILD}`, { spawn: { env: fake.env } });
+      const conn = await connect(`ssh-exec:h:${CHILD_ARGV.join(" ")}`, { spawn: { env: fake.env } });
       assert.equal(typeof (await ping(conn)).pid, "number");
       await conn.close();
       await conn.closed;

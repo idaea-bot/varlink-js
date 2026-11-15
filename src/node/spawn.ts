@@ -379,17 +379,25 @@ function spawnChild(file: string, args: readonly string[], o: CheckedProcessOpti
   const slots = [...stdio];
   const uncovered = uncoveredActivationFds(slots.length);
   if (uncovered.length === 0) return new ChildHandle(spawn(file, args, { ...options, stdio }), o.killTimeout);
-  // One /dev/null per spawn, which libuv dup2s onto each slot; ours is closed once the child has its copies.
-  const devNull = openSync("/dev/null", "r+");
+  // One /dev/null per slot (Deno 2.9.8 fails the spawn with EBADF if one fd fills two slots); ours are closed once the
+  // child has its copies.
+  const devNulls: number[] = [];
   let open = true;
   const release = (): void => {
     if (!open) return;
     open = false;
-    closeSync(devNull);
+    for (const fd of devNulls) closeSync(fd);
   };
-  for (const fd of uncovered) {
-    while (slots.length < fd) slots.push("ignore");
-    slots[fd] = devNull;
+  try {
+    for (const fd of uncovered) {
+      while (slots.length < fd) slots.push("ignore");
+      const devNull = openSync("/dev/null", "r+");
+      devNulls.push(devNull);
+      slots[fd] = devNull;
+    }
+  } catch (e) {
+    release();
+    throw e;
   }
   let child: ChildProcess;
   try {

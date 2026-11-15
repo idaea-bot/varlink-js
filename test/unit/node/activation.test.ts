@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { existsSync, readdirSync, readlinkSync } from "node:fs";
-import { chmod, mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { describe, test } from "node:test";
@@ -12,7 +12,7 @@ import { procLookup, procSockets } from "../../../src/node/activation.ts";
 import { connect, fromNodeSocket, listen, listenStdio, mergeListeners } from "../../../src/node/index.ts";
 import { createConnection, createServer, type Connection } from "../../../src/rpc/index.ts";
 import { pair } from "../../../src/testing/index.ts";
-import { closeServer, listening, tempDir, turns, SPAWN_SKIP } from "./helpers.ts";
+import { childCommand, closeServer, listening, tempDir, turns, writeWrapper } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "activation-child.ts");
@@ -69,14 +69,11 @@ function activate(a: Activation): { child: ChildProcess; exited: Promise<number 
   if (pid === "other") env.LISTEN_PID = "1";
   const fds = a.fds ?? [];
   const stdio: StdioOptions = ["ignore", "pipe", "inherit", ...fds];
-  const args = [CHILD, ...(a.args ?? [])];
+  const [file = "", ...args] = [...childCommand(CHILD), ...(a.args ?? [])];
   const child: ChildProcess =
     pid === "own"
-      ? spawn("/bin/sh", ["-c", a.hint === true ? HINT_SCRIPT : LISTEN_PID_SCRIPT, process.execPath, ...args], {
-          stdio,
-          env,
-        })
-      : spawn(process.execPath, args, { stdio, env });
+      ? spawn("/bin/sh", ["-c", a.hint === true ? HINT_SCRIPT : LISTEN_PID_SCRIPT, file, ...args], { stdio, env })
+      : spawn(file, args, { stdio, env });
   const exited = new Promise<number | null>((r) => child.once("exit", r));
   const sockets: Socket[] = [];
   const pipes = child.stdio as unknown as (Socket | null)[];
@@ -121,7 +118,7 @@ interface PingReply {
 const ping = async (conn: Connection): Promise<PingReply> =>
   (await conn.call("org.example.child.Ping")) as unknown as PingReply;
 
-describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
+describe("listenFromEnv in an activated child", () => {
   test(
     "the /proc bind path is the address while a socket is there; a non-socket there gives fd:<n>",
     { skip: LINUX ? false : "needs Linux /proc" },
@@ -313,9 +310,7 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
     async () => {
       const a = await unixSocket("cloexec-xa");
       const b = await unixSocket("cloexec-xb");
-      const cmd = join(dir(), "child.sh");
-      await writeFile(cmd, `#!/bin/sh\nexec "${process.execPath}" "${CHILD}" "$@"\n`);
-      await chmod(cmd, 0o755);
+      const cmd = await writeWrapper(join(dir(), "child.sh"), CHILD);
       try {
         const r = await report({
           fds: [a.fd, b.fd],
@@ -377,11 +372,13 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
   });
 
   test("selection by name among several fds; empty names count", async () => {
+    // Three distinct sockets: Deno (2.9.8) cannot spawn with one fd in two stdio slots (EBADF).
     const a = await unixSocket("n-a");
     const b = await unixSocket("n-b");
+    const c = await unixSocket("n-c");
     try {
       const env = { LISTEN_FDS: "3", LISTEN_FDNAMES: "other::varlink" };
-      const fds = [a.fd, b.fd, b.fd];
+      const fds = [a.fd, b.fd, c.fd];
       const byDefault = await report({ fds, env, args: ["--accept=listening"] });
       assert.equal(byDefault.address, "fd:5");
       const named = await report({ fds, env, args: ["--accept=listening", "--name=other"] });
@@ -391,6 +388,7 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
     } finally {
       await closeServer(a.server);
       await closeServer(b.server);
+      await closeServer(c.server);
     }
   });
 
@@ -416,13 +414,16 @@ describe("listenFromEnv in an activated child", { skip: SPAWN_SKIP }, () => {
 
   test("without LISTEN_FDNAMES a single fd is used, several are not", async () => {
     const a = await unixSocket("u-a");
+    const b = await unixSocket("u-b");
     try {
       const one = await report({ fds: [a.fd], env: { LISTEN_FDS: "1" }, args: ["--accept=listening"] });
       assert.equal(one.result, "listener");
-      const two = await report({ fds: [a.fd, a.fd], env: { LISTEN_FDS: "2" } });
+      // Two distinct sockets: Deno (2.9.8) cannot spawn with one fd in two stdio slots (EBADF).
+      const two = await report({ fds: [a.fd, b.fd], env: { LISTEN_FDS: "2" } });
       assert.equal(two.result, "null");
     } finally {
       await closeServer(a.server);
+      await closeServer(b.server);
     }
   });
 

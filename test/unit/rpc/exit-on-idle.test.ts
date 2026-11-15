@@ -90,9 +90,12 @@ describe("exitOnIdle", () => {
 
   test(
     "no timers once shut down (shutdown before expiry)",
-    // process.getActiveResourcesInfo() is Node's; Bun and Deno do not report Timeouts through it.
+    // process.getActiveResourcesInfo(): Node and Deno 2.9.8 list a pending timer as "Timeout"; Bun 1.4.4 lists none.
     {
-      skip: process.versions.bun !== undefined || "Deno" in globalThis ? "needs Node's getActiveResourcesInfo" : false,
+      skip:
+        process.versions.bun === undefined
+          ? false
+          : 'Bun 1.4.4: process.getActiveResourcesInfo() does not list pending timers (no "Timeout" entries)',
     },
     async () => {
       const timeouts = (): number => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
