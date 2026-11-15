@@ -81,8 +81,9 @@ export function openSocket(spec: AddressSpec, timeout: number, signal: AbortSign
  * Connects to a varlink service (DESIGN.md §5.1) and returns a {@link Connection} over the socket. Supported here:
  * `unix:/path` (and bare paths), `unix:@name` (Linux only), `tcp:host:port` (`TCP_NODELAY` on), and the spawned
  * kinds `exec:/path`, `ssh-unix:host:/path` (alias `ssh:`), `ssh-exec:host:cmdline` (§5.8: process options in
- * `options.spawn`, see `connectExec`). Other kinds reject with `OperationNotSupportedError` (WebSocket/HTTP come in a
- * later milestone). The connect phase is
+ * `options.spawn`, see `connectExec`). Other kinds reject with `OperationNotSupportedError`: WebSocket addresses are
+ * dialed by `connect` from `varlink-js/websocket`, HTTP ones by `createHttpClient` from `varlink-js/http`. The
+ * connect phase is
  * bounded by `options.timeout` (default 45 s, 0 = none; expiry rejects with `CallTimeoutError("connect timed out")`)
  * and `options.signal` (rejects with its reason); the socket is destroyed on either. Connection errors (`ENOENT`,
  * `ECONNREFUSED`, …) reject with the Node error. Sockets are half-open capable (`allowHalfOpen`).
