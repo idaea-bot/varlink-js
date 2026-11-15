@@ -186,7 +186,9 @@ describe("fromNodeStreams over a child's stdout/stdin (cat)", () => {
 describe("fromNodeStreams over streams that never emit close (Deno process.stdin)", () => {
   // As of Deno 2.9.8 a socket process.stdin is such a Duplex; on Node and Bun only the close event counts.
   const skip =
-    process.versions.deno === undefined ? "Deno-only path (emitClose: false streams re-check closed)" : false;
+    process.versions.deno === undefined
+      ? "Deno-only path (emitClose: false streams count a completed _destroy as close)"
+      : false;
   const silent = (destroy?: Duplex["_destroy"], allowHalfOpen = true): Duplex =>
     new Duplex({
       emitClose: false,

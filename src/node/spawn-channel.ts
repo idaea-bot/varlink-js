@@ -25,7 +25,8 @@ interface PendingRead {
  * (which emits `close` itself once its fd is closed), the stream's close also counts as done when its `_destroy`
  * calls back (the stream machinery sets `closed` there), whoever destroyed it: our `close()`, or the stream itself
  * (auto-destroy after EOF, an error). `stream.finished()` cannot stand in: for such a stream it fires on `end` or
- * `finish` alone and never on a destroy. Everywhere else only the event counts (on Node a destroyed socket sets
+ * `finish` alone and never on a destroy. A stream already being destroyed when the channel is built counts as
+ * closed at once (its `_destroy` callback can no longer be seen). Everywhere else only the event counts (on Node a destroyed socket sets
  * `closed` before its fd is closed).
  */
 const IS_DENO = process.versions.deno !== undefined;
@@ -61,12 +62,25 @@ function whenClosed(stream: Readable | Writable, role: "readable" | "writable"):
     // Every destroy path goes through it; once it calls back, the machinery has set `closed`.
     const target = stream as unknown as { _destroy: DestroyFn };
     const inner = target._destroy;
+    // Resolves however the destroy ends: `callback` throwing, or `inner` throwing (the machinery then finishes the
+    // destroy itself and our callback never runs).
+    const done = (): void => {
+      stream.off("close", onClose);
+      resolve();
+    };
     target._destroy = function (this: unknown, error, callback) {
-      inner.call(this, error, (err) => {
-        callback(err);
-        stream.off("close", onClose);
-        resolve();
-      });
+      try {
+        inner.call(this, error, (err) => {
+          try {
+            callback(err);
+          } finally {
+            done();
+          }
+        });
+      } catch (e) {
+        done();
+        throw e;
+      }
     };
   });
 }

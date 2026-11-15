@@ -475,12 +475,14 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
     real socket over it there (reads, writes, `end()` sends a FIN, `destroy()` closes the fd; blocking and
     `O_NONBLOCK` fds alike), so a connected activation fd goes through it on Bun. Node and Deno reject
     `net.connect({ fd })` (no port or path) and keep `new net.Socket({ fd })`. `test/unit/node/connected-fd.test.ts`
-    checks half-close, close and the fd on every runtime.
+    checks half-close and close on every runtime, and that the fd is released on Node and Bun (on Deno an inherited
+    fd taken by the runtime is not visible to `fstatSync`, so that check proves little there).
   - Deno: a socket `process.stdin` is a plain Duplex with `emitClose: false` that never emits `close` after
     `destroy()` (it only sets `closed`). For such a stream (`emitClose: false` and not a `net.Socket`, which emits
     `close` itself), on Deno only, the streams channel also counts the stream as closed once its `_destroy` calls
     back (it wraps it; `closed` is set there), whoever destroyed it (our `close()`, auto-destroy after EOF, an
-    error), so `Connection.closed`/`server.closed` of a stdio server resolve. A clean `end` alone does not count.
+    error), so `Connection.closed`/`server.closed` of a stdio server resolve. A clean `end` alone does not count; a
+    stream already being destroyed when the channel is built counts as closed at once.
     `stream.finished()` cannot do it: for such a stream it fires on `end`/`finish` and never on a destroy. Child
     pipes (`net.Socket`s) still wait for the event.
   - Deno: `spawn()` fails with `EBADF` when one fd fills two stdio slots, so the `/dev/null` cover of inherited
