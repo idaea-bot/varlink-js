@@ -107,10 +107,9 @@ async function replaceFile(file: string, text: string): Promise<void> {
     return;
   }
   try {
-    // Best effort: keep the owner (only root or the owner of both may; EPERM is ignored).
-    await chown(temp, st.uid, st.gid).catch((e: unknown) => {
-      if ((e as NodeJS.ErrnoException).code !== "EPERM") throw e;
-    });
+    // Best effort: keep the owner (only root or the owner of both may). Any error is ignored (EPERM for a
+    // non-owner, EINVAL for an owner unmapped in a user namespace, others on network/FUSE filesystems).
+    await chown(temp, st.uid, st.gid).catch(() => undefined);
     // writeFile's mode is filtered by the umask; set it exactly (after chown, which may clear setuid/setgid).
     await chmod(temp, mode);
     await rename(temp, target);

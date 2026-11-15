@@ -54,7 +54,7 @@ function output(stream: NodeJS.WriteStream, fd: number): CliOutput {
  *
  * Limit: an `exec:`/`ssh-*` child is SIGTERMed when the connection closes and SIGKILLed only after the library's
  * killTimeout (2 s). A second signal during that wait exits before the SIGKILL, so a child that ignores SIGTERM
- * outlives the CLI; the Connection does not expose the child, so the CLI cannot kill it itself (DESIGN.md §4.14).
+ * outlives the CLI; the Connection does not expose the child, so the CLI cannot SIGKILL it on demand (DESIGN.md §4.14).
  */
 export function nodeIo(): NodeIo {
   const controller = new AbortController();

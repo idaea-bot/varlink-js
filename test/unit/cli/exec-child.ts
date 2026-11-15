@@ -1,4 +1,4 @@
-// Child process for the CLI's exec: tests (test/unit/cli/exec.test.ts): `listenAuto()`, then serves
+// Child process for the CLI's exec: tests (test/unit/cli/call.test.ts): `listenAuto()`, then serves
 // org.example.execchild (Answer replies with its pid; Hang never answers and first creates `<state>/hang`, so a test
 // knows the call is in flight). Never writes to stdout. Flag: --state=<dir> (required).
 import { writeFileSync } from "node:fs";

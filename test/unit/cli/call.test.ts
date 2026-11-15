@@ -248,7 +248,9 @@ describe("call: error replies", () => {
 
 // exec: through varlink-js/node's connect (DESIGN.md §4.7): a real child (exec-child.ts) on a socketpair. Spawned
 // children are Node-only for now, so these skip under Bun and Deno like the src/node spawn tests.
-describe("call over exec:", { skip: SPAWN_SKIP }, () => {
+const EXEC_SKIP: string | false =
+  SPAWN_SKIP || (process.platform === "win32" ? "Windows: the exec: fixtures are /bin/sh scripts" : false);
+describe("call over exec:", { skip: EXEC_SKIP }, () => {
   let state: { path: string; remove(): Promise<void> };
   before(async () => {
     state = await tempDir();
@@ -309,8 +311,12 @@ describe("call over exec:", { skip: SPAWN_SKIP }, () => {
     const c = await child();
     const controller = new AbortController();
     const running = runCli(["call", c.address, "org.example.execchild.Hang", "{}"], { signal: controller.signal });
-    await waitFor(() => c.hanging(), 20_000);
-    controller.abort("SIGINT");
+    try {
+      await waitFor(() => c.hanging(), 20_000);
+    } finally {
+      // Also on a failed wait: otherwise the hanging call and its child keep the test file alive.
+      controller.abort("SIGINT");
+    }
     const r = await running;
     assert.equal(r.code, 130);
     assert.equal(r.stdout, "");
@@ -326,7 +332,8 @@ describe("call over exec:", { skip: SPAWN_SKIP }, () => {
     const r = await runCli(["call", `exec:${wrapper}`, "a.b.C", "{}"]);
     assert.equal(r.code, 1);
     assert.equal(r.stdout, "");
-    assert.equal(r.stderr, "Method call a.b.C() failed: connection closed by peer\n");
+    // A clean EOF, or ECONNRESET when the child exits with our request unread (Linux; seen on CI).
+    assert.match(r.stderr, /^Method call a\.b\.C\(\) failed: (connection closed by peer|connection lost: [^\n]*)\n$/);
   });
 
   test("a missing executable: `Failed to connect to exec:…: … ENOENT`, exit 1", async () => {
