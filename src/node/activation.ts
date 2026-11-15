@@ -1,8 +1,8 @@
 // Socket activation (DESIGN.md §5.8): listeners from LISTEN_FDS/LISTEN_FDNAMES, SYSTEMD_VARLINK_LISTEN, stdio.
 // Reference: sd-daemon.c (sd_listen_fds, sd_listen_fds_with_names), sd-varlink.c (sd_varlink_server_listen_name,
 // sd_varlink_server_listen_auto).
-import { closeSync, createReadStream, createWriteStream, lstatSync, readFileSync, readlinkSync } from "node:fs";
-import { Socket } from "node:net";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { connect, Socket, type NetConnectOpts } from "node:net";
 import { formatAddress, type AddressSpec } from "../core/address/parse.ts";
 import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
@@ -195,23 +195,19 @@ class OneShotListener implements Listener {
 }
 
 /**
- * Bun (checked on 1.4.4): `new net.Socket({ fd })` on an inherited socket fd never reads or writes (it gets no
- * handle, and the process exits as if nothing were pending), but fs streams over the fd work. So on Bun a connected fd
- * goes through fs streams instead. There `end()` cannot shut the socket down (the peer sees EOF only once the fd is
- * closed), and the channel's close closes the fd.
+ * Bun (as of 1.4.4): `new net.Socket({ fd })` on an inherited socket fd never reads or writes (it gets no handle,
+ * and the process exits as if nothing were pending), but `net.connect({ fd })` opens a real socket over it: reads,
+ * writes, `end()` sends a FIN, `destroy()` closes the fd, for blocking and `O_NONBLOCK` fds alike. Node and Deno
+ * reject `net.connect({ fd })` (no port or path), so only Bun takes that path.
  */
-const FD_SOCKET_INERT = process.versions.bun !== undefined;
+const FD_NEEDS_CONNECT = process.versions.bun !== undefined;
 
-/** The channel over a connected activation fd. */
-function connectedChannel(fd: number): ByteChannel {
-  if (!FD_SOCKET_INERT) return fromNodeSocket(new Socket({ fd, readable: true, writable: true, allowHalfOpen: true }));
-  const readable = createReadStream("", { fd, autoClose: false });
-  const writable = createWriteStream("", { fd, autoClose: false });
-  return fromNodeStreams(readable, writable, {
-    onClose: () => {
-      closeSync(fd);
-    },
-  });
+/** The channel over a connected activation fd (exported for tests); closing it closes the fd. */
+export function connectedChannel(fd: number): ByteChannel {
+  const socket = FD_NEEDS_CONNECT
+    ? connect({ fd, allowHalfOpen: true } as unknown as NetConnectOpts)
+    : new Socket({ fd, readable: true, writable: true, allowHalfOpen: true });
+  return fromNodeSocket(socket);
 }
 
 /** A connected activation fd: one channel over it. */

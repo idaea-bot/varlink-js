@@ -4,12 +4,12 @@ import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import diagnostics from "node:diagnostics_channel";
 import { chmod, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { describe, test } from "node:test";
 import { CallTimeoutError } from "../../../src/core/errors/index.ts";
 import { connect, connectBridge, connectExec, listen } from "../../../src/node/index.ts";
-import { openBridge, openSpawned, splitCommandLine } from "../../../src/node/spawn.ts";
+import { openBridge, openDevNulls, openSpawned, splitCommandLine } from "../../../src/node/spawn.ts";
 import { createServer, type Connection } from "../../../src/rpc/index.ts";
 import { BUN_NO_SPAWN_DIAGNOSTICS, childCommand, STDOUT_END_NO_FIN, tempDir, writeWrapper } from "./helpers.ts";
 
@@ -471,5 +471,29 @@ describe("splitCommandLine (sd-varlink strv_split_full UNQUOTE|CUNESCAPE)", () =
       "\\U00110000",
     ])
       assert.throws(() => splitCommandLine(bad), TypeError, JSON.stringify(bad));
+  });
+});
+
+describe("openDevNulls (the /dev/null cover of inherited activation fds)", () => {
+  test("one fd per slot; an open failing partway closes the ones opened before it", () => {
+    const fds = openDevNulls(2);
+    assert.equal(fds.length, 2);
+    assert.notEqual(fds[0], fds[1]);
+    for (const fd of fds) closeSync(fd);
+
+    const opened: number[] = [];
+    const failure = new Error("EMFILE (stubbed)");
+    const open = (): number => {
+      if (opened.length === 2) throw failure;
+      const fd = openSync("/dev/null", "r+");
+      opened.push(fd);
+      return fd;
+    };
+    assert.throws(
+      () => openDevNulls(3, open),
+      (e) => e === failure,
+    );
+    assert.equal(opened.length, 2);
+    for (const fd of opened) assert.throws(() => fstatSync(fd), { code: "EBADF" });
   });
 });

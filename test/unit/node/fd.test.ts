@@ -6,7 +6,7 @@ import { createServer as createNetServer, type Server as NetServer } from "node:
 import { join, resolve } from "node:path";
 import { describe, test } from "node:test";
 import { connect } from "../../../src/node/index.ts";
-import { closeServer, listening, tempDir } from "./helpers.ts";
+import { childCommand, closeServer, listening, tempDir } from "./helpers.ts";
 
 const dir = tempDir();
 const CHILD = resolve(import.meta.dirname, "fd-child.ts");
@@ -21,7 +21,8 @@ function fdOf(server: NetServer): number | undefined {
 async function throughChild(server: NetServer, dial: (printed: string) => string): Promise<string> {
   const fd = fdOf(server);
   assert.ok(fd !== undefined);
-  const child = spawn(process.execPath, [CHILD], { stdio: ["pipe", "pipe", "inherit", fd] });
+  const [file = "", ...args] = childCommand(CHILD);
+  const child = spawn(file, args, { stdio: ["pipe", "pipe", "inherit", fd] });
   const exited = new Promise<number | null>((r) => child.once("exit", r));
   const { stdin, stdout } = child;
   assert.ok(stdin !== null && stdout !== null);

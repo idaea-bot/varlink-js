@@ -5,11 +5,13 @@
 // --linger (ignore SIGTERM, no exit-on-idle: stays until SIGKILL), --report (print the listenAuto outcome as one
 // JSON line on stdout and exit, without serving), --fd-address=<address> (report `listen({fd: 3}, {address})`;
 // with --registry=<dir> it serves it with that registry, shuts down and reports the directory's entries instead),
-// --grandchild (with --report: also report what a bridge grandchild sees on our activation fd numbers, Linux),
+// --grandchild (with --report: also report what a bridge grandchild, fd-links-child.ts, sees on our activation fd
+// numbers, Linux),
 // --grandchild-exec=<cmd> (the same through an `exec:` grandchild with a listening socket, `cmd` being this
 // fixture's wrapper; Ping reports fds 3…6 as /proc shows them),
 // --hold (after the server closed, stay alive instead of exiting, until signalled).
 import { existsSync, readdirSync, readlinkSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Listener } from "../../../src/core/protocol/index.ts";
 import { connectExec, listen, listenAuto } from "../../../src/node/index.ts";
 import { openBridge } from "../../../src/node/spawn.ts";
@@ -19,6 +21,9 @@ const IDL = `interface org.example.child
 
 method Ping() -> (pid: int, before: object, after: object, address: string, argv: []string, fds: object)
 `;
+
+/** The --grandchild bridge's script: prints what /proc/self/fd/<n> is for the fd numbers in its argv. */
+const FD_LINKS = resolve(import.meta.dirname, "fd-links-child.ts");
 
 const VARS = [
   "LISTEN_PID",
@@ -114,10 +119,10 @@ async function grandchild(): Promise<{ ours: Record<string, string>; theirs: Rec
     await conn.closed;
     return { ours, theirs: reply.fds };
   }
-  const script = `const fs = require("node:fs"); const out = {};
-for (const fd of ${JSON.stringify(fds)}) { try { out[fd] = fs.readlinkSync("/proc/self/fd/" + fd); } catch { out[fd] = null; } }
-process.stdout.write(JSON.stringify(out));`;
-  const ch = await openBridge([process.execPath, "-e", script], {}, new AbortController().signal);
+  // helpers.ts' childCommand(), inlined (helpers.ts imports node:test).
+  const deno = process.versions.deno === undefined ? [] : ["run", "-A", "--no-check"];
+  const argv = [process.execPath, ...deno, FD_LINKS, ...fds.map(String)];
+  const ch = await openBridge(argv, {}, new AbortController().signal);
   let text = "";
   for (let chunk = await ch.read(); chunk !== null; chunk = await ch.read())
     text += new TextDecoder().decode(chunk.bytes);

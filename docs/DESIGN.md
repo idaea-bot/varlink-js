@@ -471,14 +471,23 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
   /`listenAuto` in an activated child) run on both too (checked on Bun 1.4.4 and Deno 2.9.8, macOS). The tests start
   fixtures through `childCommand()` (`deno run -A --no-check` on Deno: a bare `deno script` inside a shell script
   or a `#!` line would run without permissions). Runtime workarounds in `src/node`:
-  - Bun: `new net.Socket({ fd })` on an inherited socket fd never reads or writes, so a connected activation fd goes
-    through fs streams there. On that path `end()` sends no FIN (the peer sees EOF when the channel closes the fd).
-  - Deno: `process.stdin` never emits `close` after `destroy()` (it only sets `closed`). The streams channel checks
-    `closed` after its own `destroy()`, so `Connection.closed`/`server.closed` of a stdio server resolve.
+  - Bun: `new net.Socket({ fd })` on an inherited socket fd never reads or writes. `net.connect({ fd })` does open a
+    real socket over it there (reads, writes, `end()` sends a FIN, `destroy()` closes the fd; blocking and
+    `O_NONBLOCK` fds alike), so a connected activation fd goes through it on Bun. Node and Deno reject
+    `net.connect({ fd })` (no port or path) and keep `new net.Socket({ fd })`. `test/unit/node/connected-fd.test.ts`
+    checks half-close, close and the fd on every runtime.
+  - Deno: a socket `process.stdin` is a plain Duplex with `emitClose: false` that never emits `close` after
+    `destroy()` (it only sets `closed`). For such a stream (`emitClose: false` and not a `net.Socket`, which emits
+    `close` itself), on Deno only, the streams channel checks `closed` after its own `destroy()`, right away and a
+    turn later, so `Connection.closed`/`server.closed` of a stdio server resolve. Child pipes (`net.Socket`s) still
+    wait for the event.
   - Deno: `spawn()` fails with `EBADF` when one fd fills two stdio slots, so the `/dev/null` cover of inherited
     activation fds opens one `/dev/null` per slot.
 
-  Still skipped, as genuine runtime gaps (constants in `test/unit/node/helpers.ts`):
+  Still skipped, as genuine runtime gaps (as of Bun 1.4.4 and Deno 2.9.8; constants in
+  `test/unit/node/helpers.ts`):
+  - Deno: the `O_NONBLOCK` (accepted unix socket) half of `connected-fd.test.ts`: a Deno `net.Socket` has no real fd
+    (`_handle.fd`) to hand to a child. The socketpair half runs.
   - Bun and Deno (`STDOUT_END_NO_FIN`): `process.stdout.end()` on a socket stdout sends no FIN, so a stdio server's
     peer sees EOF only when the process exits. The must-exit rule of `listenStdio` covers it. The skipped test is
     the bridge `--hold` one.

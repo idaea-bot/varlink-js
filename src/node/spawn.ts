@@ -371,6 +371,21 @@ function uncoveredActivationFds(slots: number): number[] {
 }
 
 /**
+ * `count` fds from `open` (default: `/dev/null` read-write). If one open fails, those already opened are closed and
+ * the error is thrown. Exported for tests (`open` stubs a failure).
+ */
+export function openDevNulls(count: number, open: () => number = () => openSync("/dev/null", "r+")): number[] {
+  const fds: number[] = [];
+  try {
+    for (let i = 0; i < count; i++) fds.push(open());
+  } catch (e) {
+    for (const fd of fds) closeSync(fd);
+    throw e;
+  }
+  return fds;
+}
+
+/**
  * Spawns with `stdio` extended by `/dev/null` on every uncovered activation fd: those are not close-on-exec (Node
  * cannot set FD_CLOEXEC), and our children must not get them. They are contiguous from 3, so the array gets no gaps.
  */
@@ -381,24 +396,17 @@ function spawnChild(file: string, args: readonly string[], o: CheckedProcessOpti
   if (uncovered.length === 0) return new ChildHandle(spawn(file, args, { ...options, stdio }), o.killTimeout);
   // One /dev/null per slot (Deno 2.9.8 fails the spawn with EBADF if one fd fills two slots); ours are closed once the
   // child has its copies.
-  const devNulls: number[] = [];
+  const devNulls = openDevNulls(uncovered.length);
   let open = true;
   const release = (): void => {
     if (!open) return;
     open = false;
     for (const fd of devNulls) closeSync(fd);
   };
-  try {
-    for (const fd of uncovered) {
-      while (slots.length < fd) slots.push("ignore");
-      const devNull = openSync("/dev/null", "r+");
-      devNulls.push(devNull);
-      slots[fd] = devNull;
-    }
-  } catch (e) {
-    release();
-    throw e;
-  }
+  uncovered.forEach((fd, i) => {
+    while (slots.length < fd) slots.push("ignore");
+    slots[fd] = devNulls[i];
+  });
   let child: ChildProcess;
   try {
     child = spawn(file, args, { ...options, stdio: slots });

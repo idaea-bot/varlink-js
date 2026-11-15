@@ -95,7 +95,7 @@ describe("exitOnIdle", () => {
       skip:
         process.versions.bun === undefined
           ? false
-          : 'Bun 1.4.4: process.getActiveResourcesInfo() does not list pending timers (no "Timeout" entries)',
+          : 'as of Bun 1.4.4, process.getActiveResourcesInfo() does not list pending timers (no "Timeout" entries)',
     },
     async () => {
       const timeouts = (): number => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;

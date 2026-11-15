@@ -1,7 +1,7 @@
 // fromNodeStreams (DESIGN.md §4.1, §5.8): a ByteChannel over a Readable + Writable pair.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { PassThrough } from "node:stream";
+import { Duplex, PassThrough } from "node:stream";
 import { describe, test } from "node:test";
 import { ConnectionClosedError } from "../../../src/core/errors/index.ts";
 import { fromNodeStreams } from "../../../src/node/index.ts";
@@ -180,5 +180,44 @@ describe("fromNodeStreams over a child's stdout/stdin (cat)", () => {
     assert.equal(failures, 1);
     ch.close();
     await ch.closed;
+  });
+});
+
+describe("fromNodeStreams over streams that never emit close (Deno process.stdin)", () => {
+  // As of Deno 2.9.8 a socket process.stdin is such a Duplex; on Node and Bun only the close event counts.
+  const skip =
+    process.versions.deno === undefined ? "Deno-only path (emitClose: false streams re-check closed)" : false;
+  const silent = (destroy?: Duplex["_destroy"]): Duplex =>
+    new Duplex({
+      emitClose: false,
+      read: () => undefined,
+      write: (_chunk, _encoding, callback) => {
+        callback();
+      },
+      ...(destroy === undefined ? {} : { destroy }),
+    });
+
+  test("closed resolves after close(), and the close listeners for it are dropped", { skip }, async () => {
+    const duplex = silent();
+    const ch = fromNodeStreams(duplex, duplex);
+    const listeners = duplex.listenerCount("close");
+    ch.close();
+    await ch.closed;
+    assert.ok(duplex.closed);
+    // One per role (readable, writable) waited for the event that never comes.
+    assert.equal(duplex.listenerCount("close"), listeners - 2);
+  });
+
+  test("closed resolves when an asynchronous _destroy sets closed a turn later", { skip }, async () => {
+    const duplex = silent((error, callback) => {
+      setImmediate(() => {
+        callback(error);
+      });
+    });
+    const ch = fromNodeStreams(duplex, duplex);
+    ch.close();
+    assert.equal(duplex.closed, false);
+    await ch.closed;
+    assert.ok(duplex.closed);
   });
 });

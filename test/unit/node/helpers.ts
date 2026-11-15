@@ -94,7 +94,7 @@ export async function realpathOf(path: string): Promise<string> {
 }
 
 const IS_BUN = process.versions.bun !== undefined;
-const IS_DENO = "Deno" in globalThis;
+const IS_DENO = process.versions.deno !== undefined;
 
 /**
  * The argv that runs the `.ts` fixture `script` with the runtime running the tests: `node script`, `bun script`, or
@@ -115,19 +115,19 @@ export async function writeWrapper(path: string, script: string): Promise<string
 }
 
 /**
- * Bun 1.4.4: `node:child_process` does not publish the `child_process` diagnostics channel, so a test cannot run
- * code at the moment of the spawn (the abort/timeout-during-spawn tests).
+ * As of Bun 1.4.4, `node:child_process` does not publish the `child_process` diagnostics channel, so a test cannot
+ * run code at the moment of the spawn (the abort/timeout-during-spawn tests).
  */
 export const BUN_NO_SPAWN_DIAGNOSTICS: string | false = IS_BUN
-  ? "Bun 1.4.4: node:child_process does not publish the child_process diagnostics channel (no hook at the spawn)"
+  ? "as of Bun 1.4.4, node:child_process does not publish the child_process diagnostics channel (no hook at the spawn)"
   : false;
 
 /**
- * Bun 1.4.4 and Deno 2.9.8: `process.stdout.end()` on a socket stdout sends no FIN, so a stdio server's peer sees EOF
- * only when the process exits (the must-exit rule of `listenStdio` covers it), never while it keeps running.
+ * As of Bun 1.4.4 and Deno 2.9.8, `process.stdout.end()` on a socket stdout sends no FIN, so a stdio server's peer
+ * sees EOF only when the process exits (the must-exit rule of `listenStdio` covers it), never while it keeps running.
  */
 export const STDOUT_END_NO_FIN: string | false = IS_BUN
-  ? "Bun 1.4.4: process.stdout.end() on a socket stdout sends no FIN (EOF only at exit)"
+  ? "as of Bun 1.4.4, process.stdout.end() on a socket stdout sends no FIN (EOF only at exit)"
   : IS_DENO
-    ? "Deno 2.9.8: process.stdout.end() on a socket stdout sends no FIN (EOF only at exit)"
+    ? "as of Deno 2.9.8, process.stdout.end() on a socket stdout sends no FIN (EOF only at exit)"
     : false;
