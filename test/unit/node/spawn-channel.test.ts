@@ -281,4 +281,27 @@ describe("fromNodeStreams over streams that never emit close (Deno process.stdin
     ch.close();
     await ch.closed;
   });
+
+  test(
+    "closed resolves when _destroy throws (the stream machinery finishes the destroy itself)",
+    { skip },
+    async () => {
+      const duplex = silent(() => {
+        throw new Error("boom");
+      });
+      duplex.on("error", () => undefined);
+      const ch = fromNodeStreams(duplex, duplex);
+      ch.close();
+      assert.equal(await settlesWithin(ch.closed, 1000), true);
+      assert.ok(duplex.closed);
+    },
+  );
+
+  test("a stream already being destroyed when the channel is built counts as closed at once", { skip }, async () => {
+    const duplex = silent(later(50));
+    duplex.destroy();
+    assert.equal(duplex.closed, false);
+    const ch = fromNodeStreams(duplex, duplex);
+    assert.equal(await settlesWithin(ch.closed, 20), true);
+  });
 });

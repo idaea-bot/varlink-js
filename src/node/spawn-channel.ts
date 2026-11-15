@@ -26,8 +26,8 @@ interface PendingRead {
  * calls back (the stream machinery sets `closed` there), whoever destroyed it: our `close()`, or the stream itself
  * (auto-destroy after EOF, an error). `stream.finished()` cannot stand in: for such a stream it fires on `end` or
  * `finish` alone and never on a destroy. A stream already being destroyed when the channel is built counts as
- * closed at once (its `_destroy` callback can no longer be seen). Everywhere else only the event counts (on Node a destroyed socket sets
- * `closed` before its fd is closed).
+ * closed at once (its `_destroy` callback can no longer be seen). Everywhere else only the event counts (on Node a
+ * destroyed socket sets `closed` before its fd is closed).
  */
 const IS_DENO = process.versions.deno !== undefined;
 
