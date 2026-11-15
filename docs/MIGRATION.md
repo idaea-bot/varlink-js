@@ -62,7 +62,7 @@ Fixes that change what you observe on the wire or in your code:
 | `server.registerCall(OrgVarlinkService.GetInfo, …)` | nothing: built in, from `createServer`'s options |
 | `server.registerCall(method, fn)` | `server.addInterface(idlText, { Method: fn })`, or `server.implement(X, handlers)` after codegen |
 | `server.registerCallOneshot(method, fn)` | the same handler; whether a call is oneway is the caller's choice (`ctx.oneway` tells). A generator handler called oneway runs only up to its first `yield` |
-| `server.registerCallStream(method, async (input, callback) => …)` | an async generator handler (`yield` = reply with `continues`, `return` = final reply), or `ctx.notify(reply)` from a plain handler. Declare the method `[Requires 'more' flag]` in the IDL: then a call without `more` gets `ExpectedMore` (0.1.x also answered it with an error). Without the annotation such a call gets the first yielded or notified value as its only, final reply, and the later ones are dropped silently |
+| `server.registerCallStream(method, async (input, callback) => …)` | an async generator handler (`yield` = reply with `continues`, `return` = final reply), or `ctx.notify(reply)` from a plain handler. Declare the method `[Requires 'more' flag]` in the IDL: then a call without `more` gets `ExpectedMore` (0.1.x also answered it with an error). Without the annotation such a call gets the first yielded or notified value as its only, final reply: a generator is then closed (its code after the first `yield` does not run), and later `notify()` values are dropped silently |
 | `new SocketServerSideTransport({ port, host, timeout })` | `await listen("tcp:HOST:PORT")`, e.g. `tcp:127.0.0.1:PORT` (`timeout` is gone: no idle timeout). 0.1.x without `host` listened on every interface; 1.0 has no default host, so all interfaces need an explicit `tcp:0.0.0.0:PORT` (or `tcp:[::]:PORT`) |
 | `new SocketServerSideTransport({ path, timeout })` | `await listen("unix:/path", { mode: 0o644 })` |
 | `await server.start()` | `server.serve(listener)` |
@@ -74,7 +74,7 @@ Fixes that change what you observe on the wire or in your code:
 | `SocketTransportChannel` (`varlink-js/transport/node-socket`) | `fromNodeSocket(socket)` from `varlink-js/node`: a `net.Socket` as a `ByteChannel` |
 | `VarlinkDictionary` | `Record<string, unknown>` (untyped calls), or the generated `<Method>_Input` / `<Method>_Output` types |
 | `VarlinkRequest`, `VarlinkResponse` (`…SuccessResponse`, `…ErrorResponse`) | internal, not exported: calls take `(method, parameters, options)`, replies are the parameters object, error replies reject with a `VarlinkError` |
-| `VarlinkMethodGetName<M>` | a generated method descriptor's `method` property (fully qualified; `name` is the short name) |
+| `VarlinkMethodGetName<M>` | a generated method descriptor's `method` property (fully qualified; `name` is the short name). It is a runtime `string`, not a literal type |
 | the `.interface` field of `OrgVarlinkService` and the other schema objects | a generated descriptor's `name` (`OrgExampleNotes.name === "org.example.notes"`) |
 | `serializeVarlinkRequest()` and the other wire helpers | internal, not exported |
 | Connection pooling inside `VarlinkClient` | `createPool(address, { max, idleTimeout })` from `varlink-js/node` |

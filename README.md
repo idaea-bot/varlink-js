@@ -216,7 +216,8 @@ It implements `org.example.reference` (a plain method, a streaming method, typed
 oneway that keeps at most 16 messages of at most 1 KiB), refuses TCP hosts other than loopback (it never binds
 `0.0.0.0` or `::`), refuses `unix:@` addresses (abstract sockets have no file permissions, so any local user could
 connect), answers `GetInterfaceDescription` only from its registered interfaces (never from the file system), prints
-`Listening on <address>` and shuts down gracefully on SIGINT/SIGTERM with exit code 0. Refused addresses exit with 2
+`Listening on <address>` and shuts down gracefully on SIGINT/SIGTERM with exit code 0. A loopback TCP port is still open
+to every local user; use the default unix socket for owner-only access. Refused addresses exit with 2
 before anything is bound. All of that is checked by `test/docs/examples.test.ts`.
 
 ## Codegen
@@ -369,7 +370,7 @@ subpaths above.
 | Value nesting when validating | 1024 levels (`MAX_VALUE_DEPTH`) | fixed | `test/unit/types/validators.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
 | IDL type nesting | 64 levels (`MAX_TYPE_DEPTH`) | fixed | `test/unit/idl/errors.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
 | WebSocket bytes received but unread (then the socket is closed) | 64 MiB | `maxBufferedBytes` | `test/docs/defaults.test.ts` |
-| WebSocket `write()` resolves below this `bufferedAmount` | 1 MiB | `writeHighWaterMark` | `test/docs/defaults.test.ts` |
+| WebSocket `write()` resolves while `bufferedAmount` is at most | 1 MiB | `writeHighWaterMark` | `test/docs/defaults.test.ts` |
 | `LISTEN_FDS` accepted by `listenFromEnv()` | 1 … 1024 | — | `test/unit/node/activation.test.ts` |
 
 `test/docs/defaults.test.ts` creates each object without the option and checks that it enforces the default (for
@@ -490,7 +491,7 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
 |---|---|---|
 | Node.js 22, 24, 26 (latest of each) | `ci.yml` `test` | everything (`npm test`), plus `npm pack` and the consumer fixture |
 | Node.js 22.12.0 (the `engines` floor) | `ci.yml` `floor` | compiled `runtime-features` and `exports` tests, the packed tarball |
-| Bun (latest) | `runtimes.yml` `bun` | `test/unit` and `test/regression` (on Linux), the spawn (`exec:`, fake ssh, bridge) and activation tests included. Skipped on Bun: the two abort/timeout-during-spawn tests of `test/unit/node/spawn.test.ts` (no `child_process` diagnostics channel), its bridge test that needs EOF from a still-running stdio server (`process.stdout.end()` sends no FIN), the "no timers once shut down" test of `test/unit/rpc/exit-on-idle.test.ts`, and the cross-copy `isVarlinkError` test of `test/regression/tooling.test.ts` (Bun's module cache ignores the query). The `listen({ fd })` tests of `test/unit/node/fd.test.ts` skip themselves on any runtime whose `net.Server` exposes no fd |
+| Bun (latest) | `runtimes.yml` `bun` | `test/unit` and `test/regression` (on Linux), the spawn (`exec:`, fake ssh, bridge) and activation tests included. Skipped on Bun: the three abort/timeout-during-spawn tests of `test/unit/node/spawn.test.ts` (no `child_process` diagnostics channel), its bridge test that needs EOF from a still-running stdio server (`process.stdout.end()` sends no FIN), the "no timers once shut down" test of `test/unit/rpc/exit-on-idle.test.ts`, and the cross-copy `isVarlinkError` test of `test/regression/tooling.test.ts` (Bun's module cache ignores the query). The `listen({ fd })` tests of `test/unit/node/fd.test.ts` skip themselves on any runtime whose `net.Server` exposes no fd |
 | Deno 2 | `runtimes.yml` `deno` | the same suites. Skipped on Deno: the same stdio-EOF bridge test, and the "nonblocking" connected activation fd tests of `test/unit/node/connected-fd.test.ts` (a `net.Socket` has no real fd) |
 | Browsers | — | `varlink-js`, `varlink-js/websocket`, `varlink-js/http` and `varlink-js/idl` import nothing from Node (a lint rule and a typecheck without `@types/node` enforce it), but no browser test runs in CI |
 
@@ -509,7 +510,7 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
 | `exec:`, ssh (fake ssh), bridge | `test/unit/node/spawn.test.ts`, `test/unit/node/spawn-channel.test.ts`, `test/unit/cli/call.test.ts` | `ci.yml` test; bun, deno (a few tests skipped, see [Runtimes](#runtimes)) |
 | Socket activation, `listenAuto`, stdio, `listen({ fd })` | `test/unit/node/activation.test.ts`, `test/unit/node/connected-fd.test.ts`, `test/unit/node/fd.test.ts` | `ci.yml` test; bun, deno (Deno skips the nonblocking connected-fd tests; the `listen({ fd })` tests skip themselves on a runtime whose `net.Server` exposes no fd) |
 | Real `systemd-socket-activate`, `varlinkctl exec:`, the registry via `varlinkctl` (each runs only when its tool is on `PATH` and skips silently otherwise; nothing makes CI fail if the runner lacks it) | `test/interop/vm/socket-activate.test.ts`, `test/interop/vm/varlinkctl-exec.test.ts`, `test/interop/vm/registry.test.ts` | `ci.yml` test |
-| `exitOnIdle` | `test/unit/rpc/exit-on-idle.test.ts` | `ci.yml` test; bun, deno (one test Node only) |
+| `exitOnIdle` | `test/unit/rpc/exit-on-idle.test.ts` | `ci.yml` test; bun, deno (one test skipped on Bun) |
 | Registry, resolver | `test/unit/node/registry.test.ts`, `test/unit/node/registry-serve.test.ts`, `test/unit/node/resolver.test.ts` | `ci.yml` test; bun, deno |
 | WebSocket and HTTP clients | `test/unit/websocket/`, `test/unit/http/` | `ci.yml` test; bun, deno |
 | IDL parser, validator, formatter (corpus incl. systemd interfaces) | `test/unit/idl/` | `ci.yml` test; bun, deno |

@@ -3,7 +3,7 @@
 # NOT RUN YET. Publishing is Pawel's decision (DESIGN §9 Q1). Guards that keep this from publishing by accident:
 #   1. It only runs in pzmarzly/varlink-js (the `if:` on both jobs), never in a fork.
 #   2. The publish job uses the `npm-release` environment, and the verify job fails unless that environment
-#      exists with a "Required reviewers" rule (GitHub would otherwise create it on first use WITHOUT protection
+#      exists with a "Required reviewers" rule and a deployment branch/tag policy (GitHub would otherwise create it on first use WITHOUT protection
 #      rules). Before the first release, in the repository settings:
 #        - create the `npm-release` environment with "Required reviewers" (Pawel), and limit its deployment
 #          branches and tags to the tag pattern `v*`;
@@ -48,6 +48,10 @@ jobs:
           fi
           if ! printf '%s' "$env_json" | jq -e 'any(.protection_rules[]?; .type == "required_reviewers")' > /dev/null; then
             echo "::error::the npm-release environment has no required_reviewers protection rule"
+            exit 1
+          fi
+          if ! printf '%s' "$env_json" | jq -e '.deployment_branch_policy != null' > /dev/null; then
+            echo "::error::the npm-release environment has no deployment policy (allow only v* tags)"
             exit 1
           fi
       - uses: actions/checkout@v7

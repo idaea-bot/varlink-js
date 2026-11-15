@@ -92,7 +92,7 @@ describe(".github/workflows/release.yml guards", () => {
       assert.ok(verify.includes(`      - run: ${step}`), `verify lacks ${step}`);
   });
 
-  test("verify fails unless the npm-release environment exists with a required_reviewers rule", () => {
+  test("verify fails unless the npm-release environment exists with a required_reviewers rule and a branch/tag policy", () => {
     const verify = jobs().get("verify") ?? [];
     const start = verify.indexOf("      - name: The npm-release environment exists and requires reviewers");
     assert.ok(start >= 0, "no environment check step");
@@ -113,7 +113,13 @@ describe(".github/workflows/release.yml guards", () => {
       ),
       "the jq check requires a required_reviewers rule",
     );
-    assert.equal(step.filter((l) => l === "            exit 1").length, 2, "both checks exit 1");
+    assert.ok(
+      step.includes(
+        `          if ! printf '%s' "$env_json" | jq -e '.deployment_branch_policy != null' > /dev/null; then`,
+      ),
+      "the jq check requires a deployment branch/tag policy",
+    );
+    assert.equal(step.filter((l) => l === "            exit 1").length, 3, "every check exits 1");
   });
 
   test("verify checks out the full history and fails unless the tagged commit is on master", () => {
