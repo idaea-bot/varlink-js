@@ -325,8 +325,9 @@ console.log(`Listening on ${listener.address}`);
   `--more` included, as in varlinkctl.
 - Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM; `certify server` exits 0 after a
   signal (it stops gracefully).
-- `--upgrade` is **not available yet** (M9, in progress); neither are `--push-fd` (M11), `serve` and
-  `list-registry`.
+- `call --upgrade ADDRESS METHOD [PARAMS]` (as varlinkctl): after the confirming reply, stdin goes to the service and
+  its bytes to stdout until both sides are done; parameters come from the command line only. Not available yet:
+  `--push-fd` (M11), `serve` and `list-registry`.
 - Integers are lossless in the CLI (it uses `ints: "bigint"` internally): 2⁶³−1 and 2⁶⁴−1 round-trip.
 
 ## Addresses
@@ -539,8 +540,6 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
 
 ## Not yet implemented
 
-- **`upgrade`** (M9, in progress): clients cannot send it, typed clients have no `.upgrade()`, the CLI has no
-  `--upgrade`, and a server closes the connection after an upgrade call no handler claims.
 - **fd passing, peer credentials, per-UID connection limits, `user.varlink` xattr tagging** (M11, a native addon, not
   started).
 - **No WebSocket or HTTP server**: those subpaths are clients only.
