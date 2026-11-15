@@ -334,8 +334,12 @@ describe("call over exec:", { skip: EXEC_SKIP }, () => {
     const r = await runCli(["call", `exec:${wrapper}`, "a.b.C", "{}"]);
     assert.equal(r.code, 1);
     assert.equal(r.stdout, "");
-    // A clean EOF, or ECONNRESET when the child exits with our request unread (Linux; seen on CI).
-    assert.match(r.stderr, /^Method call a\.b\.C\(\) failed: (connection closed by peer|connection lost: [^\n]*)\n$/);
+    // A clean EOF, ECONNRESET when the child exits with our request unread (Linux; seen on CI), or EPIPE when it is
+    // gone before our request is written (Linux, Node 26; seen on CI).
+    assert.match(
+      r.stderr,
+      /^Method call a\.b\.C\(\) failed: (connection closed by peer|connection lost: [^\n]*|connection closed: write failed: [^\n]*)\n$/,
+    );
   });
 
   test("a missing executable: `Failed to connect to exec:…: … ENOENT`, exit 1", async () => {
