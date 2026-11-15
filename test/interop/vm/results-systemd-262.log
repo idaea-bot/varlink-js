@@ -1,0 +1,14 @@
+varlinkctl: systemd 262 (262.2)
+node: v24.22.3
+PASS a varlinkctl call --upgrade -> varlink-js server
+PASS b1 varlink-js call --upgrade -> varlinkctl serve
+PASS b2 conn.upgrade() -> varlinkctl serve (api: sent 1048576 bytes, got 1048576 back, equal)
+PASS c1 Q4 varlink-js: q4: org.example.Upgrade.Ping with upgrade:true then plain → ["{\"parameters\":{}}","{\"parameters\":{}}"]
+PASS c2 Q4 sd-varlink: q4: org.varlink.service.GetInfo with upgrade:true then plain → ["{\"parameters\":{\"vendor\":\"\",\"product\":\"\",\"version\":\"\",\"url\":\"\",\"interfaces\":[\"io.systemd\",\"org.example.Upgrade\",\"org.varlink.service\"]}}","{\"parameters\":{\"vendor\":\"\",\"product\":\"\",\"version\":\"\",\"url\":\"\",\"interfaces\":[\"io.systemd\",\"org.example.Upgrade\",\"org.varlink.service\"]}}"]
+INFO d1 varlinkctl -> varlinkctl serve -- head -n1 exit 141 (SIGPIPE), first line ""
+PASS d2 varlink-js -> varlinkctl serve -- head -n1 exit 0, stdout "y"
+INFO d3 varlinkctl -> varlink-js Head exit 141 (SIGPIPE), first line "y"
+PASS d4 varlink-js -> varlink-js Head exit 0, stdout "y"
+INFO d parity: exit codes varlinkctl/varlink-js: against serve 141/0, against varlink-js 141/0
+INFO e1 varlinkctl -> varlinkctl serve echo BYE exit 0, stdout "BYE", reader EOF late
+PASS e2 varlink-js -> varlinkctl serve echo BYE stdout EOF before stdin closed, exit 0

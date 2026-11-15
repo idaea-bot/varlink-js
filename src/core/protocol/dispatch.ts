@@ -14,6 +14,7 @@ import {
 import { isErrorName, isVarlinkError, type VarlinkError } from "../errors/varlink-error.ts";
 import { isInterfaceName, isMemberName } from "../idl/names.ts";
 import type { Validator } from "../types/compile.ts";
+import type { ByteChannel } from "./channel.ts";
 import { isPlainObject, type Call } from "./messages.ts";
 import type { ServerSession } from "./server-session.ts";
 
@@ -29,7 +30,26 @@ export interface CallContext {
   readonly method: string;
   readonly more: boolean;
   readonly oneway: boolean;
-  readonly upgrade: boolean;
+  /**
+   * The call's `upgrade` flag as sent. Also set for a method without upgrade support: such a call runs as a plain
+   * call (Q4, like sd-varlink) and {@link upgrade} rejects.
+   */
+  readonly upgradeRequested: boolean;
+  /**
+   * Protocol upgrade (§5.6): sends `parameters` (default `{}`, validated like any reply per `validateReplies`) as the
+   * confirming reply and resolves, once it was written, with the connection's transport as a {@link ByteChannel}
+   * that first yields the bytes the client sent after its call (already buffered), then reads from the transport.
+   * The channel belongs to the handler from then on (close or end it when done); the handler's return value and
+   * later throws no longer reach the wire (a throw goes to `onError` as `handler-threw`), and {@link notify} rejects.
+   *
+   * Rejects with a TypeError, with nothing written, unless the call has the `upgrade` flag and its method supports
+   * or requires upgrade (on a server that can hand over its transport), when called a second time, or after the
+   * call's final reply; with the validation error (the call then ends with InternalError) for an invalid reply in
+   * `validateReplies: "throw"` mode or a value that is not a plain object; with a `ConnectionClosedError` when the
+   * connection is gone before the reply was written. A handler that returns without calling it confirms the upgrade
+   * with its return value and the server closes the connection (`upgrade-unclaimed`).
+   */
+  upgrade(parameters?: Record<string, unknown>): Promise<ByteChannel>;
   /** Vendor extension keys of the call. */
   readonly ext: Readonly<Record<string, unknown>>;
   /**
@@ -125,6 +145,12 @@ export interface DispatchOptions {
    * (later replies are dropped, `notify` rejects, `ctx.signal` aborts at once via `session.closedSignal`).
    */
   signal?: AbortSignal;
+  /**
+   * Driver: hands over the transport once the confirming reply of `ctx.upgrade()` was written (the session is
+   * `upgraded` then), as a ByteChannel that first yields `session.takeUpgradeRemainder()`. Absent: `ctx.upgrade()`
+   * rejects (unavailable), and a confirmed upgrade is `upgrade-unclaimed`.
+   */
+  upgrade?: () => ByteChannel;
 }
 
 /**
@@ -183,7 +209,7 @@ function describe(v: unknown): string {
 }
 
 /** `p` with a no-op rejection handler attached: never an unhandled rejection; callers that await still see it. */
-function quiet(p: Promise<void>): Promise<void> {
+function quiet<T>(p: Promise<T>): Promise<T> {
   p.catch(() => undefined);
   return p;
 }
@@ -214,6 +240,10 @@ class Dispatch {
   #lastProblem: unknown;
   /** #produce is running the session's encoder (which may call back into user code: toJSON, getters). */
   #producing = false;
+  /** ctx.upgrade() was called (it may still be writing the confirming reply). */
+  #upgradeCalled = false;
+  /** ctx.upgrade() handed the transport to the handler. */
+  #claimed = false;
 
   constructor(
     session: ServerSession,
@@ -272,7 +302,7 @@ class Dispatch {
     }
     await this.#chain;
     closedSignal.removeEventListener("abort", onClosed);
-    if (this.#call.upgrade && this.#session.state === "upgraded")
+    if (this.#call.upgrade && this.#session.state === "upgraded" && !this.#claimed)
       this.#report(
         "upgrade-unclaimed",
         new Error(`${this.#call.method}: upgrade confirmed but nobody took the upgraded stream`),
@@ -280,8 +310,8 @@ class Dispatch {
   }
 
   /**
-   * Checks 1–7 of the dispatch order (§5.4): the first failing check's error, or the handler and its validated
-   * parameters.
+   * Checks 1–6 of the dispatch order (§5.4): the first failing check's error, or the handler and its validated
+   * parameters. An `upgrade` call to a method without upgrade support is not an error (Q4): it runs as a plain call.
    */
   #check(): { error: VarlinkError } | { handler: (p: unknown, ctx: CallContext) => unknown; parameters: unknown } {
     const call = this.#call;
@@ -295,8 +325,10 @@ class Dispatch {
     this.#entry = entry;
     if (entry.more === "requires" && !call.more) return { error: new ExpectedMoreError() };
     if (entry.upgrade === "requires" && !call.upgrade) return { error: new ExpectedUpgradeError() };
-    if (call.upgrade && entry.upgrade === undefined)
-      return { error: new InvalidParameterError({ parameter: "upgrade" }) };
+    // Q4 (sd-varlink, varlink_dispatch_method): the flag on a method without upgrade support is not checked; the
+    // call is answered like a plain one and the session keeps speaking varlink afterwards.
+    if (call.upgrade && entry.upgrade === undefined && this.#session.state === "open")
+      this.#session.ignoreUpgrade(this.#id);
     const handler = entry.handler as ((p: unknown, ctx: CallContext) => unknown) | undefined;
     if (handler === undefined) return { error: new MethodNotImplementedError({ method: call.method }) };
     if (entry.input === undefined) return { handler, parameters: call.parameters };
@@ -426,13 +458,59 @@ class Dispatch {
       method: call.method,
       more: call.more,
       oneway: call.oneway,
-      upgrade: call.upgrade,
+      upgradeRequested: call.upgrade,
+      upgrade: (parameters) => quiet(this.#upgrade(parameters)),
       ext: call.ext,
       notify: (parameters) => this.#notify(parameters),
     };
   }
 
+  /** Why ctx.upgrade() cannot be used for this call, or undefined if it can. */
+  #upgradeUnavailable(): string | undefined {
+    if (!this.#call.upgrade) return "the call does not have the upgrade flag";
+    if (this.#entry?.upgrade === undefined) return "the method does not support upgrade";
+    if (this.#options.upgrade === undefined) return "this server cannot hand over its transport";
+    return undefined;
+  }
+
+  async #upgrade(parameters: unknown): Promise<ByteChannel> {
+    const method = this.#call.method;
+    const unavailable = this.#upgradeUnavailable();
+    if (unavailable !== undefined) throw new TypeError(`${method}: ctx.upgrade() is unavailable: ${unavailable}`);
+    if (this.#upgradeCalled) throw new TypeError(`${method}: ctx.upgrade() was already called`);
+    if (this.#gone()) throw this.#goneError();
+    if (this.#done) throw new TypeError(`${method}: ctx.upgrade() after the call's final reply`);
+    this.#upgradeCalled = true;
+    let outcome: Outcome;
+    try {
+      outcome = this.#reply(parameters, false);
+    } catch (e) {
+      // A re-entrant ctx.upgrade() from a reply's toJSON or getter (#produce refuses it); the outer reply goes on.
+      this.#report("invalid-reply", e);
+      throw e;
+    }
+    if (outcome === "invalid") {
+      const problem = this.#lastProblem;
+      this.#sendError(InternalError.errorName, {});
+      // Already reported through onError.
+      throw problem instanceof Error ? problem : new TypeError("invalid ctx.upgrade() value");
+    }
+    if (outcome === "dropped") throw this.#goneError();
+    await this.#chain;
+    if (this.#dead || this.#session.state !== "upgraded") throw this.#goneError();
+    let channel: ByteChannel;
+    try {
+      channel = (this.#options.upgrade as () => ByteChannel)();
+    } catch (e) {
+      throw new ConnectionClosedError(`${method}: the connection is closed`, { cause: e });
+    }
+    this.#claimed = true;
+    return channel;
+  }
+
   #notify(parameters: unknown): Promise<void> {
+    if (this.#upgradeCalled)
+      return quiet(Promise.reject(new TypeError(`${this.#call.method}: notify() after ctx.upgrade()`)));
     if (this.#gone()) return quiet(Promise.reject(this.#goneError()));
     if (this.#call.oneway) return Promise.resolve();
     if (this.#done) {

@@ -37,14 +37,28 @@ export function closeServer(server: Server): Promise<void> {
   });
 }
 
-/** A connected tcp socket pair over 127.0.0.1 (both half-open capable). */
-export async function tcpPair(): Promise<{ client: Socket; server: Socket; close(): Promise<void> }> {
+/** A connected tcp socket pair over 127.0.0.1 (both half-open capable; the server side paused). */
+export function tcpPair(): Promise<{ client: Socket; server: Socket; close(): Promise<void> }> {
+  return socketPair(undefined);
+}
+
+/** A connected unix socket pair over a socket file at `path` (removed once connected), like {@link tcpPair}. */
+export function unixPair(path: string): Promise<{ client: Socket; server: Socket; close(): Promise<void> }> {
+  return socketPair(path);
+}
+
+async function socketPair(
+  path: string | undefined,
+): Promise<{ client: Socket; server: Socket; close(): Promise<void> }> {
   const listener = createServer({ allowHalfOpen: true, pauseOnConnect: true });
-  await listening(listener, { host: "127.0.0.1", port: 0 });
+  await listening(listener, path ?? { host: "127.0.0.1", port: 0 });
   const accepted = new Promise<Socket>((resolve) => listener.once("connection", resolve));
   const address = listener.address();
-  if (address === null || typeof address === "string") throw new Error("no tcp address");
-  const client = netConnect({ host: "127.0.0.1", port: address.port, allowHalfOpen: true });
+  if (address === null || (path === undefined && typeof address === "string")) throw new Error("no address");
+  const client =
+    path !== undefined
+      ? netConnect({ path, allowHalfOpen: true })
+      : netConnect({ host: "127.0.0.1", port: (address as { port: number }).port, allowHalfOpen: true });
   await new Promise<void>((resolve, reject) => {
     client.once("connect", resolve);
     client.once("error", reject);

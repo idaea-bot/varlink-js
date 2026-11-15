@@ -17,6 +17,7 @@ import {
   parseMethodName,
   ServerSession,
   streamOf,
+  type ByteChannel,
   type CallContext,
   type CallInit,
   type DispatchErrorReason,
@@ -25,7 +26,7 @@ import {
   type MethodEntry,
 } from "../../../src/core/protocol/index.ts";
 import { compileInterfaceText, jsonCodec, type Codec } from "../../../src/core/types/index.ts";
-import { concat, frame, messages, msg, serve, tableOf, type Served } from "./helpers.ts";
+import { concat, frame, messages, msg, serve, tableOf, utf8, type Served } from "./helpers.ts";
 
 const IDL = `interface org.example.ftl
 
@@ -141,11 +142,93 @@ describe("dispatch table (§5.4 rows, check order)", () => {
     assert.deepEqual(r.replies, [{ error: "org.varlink.service.ExpectedUpgrade", parameters: {} }]);
   });
 
-  test("5. upgrade on a method without upgrade support → InvalidParameter {parameter: upgrade} (Q4, provisional)", async () => {
-    const r = await run({ Ping: () => ({ pong: "x" }) }, { method: `${I}.Ping`, upgrade: true });
+  test("Q4: upgrade on a method without upgrade support runs as a plain call; the session keeps speaking varlink", async () => {
+    const session = new ServerSession();
+    let flags: [boolean, unknown] | undefined;
+    const table = tableOf([FTL], {
+      [`${I}.Ping`]: async (p: { ping: string }, ctx: CallContext) => {
+        flags = [ctx.upgradeRequested, await ctx.upgrade().catch((e: unknown) => e)];
+        return { pong: p.ping };
+      },
+    });
+    const r = await serve(
+      concat([
+        msg({ method: `${I}.Ping`, parameters: { ping: "a" }, upgrade: true }),
+        msg({ method: `${I}.Ping`, parameters: { ping: "b" } }),
+      ]),
+      table,
+      { session, upgrade: () => assert.fail("no hand-over for a plain method") },
+    );
+    // The second call is answered: no upgrade happened.
+    assert.deepEqual(r.replies, [{ parameters: { pong: "a" } }, { parameters: { pong: "b" } }]);
+    assert.equal(r.calls.length, 2);
+    assert.equal(flags?.[0], false); // the second call's flags
+    assert.ok(r.close?.type === "close" && r.close.error === undefined);
+  });
+
+  test("Q4: the plain method sees upgradeRequested, and ctx.upgrade() rejects with a TypeError, nothing written", async () => {
+    let seen: [boolean, unknown] | undefined;
+    const r = await run(
+      {
+        Ping: async (p: { ping: string }, ctx: CallContext) => {
+          seen = [ctx.upgradeRequested, await ctx.upgrade({ ok: true }).catch((e: unknown) => e)];
+          return { pong: p.ping };
+        },
+      },
+      { method: `${I}.Ping`, parameters: { ping: "x" }, upgrade: true },
+      { upgrade: () => assert.fail("no hand-over") },
+    );
+    assert.equal(seen?.[0], true);
+    assert.ok(seen[1] instanceof TypeError && /does not support upgrade/.test(seen[1].message));
+    assert.deepEqual(r.replies, [{ parameters: { pong: "x" } }]);
+    assert.deepEqual(r.reported, []);
+  });
+
+  test("Q4: an error from the plain method goes out; the next call is answered", async () => {
+    const r = await serve(
+      concat([
+        msg({ method: `${I}.Ping`, parameters: { ping: "a" }, upgrade: true }),
+        msg({ method: `${I}.Ping`, parameters: { ping: "b" } }),
+      ]),
+      tableOf([FTL], {
+        [`${I}.Ping`]: (p: { ping: string }) => {
+          if (p.ping === "a") throw new PermissionDeniedError();
+          return { pong: p.ping };
+        },
+      }),
+    );
     assert.deepEqual(r.replies, [
-      { error: "org.varlink.service.InvalidParameter", parameters: { parameter: "upgrade" } },
+      { error: "org.varlink.service.PermissionDenied", parameters: {} },
+      { parameters: { pong: "b" } },
     ]);
+  });
+
+  test("Q4: upgrade on a [Requires 'more' flag] method → ExpectedMore (sd-varlink sends nothing there), then the next call", async () => {
+    const r = await serve(
+      concat([msg({ method: `${I}.Monitor`, upgrade: true }), msg({ method: `${I}.Ping`, parameters: { ping: "b" } })]),
+      tableOf([FTL], {
+        [`${I}.Monitor`]: () => ({}),
+        [`${I}.Ping`]: (p: { ping: string }) => ({ pong: p.ping }),
+      }),
+    );
+    assert.deepEqual(r.replies, [
+      { error: "org.varlink.service.ExpectedMore", parameters: {} },
+      { parameters: { pong: "b" } },
+    ]);
+  });
+
+  test("Q4: org.varlink.service.GetInterfaceDescription with upgrade answers and the session stays open", async () => {
+    const r = await serve(
+      concat([
+        msg({ method: "org.varlink.service.GetInterfaceDescription", parameters: { interface: I }, upgrade: true }),
+        msg({ method: `${I}.Ping`, parameters: { ping: "b" } }),
+      ]),
+      tableOf([FTL], {
+        "org.varlink.service.GetInterfaceDescription": () => ({ description: IDL }),
+        [`${I}.Ping`]: (p: { ping: string }) => ({ pong: p.ping }),
+      }),
+    );
+    assert.deepEqual(r.replies, [{ parameters: { description: IDL } }, { parameters: { pong: "b" } }]);
   });
 
   test("6. no handler → MethodNotImplemented {method} (before validation)", async () => {
@@ -240,7 +323,7 @@ describe("dispatch table (§5.4 rows, check order)", () => {
     assert.equal(ctx?.method, `${I}.Ping`);
     assert.equal(ctx.more, true);
     assert.equal(ctx.oneway, false);
-    assert.equal(ctx.upgrade, false);
+    assert.equal(ctx.upgradeRequested, false);
     assert.deepEqual(ctx.ext, { "com.example.trace": "t" });
     assert.equal(ctx.signal.aborted, false);
     // Plain handler called with more: a single reply without continues (F6).
@@ -1505,6 +1588,188 @@ describe("onError, send failures, aborts, upgrade, oneway", () => {
   test("supports-upgrade method called without upgrade runs as a plain call", async () => {
     const r = await run({ Up: () => ({ ok: false }) }, { method: `${I}.Up` });
     assert.deepEqual(r.replies, [{ parameters: { ok: false } }]);
+  });
+
+  /** A fake upgraded channel: what the driver's hand-over returns. */
+  function fakeChannel(): ByteChannel {
+    return {
+      read: () => Promise.resolve(null),
+      write: () => Promise.resolve(),
+      end: () => Promise.resolve(),
+      close: () => undefined,
+      closed: Promise.resolve(),
+      capabilities: {},
+    };
+  }
+
+  test("ctx.upgrade(): confirming reply written first, then the hand-over; return value ignored, nothing reported", async () => {
+    const session = new ServerSession();
+    const events: string[] = [];
+    const channel = fakeChannel();
+    let got: unknown;
+    const table = tableOf([FTL], {
+      [`${I}.Up`]: async (_p: unknown, ctx: CallContext) => {
+        got = await ctx.upgrade({ ok: true });
+        events.push("resolved");
+        return { ok: false };
+      },
+    });
+    const out: Uint8Array[] = [];
+    const reported: DispatchErrorReason[] = [];
+    session.receive(concat([msg({ method: `${I}.Up`, upgrade: true }), utf8("early")]));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    await dispatchCall(
+      session,
+      ev.id,
+      ev.call,
+      table,
+      (bytes) => {
+        events.push("send");
+        out.push(bytes);
+        return Promise.resolve();
+      },
+      {
+        onError: (_e, info) => reported.push(info.reason),
+        upgrade: () => {
+          events.push("hand-over");
+          assert.equal(new TextDecoder().decode(session.takeUpgradeRemainder()), "early");
+          return channel;
+        },
+      },
+    );
+    assert.deepEqual(events, ["send", "hand-over", "resolved"]);
+    assert.equal(got, channel);
+    assert.deepEqual(messages(concat(out)), [{ parameters: { ok: true } }]);
+    assert.equal(session.state, "upgraded");
+    assert.deepEqual(reported, []);
+  });
+
+  test("ctx.upgrade(): a throw after the upgrade goes to onError only; notify() after it rejects", async () => {
+    const boom = new Error("after");
+    let notified: unknown;
+    const r = await run(
+      {
+        Up: async (_p: unknown, ctx: CallContext) => {
+          await ctx.upgrade({ ok: true });
+          notified = await ctx.notify({ ok: true }).catch((e: unknown) => e);
+          throw boom;
+        },
+      },
+      { method: `${I}.Up`, upgrade: true },
+      { upgrade: fakeChannel },
+    );
+    assert.deepEqual(r.replies, [{ parameters: { ok: true } }]);
+    assert.ok(notified instanceof TypeError);
+    assert.deepEqual(r.reported, [{ reason: "handler-threw", error: boom, method: `${I}.Up` }]);
+  });
+
+  test("ctx.upgrade() twice: the second rejects with a TypeError (also while the first is writing)", async () => {
+    const results: unknown[] = [];
+    const r = await run(
+      {
+        Up: async (_p: unknown, ctx: CallContext) => {
+          const first = ctx.upgrade();
+          results.push(await ctx.upgrade().catch((e: unknown) => e));
+          await first;
+          results.push(await ctx.upgrade().catch((e: unknown) => e));
+        },
+      },
+      { method: `${I}.Up`, upgrade: true },
+      { upgrade: fakeChannel },
+    );
+    assert.equal(results.length, 2);
+    for (const e of results) assert.ok(e instanceof TypeError && /already called/.test(e.message));
+    assert.deepEqual(r.replies, [{ parameters: {} }]);
+  });
+
+  test("ctx.upgrade() without the flag, without a driver hand-over, or after the final reply: TypeError, no wire effect", async () => {
+    // A supports-upgrade method called without the flag runs as a plain call.
+    let e1: unknown;
+    const plain = await run(
+      {
+        Up: async (_p: unknown, ctx: CallContext) => {
+          e1 = await ctx.upgrade().catch((e: unknown) => e);
+          return { ok: false };
+        },
+      },
+      { method: `${I}.Up` },
+      { upgrade: fakeChannel },
+    );
+    assert.ok(e1 instanceof TypeError && /does not have the upgrade flag/.test(e1.message));
+    assert.deepEqual(plain.replies, [{ parameters: { ok: false } }]);
+
+    // No hand-over from the driver: unavailable; the return value confirms, nobody claims it.
+    let e2: unknown;
+    const session = new ServerSession();
+    const noDriver = await run(
+      {
+        Up: async (_p: unknown, ctx: CallContext) => {
+          e2 = await ctx.upgrade().catch((e: unknown) => e);
+          return { ok: true };
+        },
+      },
+      { method: `${I}.Up`, upgrade: true },
+      { session },
+    );
+    assert.ok(e2 instanceof TypeError && /cannot hand over/.test(e2.message));
+    assert.deepEqual(noDriver.replies, [{ parameters: { ok: true } }]);
+    assert.deepEqual(reasons(noDriver), ["upgrade-unclaimed"]);
+
+    // A notify() without more is the final reply (it confirms the upgrade); ctx.upgrade() after it is too late.
+    let e3: unknown;
+    const late = await run(
+      {
+        Up: async (_p: unknown, ctx: CallContext) => {
+          await ctx.notify({ ok: true });
+          e3 = await ctx.upgrade().catch((e: unknown) => e);
+        },
+      },
+      { method: `${I}.Up`, upgrade: true },
+      { upgrade: () => assert.fail("no hand-over after the final reply") },
+    );
+    assert.ok(e3 instanceof TypeError && /after the call's final reply/.test(e3.message));
+    assert.deepEqual(late.replies, [{ parameters: { ok: true } }]);
+    assert.deepEqual(reasons(late), ["upgrade-unclaimed"]);
+  });
+
+  test("ctx.upgrade() with an invalid reply in validateReplies 'throw' mode: rejects, InternalError, session resumes", async () => {
+    let rejection: unknown;
+    const session = new ServerSession();
+    const r = await run(
+      {
+        Up: async (_p: unknown, ctx: CallContext) => {
+          rejection = await ctx.upgrade({ ok: "yes" }).catch((e: unknown) => e);
+        },
+      },
+      { method: `${I}.Up`, upgrade: true },
+      { session, eof: false, validateReplies: "throw", upgrade: () => assert.fail("no hand-over") },
+    );
+    assert.ok(rejection instanceof ValidationError);
+    assert.deepEqual(r.replies, [internal]);
+    assert.equal(session.state, "open");
+    assert.deepEqual(reasons(r), ["invalid-reply"]);
+  });
+
+  test("ctx.upgrade() when the reply's write fails: rejects with ConnectionClosedError, no hand-over", async () => {
+    let rejection: unknown;
+    const session = new ServerSession();
+    session.receive(msg({ method: `${I}.Up`, upgrade: true }));
+    const ev = session.nextEvent();
+    assert.ok(ev?.type === "call");
+    await dispatchCall(
+      session,
+      ev.id,
+      ev.call,
+      tableOf([FTL], {
+        [`${I}.Up`]: async (_p: unknown, ctx: CallContext) => {
+          rejection = await ctx.upgrade().catch((e: unknown) => e);
+        },
+      }),
+      () => Promise.reject(new Error("EPIPE")),
+      { upgrade: () => assert.fail("no hand-over"), onError: () => undefined },
+    );
+    assert.ok(rejection instanceof ConnectionClosedError);
   });
 
   test("oneway: nothing is ever written; throws are reported; the call finishes", async () => {

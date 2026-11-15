@@ -12,6 +12,7 @@ import {
   type StreamIterator,
   type StreamOptions,
 } from "./connection.ts";
+import type { UpgradeResult } from "./upgrade.ts";
 import { checkMode } from "./util.ts";
 
 /** Options for `conn.proxy()`. */
@@ -26,6 +27,11 @@ export interface ProxyMethod {
   stream(parameters?: Record<string, unknown>, options?: StreamOptions): StreamIterator;
   collect(parameters?: Record<string, unknown>, options?: CollectOptions): Promise<Record<string, unknown>[]>;
   oneway(parameters?: Record<string, unknown>, options?: CallOptions): Promise<void>;
+  /**
+   * A call with `upgrade` (see `Connection.upgrade`); rejects with a TypeError, nothing sent, for a method whose IDL
+   * has no upgrade flag.
+   */
+  upgrade(parameters?: Record<string, unknown>, options?: CallOptions): Promise<UpgradeResult>;
 }
 
 /**
@@ -91,6 +97,22 @@ export async function createProxy(conn: Connection, name: string, options?: Prox
                 resolve();
               },
               fail: reject,
+            });
+          }),
+      },
+      upgrade: {
+        value: (parameters?: Record<string, unknown>, opts?: CallOptions) =>
+          new Promise<UpgradeResult>((resolve, reject) => {
+            if (m.member.upgrade === undefined) {
+              reject(new TypeError(`${method} does not support upgrade (its IDL has no upgrade flag)`));
+              return;
+            }
+            internals.start("upgrade", method, parameters, opts, spec, {
+              value: () => undefined,
+              fail: reject,
+              upgraded: (v, channel) => {
+                resolve({ parameters: v, channel });
+              },
             });
           }),
       },

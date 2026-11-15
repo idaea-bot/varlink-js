@@ -24,6 +24,7 @@ import {
 import { InternalErrorInterface, OrgVarlinkService } from "../interfaces/index.ts";
 import { createProxy, type InterfaceProxy, type ProxyOptions } from "./proxy.ts";
 import { assertBuiltinCompatible } from "./service.ts";
+import { UpgradedChannel, type UpgradeResult } from "./upgrade.ts";
 import { checkMode, checkPositiveInt, checkTimeout, splitName } from "./util.ts";
 
 /** Default call timeout in ms (sd-varlink's 45 s). */
@@ -123,7 +124,7 @@ export interface CallSpec {
 }
 
 /** Internal: the shape of a call on the wire. */
-export type OpKind = "single" | "more" | "oneway";
+export type OpKind = "single" | "more" | "oneway" | "upgrade";
 
 /** Internal: where a call's outcome goes. */
 export interface Sink {
@@ -131,6 +132,8 @@ export interface Sink {
   fail(error: unknown): void;
   /** Undelivered stream replies (backpressure). */
   buffered?(): number;
+  /** The confirming reply of an upgrade call, with the upgraded channel (kind `upgrade` only). */
+  upgraded?(value: Record<string, unknown>, channel: ByteChannel): void;
 }
 
 interface Registered {
@@ -366,6 +369,8 @@ export class Connection {
   #writingOneway: Op | undefined;
   #pumping = false;
   #closing = false;
+  /** An upgrade call succeeded: the connection is finished and the channel belongs to the upgrade's caller. */
+  #upgraded = false;
   #closeReason: unknown;
   #resumeRead: (() => void) | undefined;
   #resolveClosed: () => void = () => undefined;
@@ -561,6 +566,45 @@ export class Connection {
     });
   }
 
+  /**
+   * A call with `upgrade` (protocol upgrade, §5.6): resolves with the confirming reply's parameters and the
+   * connection's transport as a ByteChannel carrying the upgraded protocol. That channel first yields any bytes the
+   * service sent after its reply (also those in the reply's chunk), then reads from the transport; it owns the
+   * transport from then on. The connection is finished as a varlink connection: later calls reject with
+   * ConnectionClosedError, `isClosed` is true, `closed` resolves and `close()` leaves the channel alone (close or
+   * end the channel instead).
+   *
+   * An error reply rejects with it and the connection stays usable (UAPI). While the call is pending, calls made after
+   * it reject with UpgradePendingError. `timeout` runs until the confirming reply; a timeout or an abort of a call
+   * that was written closes the connection (nobody can tell whether the service upgraded) and rejects with
+   * CallTimeoutError or the abort reason. A method descriptor must declare upgrade support (TypeError otherwise,
+   * nothing sent); an untyped name is sent as is.
+   */
+  upgrade<M extends MethodDescriptor<object, object>>(
+    method: M,
+    parameters: MethodInput<M>,
+    options?: CallOptions,
+  ): Promise<UpgradeResult<MethodOutput<M>>>;
+  upgrade(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<UpgradeResult>;
+  upgrade(
+    method: string | MethodDescriptor<object, object>,
+    parameters?: object,
+    options?: CallOptions,
+  ): Promise<UpgradeResult> {
+    return new Promise((resolve, reject) => {
+      const [name, spec] = this.#resolve(method);
+      if (typeof method !== "string" && method.upgrade === undefined)
+        throw new TypeError(`${safeQuote(name)} does not support upgrade (its IDL has no upgrade flag)`);
+      this.#start("upgrade", name, parameters as Record<string, unknown>, options, spec, {
+        value: () => undefined,
+        fail: reject,
+        upgraded: (value, channel) => {
+          resolve({ parameters: value, channel });
+        },
+      });
+    });
+  }
+
   /** `org.varlink.service.GetInfo`, validated. */
   getInfo(options?: CallOptions): Promise<ServiceInfo> {
     return this.#service("GetInfo", {}, options) as Promise<ServiceInfo>;
@@ -663,7 +707,7 @@ export class Connection {
       onDone?.();
     };
     if (this.#closing) {
-      finish(new ConnectionClosedError("connection is closed"));
+      finish(new ConnectionClosedError(this.#upgraded ? "connection was upgraded" : "connection is closed"));
       return undefined;
     }
     let op: Op;
@@ -688,6 +732,7 @@ export class Connection {
       const init: CallInit = { method, parameters: params };
       if (kind === "oneway") init.oneway = true;
       if (kind === "more") init.more = true;
+      if (kind === "upgrade") init.upgrade = true;
       op = new Op(kind, method, init, spec ?? { mode: "off" }, times, signal, sink, onDone);
     } catch (e) {
       finish(e);
@@ -819,8 +864,8 @@ export class Connection {
           else this.#closeWith(new ConnectionClosedError("connection closed by peer"), undefined);
           return;
         case "upgraded":
-          // call() never sets upgrade (M9).
-          break;
+          this.#onUpgraded(ev.id, ev.parameters);
+          return;
       }
     }
   }
@@ -850,6 +895,49 @@ export class Connection {
       this.#clearTimer(op);
       if (op.idleTimeout > 0 && !this.#paused(op)) this.#arm(op, op.idleTimeout);
     }
+  }
+
+  /**
+   * The confirming reply of the upgrade call: the session stopped decoding, so the rest of the stream (what it kept
+   * past the reply's NUL, then the transport) goes to the caller as the upgraded channel, and the connection is
+   * finished without closing the transport. The reader loop stops before reading again (it sees #closing).
+   */
+  #onUpgraded(id: number, parameters: Record<string, unknown>): void {
+    const channel = new UpgradedChannel(this.#channel, this.#session.takeUpgradeRemainder());
+    const op = this.#byId.get(id);
+    this.#upgraded = true;
+    this.#closing = true;
+    // Calls after the upgrade call never reached the session (it refuses them while the upgrade is pending).
+    const failure = new ConnectionClosedError("connection was upgraded");
+    for (const other of [...this.#queue.splice(0), ...this.#inflight]) {
+      if (other === op || other.stage === "done") continue;
+      this.#settle(other);
+      other.sink.fail(failure);
+    }
+    this.#maybeResume();
+    this.#resolveClosed();
+    if (op?.sink.upgraded === undefined) {
+      // Not reachable: only upgrade calls upgrade, and one that settled early (timeout, abort) closed the connection.
+      channel.close();
+      return;
+    }
+    this.#settle(op);
+    let value: Record<string, unknown> = parameters;
+    const output = op.spec.output;
+    if (output !== undefined && op.spec.mode !== "off") {
+      try {
+        value = output.decode(parameters, { unknownFields: "drop" }) as Record<string, unknown>;
+      } catch (e) {
+        if (op.spec.mode === "throw" || (this.#ints === "number" && isIntRange(e))) {
+          // Nobody will take the channel: release the transport.
+          channel.close(e);
+          op.sink.fail(e);
+          return;
+        }
+        this.#report(e, op.method, "invalid-reply");
+      }
+    }
+    op.sink.upgraded(value, channel);
   }
 
   /** An error reply as the most specific error, validating its parameters where the interface is known. */

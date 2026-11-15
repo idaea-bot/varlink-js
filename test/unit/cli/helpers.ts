@@ -142,6 +142,8 @@ export interface FakeIoOptions {
   signal?: AbortSignal;
   /** Called with stdout's text so far after each write. */
   onStdout?: (text: string) => void;
+  /** Called when the command ends stdout early (CliOutput.end). */
+  onStdoutEnd?: () => void;
   /** Called with each stderr write's text once it is recorded. */
   onStderr?: (text: string) => void;
   /** Awaited by each stdout write before it is recorded (a slow or blocked reader). */
@@ -151,6 +153,8 @@ export interface FakeIoOptions {
 /** A fake CliIo recording stdout and stderr. */
 export interface FakeIo extends CliIo {
   readonly stdoutChunks: Uint8Array[];
+  /** Whether the command ended stdout early (CliOutput.end); a write after that rejects. */
+  readonly stdoutEnded: boolean;
   stdoutText(): string;
   stderrText(): string;
 }
@@ -187,6 +191,7 @@ export function fakeIo(options: FakeIoOptions = {}): FakeIo {
         ? once(bytesOf(options.stdin))
         : options.stdin;
   let writes = 0;
+  let stdoutEnded = false;
   return {
     stdin: {
       isTTY: options.stdinTTY ?? false,
@@ -196,6 +201,7 @@ export function fakeIo(options: FakeIoOptions = {}): FakeIo {
       isTTY: options.stdoutTTY ?? false,
       write: async (data) => {
         await Promise.resolve();
+        if (stdoutEnded) throw new Error("fake stdout: write after end()");
         if (options.stdoutBreaksAfter !== undefined && writes >= options.stdoutBreaksAfter)
           throw new BrokenPipeError("write EPIPE");
         writes++;
@@ -203,6 +209,11 @@ export function fakeIo(options: FakeIoOptions = {}): FakeIo {
         await options.beforeStdoutWrite?.(bytes);
         stdoutChunks.push(bytes);
         options.onStdout?.(decoder.decode(concat(stdoutChunks)));
+      },
+      end: async () => {
+        await Promise.resolve();
+        stdoutEnded = true;
+        options.onStdoutEnd?.();
       },
     },
     stderr: {
@@ -216,6 +227,9 @@ export function fakeIo(options: FakeIoOptions = {}): FakeIo {
     env: options.env ?? {},
     signal: options.signal,
     stdoutChunks,
+    get stdoutEnded() {
+      return stdoutEnded;
+    },
     stdoutText: () => decoder.decode(concat(stdoutChunks)),
     stderrText: () => decoder.decode(concat(stderrChunks)),
   };

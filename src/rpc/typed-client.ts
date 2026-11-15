@@ -1,9 +1,11 @@
 // Typed clients for generated interface descriptors (DESIGN.md §5.3, §4.13): one function per method over a
 // Connection or a Pool, plus the runtime helpers generated code calls. Connection and Pool are imported as types
 // only, so the generated built-ins (src/interfaces/, imported by connection.ts) do not form an import cycle.
+import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { InterfaceDescriptor, MethodDescriptor, MethodInput, MethodOutput } from "../core/types/descriptors.ts";
 import type { CallOptions, CollectOptions, Connection, StreamIterator, StreamOptions } from "./connection.ts";
 import type { Pool } from "./pool.ts";
+import type { UpgradeResult } from "./upgrade.ts";
 
 /** The `options` of a generated error class constructor (the standard `ErrorOptions`, under a name that a varlink type cannot shadow). */
 export type VarlinkErrorOptions = ErrorOptions;
@@ -12,8 +14,8 @@ export type VarlinkErrorOptions = ErrorOptions;
 type Args<In, O> = Record<string, never> extends In ? [parameters?: In, options?: O] : [parameters: In, options?: O];
 
 /**
- * One method of a {@link TypedClient}: callable (single reply), plus `.stream()`, `.collect()` and `.oneway()`,
- * mirroring the untyped Connection API (§5.3). `.upgrade()` comes with M9.
+ * One method of a {@link TypedClient}: callable (single reply), plus `.stream()`, `.collect()`, `.oneway()` and
+ * `.upgrade()`, mirroring the untyped Connection API (§5.3).
  */
 export type TypedMethod<M> = {
   (...args: Args<MethodInput<M>, CallOptions>): Promise<MethodOutput<M>>;
@@ -23,6 +25,12 @@ export type TypedMethod<M> = {
   collect(...args: Args<MethodInput<M>, CollectOptions>): Promise<MethodOutput<M>[]>;
   /** A oneway call; resolves when written. */
   oneway(...args: Args<MethodInput<M>, CallOptions>): Promise<void>;
+  /**
+   * A protocol upgrade (see `Connection.upgrade`). Present on every method because generated method descriptor types
+   * do not carry the IDL flags; it rejects with a TypeError (nothing sent) for a method whose IDL has no upgrade flag,
+   * and with an OperationNotSupportedError over a Pool (an upgraded connection can never return to it).
+   */
+  upgrade(...args: Args<MethodInput<M>, CallOptions>): Promise<UpgradeResult<MethodOutput<M>>>;
 };
 
 /** A typed client: one {@link TypedMethod} per method of the descriptor, by short name. */
@@ -39,6 +47,8 @@ interface ClientTarget {
   stream(method: AnyMethod, parameters: object, options?: StreamOptions): StreamIterator<object>;
   collect(method: AnyMethod, parameters: object, options?: CollectOptions): Promise<object[]>;
   oneway(method: AnyMethod, parameters: object, options?: CallOptions): Promise<void>;
+  /** Connection only (a Pool has none). */
+  upgrade?(method: AnyMethod, parameters: object, options?: CallOptions): Promise<UpgradeResult<object>>;
 }
 
 function isClientTarget(target: unknown): target is ClientTarget {
@@ -74,6 +84,19 @@ export function createClient<D extends InterfaceDescriptor>(descriptor: D, targe
       },
       oneway: {
         value: (parameters?: object, options?: CallOptions) => target.oneway(md, parameters ?? {}, options),
+      },
+      upgrade: {
+        value: (parameters?: object, options?: CallOptions): Promise<UpgradeResult<object>> => {
+          if (md.upgrade === undefined)
+            return Promise.reject(new TypeError(`${md.method} does not support upgrade (its IDL has no upgrade flag)`));
+          if (typeof target.upgrade !== "function")
+            return Promise.reject(
+              new OperationNotSupportedError(
+                `${md.method}: a Pool cannot upgrade (an upgraded connection never returns to it); use a Connection`,
+              ),
+            );
+          return target.upgrade(md, parameters ?? {}, options);
+        },
       },
     });
     Object.defineProperty(out, key, { value: Object.freeze(fn), enumerable: true });

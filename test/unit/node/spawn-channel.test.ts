@@ -167,6 +167,25 @@ describe("fromNodeStreams over a child's stdout/stdin (cat)", () => {
     assert.equal(await exited, 0);
   });
 
+  // M9 VM interop: a child that reads one line, answers and exits while we keep writing. stdin's EPIPE destroys only
+  // stdin (a separate pipe), so the answer on stdout is kept, unlike a socket (socket.test.ts).
+  test("a child that answers one line and exits while we keep writing: the answer is read, the write rejects", async () => {
+    const child = spawn("/bin/sh", ["-c", 'read -r l; echo "$l"'], { stdio: ["pipe", "pipe", "inherit"] });
+    const ch = fromNodeStreams(child.stdout, child.stdin);
+    let failure: unknown;
+    const writing = (async () => {
+      for (let i = 0; i < 10_000 && failure === undefined; i++)
+        await ch.write(enc("y\n".repeat(32768))).catch((e: unknown) => (failure = e));
+    })();
+    let got = "";
+    for (let c = await ch.read(); c !== null; c = await ch.read()) got += dec(c.bytes);
+    await writing;
+    assert.equal(got, "y\n");
+    assert.ok(failure !== undefined, "a write failed once the child was gone");
+    ch.close();
+    await ch.closed;
+  });
+
   test("writing to a dead child rejects (EPIPE), never crashes", async () => {
     const child = spawn("/bin/sh", ["-c", "exit 0"], { stdio: ["pipe", "pipe", "inherit"] });
     const ch = fromNodeStreams(child.stdout, child.stdin);

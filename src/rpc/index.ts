@@ -15,6 +15,7 @@ export {
 } from "./connection.ts";
 export { createPool, Pool, type ConnectionFactory, type PoolOptions } from "./pool.ts";
 export type { InterfaceProxy, ProxyMethod, ProxyOptions } from "./proxy.ts";
+export type { UpgradeResult } from "./upgrade.ts";
 export {
   createClient,
   freezeDescriptor,

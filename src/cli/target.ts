@@ -2,6 +2,7 @@
 // ssh-unix: and ssh-exec: of varlink-js/node's connect(); WebSocket mode) and the simple HTTP mode client.
 // The CLI bounds everything with its own deadline signal, so the library's timeouts are off (0).
 import type { AddressSpec } from "../core/address/index.ts";
+import type { ByteChannel } from "../core/protocol/index.ts";
 import { createHttpClient, type HttpClient } from "../http/index.ts";
 import { connect as nodeConnect } from "../node/index.ts";
 import type { Connection, ConnectionOptions } from "../rpc/index.ts";
@@ -20,6 +21,11 @@ export interface Target {
   collect(method: string, parameters: Params): Promise<Params[]>;
   /** Resolves once the call was written (simple HTTP mode: rejects, it has no oneway). */
   oneway(method: string, parameters: Params): Promise<void>;
+  /**
+   * A protocol upgrade: the upgraded channel (the connection is finished; close the channel). Simple HTTP mode has
+   * none (a CliError).
+   */
+  upgrade(method: string, parameters: Params): Promise<ByteChannel>;
   /**
    * The service to send an `org.varlink.service` call to: `undefined` on a connection (it is the service); in simple
    * HTTP mode `iface` when given, else the bridge's only service (more than one: a CliError).
@@ -44,6 +50,7 @@ function connectionTarget(conn: Connection, signal: AbortSignal): Target {
     stream: (method, parameters) => conn.stream(method, parameters, { signal }),
     collect: (method, parameters) => conn.collect(method, parameters, { signal }),
     oneway: (method, parameters) => conn.oneway(method, parameters, { signal }),
+    upgrade: async (method, parameters) => (await conn.upgrade(method, parameters, { signal })).channel,
     introspectionService: () => Promise.resolve(undefined),
     close: () => conn.close(),
   };
@@ -57,6 +64,12 @@ function httpTarget(client: HttpClient, signal: AbortSignal): Target {
     stream: (method, parameters) => client.stream(method, parameters, { signal }),
     collect: (method, parameters) => client.collect(method, parameters, { signal }),
     oneway: (method, parameters) => client.oneway(method, parameters, { signal }),
+    upgrade: () =>
+      Promise.reject(
+        new CliError(
+          "simple HTTP mode has no protocol upgrade; use the WebSocket address of the service (…/ws/services/<service>)",
+        ),
+      ),
     async introspectionService(iface) {
       if (iface !== undefined) return iface;
       const services = await client.listServices({ signal });

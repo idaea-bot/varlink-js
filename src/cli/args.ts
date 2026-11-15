@@ -37,6 +37,7 @@ const COMMANDS: Readonly<Record<string, Table>> = {
     E: { type: "boolean", short: "E", shortOnly: true },
     collect: { type: "boolean" },
     oneway: { type: "boolean" },
+    upgrade: { type: "boolean" },
     graceful: { type: "string", multiple: true },
   },
   "validate-idl": {},
@@ -55,7 +56,7 @@ const COMMANDS: Readonly<Record<string, Table>> = {
 /** `--json=` / `-j`: `auto` is pretty when stdout is a TTY, else short. */
 export type JsonMode = "pretty" | "short" | "off" | "auto";
 /** How `call` sends the call. */
-export type CallMode = "single" | "more" | "collect" | "oneway";
+export type CallMode = "single" | "more" | "collect" | "oneway" | "upgrade";
 
 /** The parsed command line. */
 export interface CommandLine {
@@ -151,11 +152,12 @@ const USEC_INFINITY = 2n ** 64n - 1n;
 const INT64_MAX = 2n ** 63n - 1n;
 /** parse_time's WHITESPACE: space, TAB, LF, CR. */
 const WHITESPACE = /^[ \t\n\r]*/;
-const TERM = /^(\d*)(?:(\.)(\d*))?/;
+/** One term's number as strtoll reads it: an optional `+` (a `-` is ERANGE), digits, then parse_time's fraction. */
+const TERM = /^(\+?)(\d*)(?:(\.)(\d*))?/;
 
 /**
- * systemd's parse_sec: a sum of terms `NUMBER[.DIGITS][ ]UNIT` (whitespace between terms allowed, `1min 30s`,
- * `1.5h`), a bare number being seconds; whole microseconds, each term and fraction digit rounded down like
+ * systemd's parse_sec: a sum of terms `[+]NUMBER[.DIGITS][ ]UNIT` (whitespace between terms allowed, `1min 30s`,
+ * `1.5h`, `+5s`: each term's number goes through strtoll, which takes a sign), a bare number being seconds; whole microseconds, each term and fraction digit rounded down like
  * parse_time. `undefined` when it does not parse or is out of range.
  */
 function parseSec(text: string): bigint | "infinity" | undefined {
@@ -167,9 +169,10 @@ function parseSec(text: string): bigint | "infinity" | undefined {
     p = p.slice(WHITESPACE.exec(p)?.[0].length ?? 0);
     if (p === "") return something ? total : undefined;
     const m = TERM.exec(p);
-    const [all = "", whole = "", dot, digits = ""] = m ?? [];
-    // Like strtoll: digits (none only before a dot); "3." and "3.s" are rejected below.
-    if (whole === "" && dot === undefined) return undefined;
+    const [all = "", sign = "", whole = "", dot, digits = ""] = m ?? [];
+    // Like strtoll: digits (none only before a dot, and not after a sign: strtoll("+.5") converts nothing and
+    // parse_time then sees neither digits nor a dot, EINVAL); "3." and "3.s" are rejected below.
+    if (whole === "" && (dot === undefined || sign !== "")) return undefined;
     if (dot !== undefined && digits === "") return undefined;
     p = p.slice(all.length);
     const afterSpace = p.slice(WHITESPACE.exec(p)?.[0].length ?? 0);
@@ -221,7 +224,8 @@ export function isQualifiedName(s: string): boolean {
  * Parses `argv` (without the node and script paths).
  *
  * @throws {UsageError} for an unknown command or option, a missing or unexpected option value, an invalid `--json`,
- *   `--timeout`, `--graceful` or `--ints` value, or more than one of `--more`/`-E`, `--collect` and `--oneway`.
+ *   `--timeout`, `--graceful` or `--ints` value, more than one of `--more`/`-E`, `--collect` and `--oneway`, or
+ *   `--upgrade` with any of them or `--graceful`.
  */
 export function parseCommandLine(argv: readonly string[]): CommandLine {
   // Pass 1: find the command. Lenient, so an unknown option does not hide it (pass 2 reports it).
@@ -266,6 +270,7 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
   let ints: "number" | "bigint" | undefined;
   let importPath: string | undefined;
   let address: string | undefined;
+  let upgrade = false;
   for (const token of parsed.tokens) {
     if (token.kind !== "option") continue;
     if (defs[token.name]?.shortOnly === true && token.rawName.startsWith("--"))
@@ -311,6 +316,9 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
         modes.add("oneway");
         mode = "oneway";
         break;
+      case "upgrade":
+        upgrade = true;
+        break;
       case "graceful":
         if (!isQualifiedName(value)) throw new UsageError(`Not a valid Varlink error name: ${escapeControls(value)}`);
         graceful.add(value);
@@ -337,6 +345,10 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
         break;
     }
   }
+  // varlinkctl's check and message (verb_call); --push-fd= is M11's.
+  if (upgrade && (modes.size > 0 || graceful.size > 0))
+    throw new UsageError("--upgrade may not be combined with --collect/--more/--oneway/--push-fd=/--graceful.");
+  if (upgrade) mode = "upgrade";
   if (modes.size > 1) throw new UsageError("--more/-E, --collect and --oneway are mutually exclusive.");
   if (check && inPlace) throw new UsageError("--check and --in-place are mutually exclusive.");
   return {

@@ -22,6 +22,11 @@ async function isPending(p: Promise<unknown>): Promise<boolean> {
   return !settled;
 }
 
+/** The channel's own failures carry `local: true`; those caused by the peer do not. */
+function isLocal(e: unknown): boolean {
+  return (e as { local?: unknown }).local === true;
+}
+
 async function readText(ch: ReturnType<typeof fromWebSocket>): Promise<string | null> {
   const chunk = await ch.read();
   return chunk === null ? null : dec(chunk.bytes);
@@ -98,7 +103,10 @@ describe("fromWebSocket: reading", () => {
     ws.message({ size: 3, arrayBuffer: () => Promise.reject(boom) });
     ws.message("after");
     assert.equal(await readText(ch), "before");
-    await assert.rejects(ch.read(), (e: unknown) => e instanceof ConnectionClosedError && e.cause === boom);
+    await assert.rejects(
+      ch.read(),
+      (e: unknown) => e instanceof ConnectionClosedError && e.cause === boom && isLocal(e),
+    );
     assert.equal(await ch.read(), null);
     assert.deepEqual(ws.closes, [{ code: 1011, reason: "unreadable message" }]);
   });
@@ -113,7 +121,7 @@ describe("fromWebSocket: reading", () => {
     ws.message({ size: 3, arrayBuffer: () => Promise.reject(boom) });
     await assert.rejects(ch.read(), (e: unknown) => e instanceof ConnectionClosedError && e.cause === boom);
     ws.closed(1000);
-    await assert.rejects(w, ConnectionClosedError);
+    await assert.rejects(w, (e: unknown) => e instanceof ConnectionClosedError && isLocal(e));
     await assert.rejects(ch.write(enc("y")), ConnectionClosedError);
     ch.close();
     await ch.closed;
@@ -126,7 +134,7 @@ describe("fromWebSocket: reading", () => {
     ws.message(42);
     await assert.rejects(
       ch.read(),
-      (e: unknown) => e instanceof ConnectionClosedError && /unsupported/.test(e.message),
+      (e: unknown) => e instanceof ConnectionClosedError && /unsupported/.test(e.message) && isLocal(e),
     );
     assert.deepEqual(ws.closes, [{ code: 1000, reason: undefined }]); // 1003 refused by the WHATWG API
   });
@@ -162,6 +170,7 @@ describe("fromWebSocket: reading", () => {
       await assert.rejects(ch.read(), (e: unknown) => {
         assert.ok(e instanceof ConnectionClosedError);
         assert.equal(e.message, message);
+        assert.equal(isLocal(e), false, "the peer's close is no local failure");
         return true;
       });
       assert.equal(await ch.read(), null);
@@ -187,6 +196,7 @@ describe("fromWebSocket: reading", () => {
       assert.ok(e instanceof ConnectionClosedError);
       assert.equal(e.message, "websocket closed: code 1006");
       assert.ok(e.cause instanceof ConnectionClosedError && e.cause.message === "websocket error");
+      assert.equal(isLocal(e) || isLocal(e.cause), false);
       return true;
     });
     assert.equal(await ch.read(), null);
@@ -225,7 +235,7 @@ describe("fromWebSocket: reading", () => {
     ws.message("ignored");
     await assert.rejects(
       ch.read(),
-      (e: unknown) => e instanceof ConnectionClosedError && /receive buffer limit/.test(e.message),
+      (e: unknown) => e instanceof ConnectionClosedError && /receive buffer limit/.test(e.message) && isLocal(e),
     );
     assert.equal(await ch.read(), null);
     ws.closed(1009, "", true);
@@ -430,7 +440,7 @@ describe("fromWebSocket: end, close, closed", () => {
       const ended = ch2.end();
       mock.timers.tick(5000);
       await ended;
-      await assert.rejects(w, ConnectionClosedError);
+      await assert.rejects(w, (e: unknown) => e instanceof ConnectionClosedError && !isLocal(e));
       ch2.close();
       await ch2.closed;
       await ch2.end();
@@ -508,7 +518,7 @@ describe("fromWebSocket: end, close, closed", () => {
         await ended;
         await assert.rejects(
           read,
-          (e: unknown) => e instanceof ConnectionClosedError && /did not close in time/.test(e.message),
+          (e: unknown) => e instanceof ConnectionClosedError && /did not close in time/.test(e.message) && !isLocal(e),
         );
         assert.equal(await ch.read(), null);
         await ch.closed;

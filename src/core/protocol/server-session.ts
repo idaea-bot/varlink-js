@@ -36,6 +36,8 @@ export type ServerEvent =
 interface Active {
   readonly id: number;
   readonly call: Call;
+  /** An upgrade call answered as a plain call (Q4, {@link ServerSession.ignoreUpgrade}): its reply does not upgrade. */
+  plain: boolean;
 }
 
 /**
@@ -142,7 +144,7 @@ export class ServerSession {
       return { type: "close", error };
     }
     const id = this.#nextId++;
-    this.#active = { id, call };
+    this.#active = { id, call, plain: false };
     if (call.upgrade) this.#paused = true;
     return { type: "call", id, call };
   }
@@ -206,6 +208,17 @@ export class ServerSession {
       return;
     }
     if (id !== this.#lastFinished || id === 0) throw new TypeError(`call ${String(id)} is not active`);
+  }
+
+  /**
+   * The active call has `upgrade: true` but is answered as a plain call (Q4: its method has no upgrade support, as
+   * sd-varlink does): its final reply, error or not, does not upgrade the session, and splitting resumes once it
+   * ended. A no-op for a call without the flag.
+   *
+   * @throws {TypeError} if `id` is not the active call or the session is not open.
+   */
+  ignoreUpgrade(id: number): void {
+    this.#activeCall(id).plain = true;
   }
 
   /**
@@ -277,7 +290,7 @@ export class ServerSession {
     this.#lastFinished = active.id;
     if (!active.call.upgrade) return true;
     this.#paused = false;
-    if (isError) return true;
+    if (isError || active.plain) return true;
     try {
       const rest = this.#framer.takeRemainder();
       this.#remainder = rest.length > 0 ? [rest] : [];

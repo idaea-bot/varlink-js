@@ -58,6 +58,8 @@ call:
   -E                           Same as --more --timeout=infinity
      --collect                 Request multiple replies, printed as one JSON array
      --oneway                  Do not request a reply
+     --upgrade                 Request a protocol upgrade; then pipe raw bytes between stdin/stdout and the
+                               service (PARAMETERS from argv only; --timeout covers the call, not the stream)
      --graceful=ERROR          Treat the error reply ERROR as success (repeatable)
 format:
      --check                   Print nothing; fail and name the files that are not canonical

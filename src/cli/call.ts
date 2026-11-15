@@ -5,6 +5,7 @@ import { isQualifiedName } from "./args.ts";
 import { callFailure, expectArgs, jsonStyle, parseAddressArg, printable, withTarget, type Context } from "./context.ts";
 import { BrokenPipeError, CliError, decodeUtf8, describeError, readAll, type Deadline } from "./io.ts";
 import { formatJson, type JsonStyle } from "./json.ts";
+import { callUpgrade } from "./upgrade.ts";
 
 type Params = Record<string, unknown>;
 
@@ -38,6 +39,16 @@ async function readParameters(ctx: Context, text: string | undefined): Promise<P
     source = "<argv>";
     raw = text;
   }
+  return parseParameters(raw, source);
+}
+
+/** PARAMETERS from argv only (`call --upgrade`: stdin carries the upgraded stream); absent or `-` → `{}`. */
+function argvParameters(text: string | undefined): Params {
+  return text === undefined || text === "-" ? {} : parseParameters(text, "<argv>");
+}
+
+/** A JSON object (blank = `{}`), parsed losslessly. @throws {CliError} `Failed to parse parameters at SOURCE: …`. */
+function parseParameters(raw: string, source: string): Params {
   if (BLANK.test(raw)) return {};
   let value: unknown;
   try {
@@ -88,6 +99,7 @@ export async function call(ctx: Context): Promise<number> {
       `Not a valid qualified method name: '${method}' (Expected valid Varlink interface name, followed by a dot, followed by a valid Varlink symbol name.)`,
     );
   parseAddressArg(address);
+  if (ctx.cli.mode === "upgrade") return callUpgrade(ctx, address, method, argvParameters(text));
   const parameters = await readParameters(ctx, text);
   const style = jsonStyle(ctx, true) ?? "short";
   const quiet = ctx.cli.quiet;
@@ -133,6 +145,9 @@ export async function call(ctx: Context): Promise<number> {
         if (!quiet) await ctx.out(formatJson(reply, style));
         return 0;
       }
+      case "upgrade":
+        // Handled before stdin is read (callUpgrade).
+        throw new Error("call --upgrade reached the plain call path");
     }
   });
 }

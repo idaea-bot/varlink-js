@@ -14,6 +14,11 @@ export interface CliOutput {
    * backpressure and the per-record flush); rejects with {@link BrokenPipeError} when the reader went away (EPIPE).
    */
   write(data: string | Uint8Array): Promise<void>;
+  /**
+   * Ends the stream early, so its reader sees EOF before the process exits (`call --upgrade` when the service's side
+   * ended). Optional and best effort; no write may follow.
+   */
+  end?(): Promise<void>;
   readonly isTTY: boolean;
 }
 
@@ -27,7 +32,40 @@ export interface CliIo {
   readonly signal?: AbortSignal | undefined;
 }
 
-/** stdout's reader went away (EPIPE, e.g. `| head -1`): the command stops quietly and exits 0. */
+/**
+ * systemd's ERRNO_IS_DISCONNECT (src/basic/errno-util.h:124-141 at 6bd4689f) as Node `code`s: the errnos that mean the
+ * other side went away (socket-forward ends a direction quietly on them; the CLI treats them like EPIPE on stdout).
+ */
+const DISCONNECT_CODES: ReadonlySet<string> = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTDOWN",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "ENONET",
+  "ENOPROTOOPT",
+  "ENOTCONN",
+  "EPIPE",
+  "EPROTO",
+  "ESHUTDOWN",
+  "ETIMEDOUT",
+  // Not systemd's: libuv's code for a write still pending when the socket was closed under it (Bun reports a write
+  // into a reset connection this way); a close of our own never gets here (the command is done by then).
+  "ECANCELED",
+]);
+
+/** Whether `code` (a Node error's `code`) is a disconnect errno ({@link DISCONNECT_CODES}). */
+export function isDisconnectCode(code: unknown): boolean {
+  return typeof code === "string" && DISCONNECT_CODES.has(code);
+}
+
+/**
+ * stdout's reader went away (EPIPE, e.g. `| head -1`, or another disconnect errno such as ECONNRESET when stdout is a
+ * socket): the command stops quietly and exits 0.
+ */
 export class BrokenPipeError extends Error {
   override readonly name: string = "BrokenPipeError";
 }

@@ -173,7 +173,7 @@ function received(ctx: CallContext, parameters: Params): Params {
     parameters,
     ...(ctx.more ? { more: true } : {}),
     ...(ctx.oneway ? { oneway: true } : {}),
-    ...(ctx.upgrade ? { upgrade: true } : {}),
+    ...(ctx.upgradeRequested ? { upgrade: true } : {}),
   };
 }
 
@@ -216,7 +216,7 @@ export function createCertificationService(options: CertificationServiceOptions 
   const start = (parameters: Params, ctx: CallContext): Params => {
     expire();
     const wants = { method: `${CERTIFICATION_INTERFACE}.Start` };
-    if (ctx.more || ctx.oneway || ctx.upgrade) throw certificationError(wants, received(ctx, parameters));
+    if (ctx.more || ctx.oneway || ctx.upgradeRequested) throw certificationError(wants, received(ctx, parameters));
     while (clients.size >= maxClients) {
       const oldest = clients.keys().next();
       if (oldest.done === true) break;
@@ -250,7 +250,8 @@ export function createCertificationService(options: CertificationServiceOptions 
     if (state.next !== index && expected !== undefined)
       fail({ method: `${CERTIFICATION_INTERFACE}.${expected.method}` });
     const wants = wanted(step, clientId);
-    const shapeOk = !ctx.upgrade && ctx.more === (step.kind === "more") && ctx.oneway === (step.kind === "oneway");
+    const shapeOk =
+      !ctx.upgradeRequested && ctx.more === (step.kind === "more") && ctx.oneway === (step.kind === "oneway");
     if (!shapeOk || !jsonEqual(normalized(parameters), wants["parameters"])) fail(wants);
     state.next = index + 1;
     if (state.next === CERTIFICATION_STEPS.length) clients.delete(clientId);

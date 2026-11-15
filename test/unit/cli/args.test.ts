@@ -37,7 +37,15 @@ describe("usage errors: one line, the help hint, exit 1", () => {
   const cases: [string[], RegExp][] = [
     [[], /^Command verb required\.$/],
     [["frobnicate"], /^Unknown command verb 'frobnicate'\.$/],
-    [["call", "--upgrade", "a", "b.c.D"], /--upgrade/],
+    [["info", "--upgrade", "a"], /--upgrade/],
+    ...["--more", "-E", "--collect", "--oneway", "--graceful=a.b.C"].map((flag): [string[], RegExp] => [
+      ["call", "--upgrade", flag, "a", "b.c.D"],
+      /^--upgrade may not be combined with --collect\/--more\/--oneway\/--push-fd=\/--graceful\.$/,
+    ]),
+    [
+      ["call", "--more", "a", "b.c.D", "--upgrade"],
+      /^--upgrade may not be combined with --collect\/--more\/--oneway\/--push-fd=\/--graceful\.$/,
+    ],
     [["info", "--more", "a"], /--more/],
     [["call", "--timeout"], /--timeout/],
     [["call", "--more=yes", "a", "b.c.D"], /--more/],
@@ -102,6 +110,14 @@ describe("parseCommandLine", () => {
     assert.equal(parseCommandLine(["call", "--more", "-E", "a", "b.c.D"]).mode, "more");
   });
 
+  test("--upgrade: mode upgrade, with --timeout, -j, -q (anywhere on the line)", () => {
+    const c = parseCommandLine(["call", "--timeout=+5s", "a", "--upgrade", "b.c.D", "-"]);
+    assert.equal(c.mode, "upgrade");
+    assert.equal(c.timeout, 5000);
+    assert.deepEqual(c.args, ["a", "b.c.D", "-"]);
+    assert.equal(parseCommandLine(["-q", "-j", "call", "--upgrade", "a", "b.c.D"]).mode, "upgrade");
+  });
+
   test("--graceful is repeatable, sorted and unique; -- ends the options", () => {
     const c = parseCommandLine(["call", "--graceful=z.y.X", "--graceful", "a.b.C", "--graceful=z.y.X", "a", "b.c.D"]);
     assert.deepEqual(c.graceful, ["a.b.C", "z.y.X"]);
@@ -152,6 +168,13 @@ describe("parseCommandLine", () => {
       ["infinity", null],
       [" infinity ", null],
       ["", null],
+      // strtoll takes a leading "+" in every term (M9).
+      ["+5s", 5000],
+      ["+5", 5000],
+      ["+1.5s", 1500],
+      ["+1min +30s", 90_000],
+      ["1min+30s", 90_000],
+      [" +500ms", 500],
     ];
     for (const [text, ms] of cases) assert.equal(parseTimeout(text), ms, text);
     for (const bad of [
@@ -167,6 +190,13 @@ describe("parseCommandLine", () => {
       " ",
       "infinity 1",
       "+",
+      "+.5",
+      "+ 5",
+      "++5",
+      "+-5",
+      "-5s",
+      "1min -30s",
+      "+infinity",
       "2500ns",
       "999ns",
       "1500nsec",

@@ -2,7 +2,7 @@
 // over ServerSession + dispatchCall (DESIGN.md §4.10 contract), accept loops, limits and shutdown.
 import { ConnectionClosedError, OperationNotSupportedError, safeQuote } from "../core/errors/local.ts";
 import { INTERNAL_ERROR_INTERFACE, ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
-import type { ByteChannel } from "../core/protocol/channel.ts";
+import type { ByteChannel, ReadChunk } from "../core/protocol/channel.ts";
 import {
   dispatchCall,
   type CallContext,
@@ -24,6 +24,7 @@ import {
   type MethodOutput,
 } from "../core/types/descriptors.ts";
 import { builtinInterfaces, entriesOf, type MethodImplementation, type RegisteredInterface } from "./service.ts";
+import { UpgradedChannel } from "./upgrade.ts";
 import { checkMode, checkPositiveInt, checkTimeout, splitName, Wakeup } from "./util.ts";
 
 /** Why {@link ServerOptions.onError} was called: a dispatch reason (§4.10) or a connection-level one. */
@@ -234,11 +235,45 @@ class ServerConnection {
   #finishing: Promise<void> | undefined;
   /** Graceful close: closes the connection GRACEFUL_LINGER_MS after the channel was ended. */
   #linger: ReturnType<typeof setTimeout> | undefined;
+  /** The reader's read() that has not settled yet (handed to the upgraded channel if the upgrade happens meanwhile). */
+  #inFlight: Promise<ReadChunk | null> | undefined;
+  /** ctx.upgrade() took the transport: the reader and dispatcher leave the channel alone. */
+  #handedOver = false;
+  /** A read outcome after the confirming reply (EOF, or a rejection), before the hand-over: the channel's next one. */
+  #upgradeEnd: { error?: unknown } | undefined;
+  #resolveReleased: () => void = () => undefined;
+  /** Resolves when the transport was handed to an upgrade handler (graceful shutdown does not wait for it). */
+  readonly released: Promise<void>;
 
   constructor(channel: ByteChannel, session: ServerSession, host: ConnectionHost) {
     this.#channel = channel;
     this.#session = session;
     this.#host = host;
+    this.released = new Promise((resolve) => {
+      this.#resolveReleased = resolve;
+    });
+  }
+
+  /** The transport belongs to an upgrade handler (until it closes the channel, the connection stays counted). */
+  get upgraded(): boolean {
+    return this.#handedOver;
+  }
+
+  /**
+   * `ctx.upgrade()`'s hand-over, once the confirming reply was written: the transport as a channel that yields the
+   * bytes the session kept past the call (early data), then the outcome of a read already in flight (or one seen
+   * after the reply), then the transport's reads.
+   */
+  #handOver(): ByteChannel {
+    if (this.#closing) throw new ConnectionClosedError("the connection was closed");
+    const head = this.#session.takeUpgradeRemainder();
+    this.#handedOver = true;
+    const channel = new UpgradedChannel(this.#channel, head, { pending: this.#inFlight, ended: this.#upgradeEnd });
+    this.#inFlight = undefined;
+    this.#upgradeEnd = undefined;
+    this.#resolveReleased();
+    this.#readerWake.notify();
+    return channel;
   }
 
   /** Serves until the channel is closed. Never rejects. */
@@ -279,7 +314,25 @@ class ServerConnection {
           await this.#readerWake.wait();
           continue;
         }
-        const chunk = await this.#channel.read();
+        const read = this.#channel.read();
+        this.#inFlight = read;
+        let chunk: ReadChunk | null;
+        try {
+          chunk = await read;
+        } finally {
+          if (this.#inFlight === read) this.#inFlight = undefined;
+        }
+        // The upgraded channel took this read's outcome.
+        if (this.#handedOver) return;
+        // Read again: the state may change during the await (TypeScript still has it narrowed to "open").
+        const state: string = session.state;
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
+        if (!this.#closing && this.#finishing === undefined && state === "upgraded") {
+          // After the confirming reply, before the hand-over: kept for the upgraded channel.
+          if (chunk === null) this.#upgradeEnd = {};
+          else session.receive(chunk.bytes);
+          return;
+        }
         // Closing, finishing or no longer open: the top of the loop decides (the chunk is dropped).
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
         if (this.#closing || this.#finishing !== undefined || session.state !== "open") continue;
@@ -288,7 +341,12 @@ class ServerConnection {
         this.#dispatcherWake.notify();
       }
     } catch (e) {
-      if (this.#closing) return;
+      if (this.#closing || this.#handedOver) return;
+      if (session.state === "upgraded") {
+        // After the confirming reply, before the hand-over: the upgraded channel's first read reports it.
+        this.#upgradeEnd = { error: e };
+        return;
+      }
       // A graceful finish was in progress: the peer is gone, nothing left to protect (no report).
       if (this.#finishing !== undefined) {
         this.#close();
@@ -320,6 +378,8 @@ class ServerConnection {
     const session = this.#session;
     /** Ended by a graceful shutdown (not a protocol error, upgrade or close): the last reply must arrive. */
     let graceful = false;
+    /** The transport went to an upgrade handler: it is not ours to close. */
+    let claimed = false;
     try {
       for (;;) {
         const ev = session.nextEvent();
@@ -348,11 +408,16 @@ class ServerConnection {
         await dispatchCall(session, ev.id, ev.call, this.#host.table, (bytes) => this.#channel.write(bytes), {
           ...this.#host.dispatchOptions,
           signal: ac.signal,
+          upgrade: () => this.#handOver(),
         });
         this.#active = undefined;
         this.#readerWake.notify();
-        // An upgrade nobody claimed (M3 reported upgrade-unclaimed): the stream is not varlink any more.
-        if (session.state === "upgraded") break;
+        // Upgraded: the handler took the transport (ctx.upgrade), or nobody did (dispatch reported
+        // upgrade-unclaimed) and the stream, no longer varlink, is closed below.
+        if (session.state === "upgraded") {
+          claimed = this.#handedOver;
+          break;
+        }
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- drain() may run during the await
         if (this.#draining) {
           graceful = true;
@@ -363,6 +428,7 @@ class ServerConnection {
       // Not reachable by design (dispatchCall never rejects); never an unhandled rejection.
       this.#host.report(e, "transport-error");
     }
+    if (claimed) return;
     if (graceful) this.#finish();
     else this.#close();
   }
@@ -742,7 +808,9 @@ export class Server {
    * `timeout` deadline (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves
    * when every connection is closed. With `timeout: 0` it waits for every active handler to finish and for its
    * replies to be written: a handler that ignores its signal, or a peer that stops reading while a reply is being
-   * written, holds it forever (use a deadline).
+   * written, holds it forever (use a deadline). A connection whose transport went to a handler (`ctx.upgrade()`)
+   * is no varlink connection any more: a graceful shutdown aborts that handler's signal (if it still runs) but
+   * neither waits for the upgraded channel nor closes it, also not at the deadline; `graceful: false` closes it too.
    *
    * @throws {RangeError|TypeError} for invalid options (synchronously; nothing is stopped then).
    */
@@ -769,12 +837,15 @@ export class Server {
       for (const c of conns) c.force();
     } else {
       for (const c of conns) c.drain();
+      // Upgraded connections belong to their handlers: not waited for, not closed at the deadline.
       if (timeout > 0)
         timer = setTimeout(() => {
-          for (const c of this.#connections) c.force();
+          for (const c of this.#connections) if (!c.upgraded) c.force();
         }, timeout);
     }
-    await Promise.all(conns.map(async (c) => this.#done.get(c)));
+    await Promise.all(
+      conns.map(async (c) => (graceful ? Promise.race([this.#done.get(c), c.released]) : this.#done.get(c))),
+    );
     if (timer !== undefined) clearTimeout(timer);
   }
 

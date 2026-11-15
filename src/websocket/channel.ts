@@ -109,6 +109,17 @@ function isCleanClose(event: unknown): boolean {
   return wasClean === true && (code === 1000 || code === 1005);
 }
 
+/**
+ * The channel's own failure (receive limit, unsupported data, unreadable Blob, close-guard timeout), not the peer
+ * closing or resetting: a ConnectionClosedError (as documented) marked with `local: true`, so that a caller can tell
+ * it from a disconnect (the CLI's `call --upgrade` reports it instead of treating it as the stream's end).
+ */
+function localFailure(message: string, options?: ErrorOptions): ConnectionClosedError {
+  const error = new ConnectionClosedError(message, options);
+  Object.defineProperty(error, "local", { value: true, enumerable: true });
+  return error;
+}
+
 function isArrayBuffer(value: unknown): value is ArrayBuffer {
   return Object.prototype.toString.call(value) === "[object ArrayBuffer]";
 }
@@ -254,12 +265,12 @@ class WebSocketChannel implements ByteChannel {
         },
         (error: unknown) => {
           slot.bytes = new Uint8Array(0);
-          slot.error = new ConnectionClosedError("websocket: reading a Blob message failed", { cause: error });
+          slot.error = localFailure("websocket: reading a Blob message failed", { cause: error });
           this.#wake();
         },
       );
     } else {
-      this.#fail(new ConnectionClosedError("websocket: unsupported message data type"), 1003);
+      this.#fail(localFailure("websocket: unsupported message data type"), 1003);
     }
   }
 
@@ -270,9 +281,7 @@ class WebSocketChannel implements ByteChannel {
       return true;
     }
     this.#fail(
-      new ConnectionClosedError(
-        `websocket receive buffer limit exceeded (maxBufferedBytes ${String(this.#maxBuffered)})`,
-      ),
+      localFailure(`websocket receive buffer limit exceeded (maxBufferedBytes ${String(this.#maxBuffered)})`),
       1009,
       "receive buffer limit exceeded",
     );
@@ -292,7 +301,7 @@ class WebSocketChannel implements ByteChannel {
     this.#buffered = 0;
     this.#outcome = { error, fromErrorEvent: false };
     this.#writeShut = true;
-    this.#rejectWrites(new ConnectionClosedError("the websocket is closed", { cause: error }));
+    this.#rejectWrites(localFailure("the websocket is closed", { cause: error }));
     if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
     closeSocket(this.#ws, code, reason);
     this.#armGuard();
@@ -364,7 +373,7 @@ class WebSocketChannel implements ByteChannel {
         reader.reject(slot.error);
         // Our own failure: like #fail, waiting writes reject at once.
         this.#writeShut = true;
-        this.#rejectWrites(new ConnectionClosedError("the websocket is closed", { cause: slot.error }));
+        this.#rejectWrites(localFailure("the websocket is closed", { cause: slot.error }));
         if (this.#ws.readyState === OPEN) this.#closeInitiated = true;
         closeSocket(this.#ws, 1011, "unreadable message");
         this.#armGuard();
@@ -422,6 +431,8 @@ class WebSocketChannel implements ByteChannel {
     this.#guard = setTimeout(() => {
       this.#guard = undefined;
       this.#writeShut = true;
+      // Not local: the peer (or a proxy) never answered our Close; the stream is over either way (call --upgrade
+      // treats it as the peer's EOF).
       this.#rejectWrites(new ConnectionClosedError("the websocket did not close in time"));
       for (const resolve of this.#endWaiters.splice(0)) resolve();
       // The close event may never come: end the stream for a reader too (after end(), reads were still allowed),
@@ -488,6 +499,10 @@ class WebSocketChannel implements ByteChannel {
  * `ConnectionClosedError("the websocket did not close in time")`, then gives `null`, and the listeners are removed;
  * the timer is cleared by the `close` event. All listeners are removed on the
  * `close` event (the socket's last event).
+ *
+ * The channel's own failures (the receive limit, an unsupported or unreadable message, and the write rejections they
+ * cause) are `ConnectionClosedError`s with an extra `local: true` property; those caused by the peer (its close, an
+ * `error` event, no answer to our Close within the guard time) have none.
  *
  * Attach it synchronously in the `open` handler: messages that arrive before are not seen.
  *

@@ -125,7 +125,7 @@ Cells for C/sd/python/rust come from reading their sources (paths in §0), not f
 | Typed interface errors | ◐ (by name) | ◐ (by name) | ✅ | ✅ (codegen) | ◐ (broken in CJS, F11) | ✅ M2/M6 |
 | `oneway` (never reply) | ✅ | ✅ | ✅ | ✅ | ❌ (F5) | ✅ M3 |
 | `more` / streaming | ✅ | ✅ (`observe`, `collect`, `notify`) | ✅ | ✅ | ◐ (callback, no backpressure) | ✅ M3/M4 async iterators |
-| `upgrade` | ❌ | ✅ (v261 varlinkctl) | ◐ | ✅ `call_upgraded` | ❌ | ✅ M9 |
+| `upgrade` | ❌ | ✅ (v261 varlinkctl) | ◐ | ✅ `call_upgraded` | ❌ | ✅ M9 (implemented, §5.6; Q4 as sd-varlink; interop run against varlinkctl 262.2 in the UTM VM, 2026-11-15, §7.4) |
 | Pipelining several calls on one connection | ? | ✅ (not for `more`) | ? | ? | ❌ | ✅ M3 |
 | `unix:` path | ✅ | ✅ | ✅ | ✅ | ✅ (via options obj) | ✅ M4 |
 | `unix:@abstract` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ M4 (Linux; verify in VM) |
@@ -153,7 +153,7 @@ Cells for C/sd/python/rust come from reading their sources (paths in §0), not f
 | **Codegen** `.varlink` → types | ❌ | — (C macros) | — (dynamic) | ✅ `varlink_generator` | ❌ (hand-written) | ✅ M6 |
 | Dynamic client from introspection | ✅ (`call` any method) | ✅ | ✅ | ✅ | ◐ (`VarlinkDynamicMethod`) | ✅ M6 |
 | **CLI** info / introspect / call / format / validate | ✅ | ✅ | ◐ (no format) | ✅ | ❌ | ✅ M7 (implemented, §4.14) |
-| CLI `--more`/`--collect`/`--oneway`/`--upgrade`/`--timeout`/`--graceful` | ◐ | ✅ | ◐ | ◐ | ❌ | ✅ M7 (implemented, §4.14; `--upgrade` M9) |
+| CLI `--more`/`--collect`/`--oneway`/`--upgrade`/`--timeout`/`--graceful` | ◐ | ✅ | ◐ | ◐ | ❌ | ✅ M7, `--upgrade` M9 (implemented, §4.14) |
 | Certification server + client | ✅ | — | ✅ (reference) | ✅ | ◐ (claimed, not in CI, F14) | ✅ M5 in CI both ways |
 | Runtimes | — | — | — | — | Node, Bun (CI only) | Node 22/24/26 (CI), Bun, Deno 2 (M10), browser via WebSocket (M10) |
 | Module format | — | — | — | — | CJS+ESM, no `exports` (F10, F11) | ESM only, `exports` map (M0) |
@@ -705,7 +705,9 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
   drops back once the messages are consumed), while paused
   after an upgrade call, after EOF or a framing error, and when not open. A malformed message, when reached, is
   `{type: "close", error}` (calls before it are answered first, nothing is written for it). An upgrade call pauses
-  splitting until it ends: an error reply resumes, a final non-error reply makes the state `upgraded` and every
+  splitting until it ends: an error reply resumes, and so does any reply after `ignoreUpgrade(id)` (M9, Q4: dispatch
+  calls it for a method without upgrade support, which then runs as a plain call); a final non-error reply makes the
+  state `upgraded` and every
   byte after the call's NUL (also bytes received later; repeated takes allowed, each returns what arrived since the
   previous one) is `takeUpgradeRemainder()`. If that remainder was lost to the size limit, the confirming `reply()`
   returns null instead of bytes and the session closes (`{type: "close", error}` with the `MessageTooLargeError`):
@@ -724,9 +726,11 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
 - **Dispatch** (`dispatchCall(session, id, call, table, send, options)`, never rejects, resolves when the call is
   finished): checks in order 1. `parseMethodName` (last dot; interface and member grammar) → `InvalidParameter
   {parameter: "method"}`; 2. `InterfaceNotFound {interface}` / `MethodNotFound {method}`; 3. `requires` more →
-  `ExpectedMore`; 4. `requires` upgrade → `ExpectedUpgrade`; 5. `upgrade` on a method without upgrade support →
-  `InvalidParameter {parameter: "upgrade"}` (Q4, provisional: sd-varlink does not check this at all; M9 decides);
-  6. no handler → `MethodNotImplemented`; 7. `input.decode(…, {unknownFields: "reject"})`, a `ValidationError` →
+  `ExpectedMore`; 4. `requires` upgrade → `ExpectedUpgrade` (an `upgrade` call to a method without upgrade support is
+  no error since M9, Q4 as sd-varlink: dispatch calls `session.ignoreUpgrade(id)` and the call runs as a plain one, its
+  reply or error goes out normally and the session reads varlink calls again; M3's provisional `InvalidParameter
+  {parameter: "upgrade"}` is gone); 5. no handler → `MethodNotImplemented`; 6. `input.decode(…, {unknownFields:
+  "reject"})`, a `ValidationError` →
   `InvalidParameter {parameter}`, anything else → `InternalError`. Then the handler runs (a sync throw counts as a
   rejection). An async-iterator result streams (each yield a `continues` reply, awaiting `send` first; the return
   value, or `{}`, is final); without `more` the first yield (or the return value) is the single reply and
@@ -750,8 +754,18 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
   rejected `send` aborts `ctx.signal`, stops the generator, reports
   `send-failed` and closes the session; `options.signal` aborts `ctx.signal` and replies after the session closed
   are dropped silently. Oneway: nothing is sent, non-`VarlinkError` throws are still `handler-threw`, then
-  `finish(id)`. A confirmed upgrade with nobody to take the stream is `upgrade-unclaimed` (M9 adds
-  `ctx.upgrade()`). `onError` exceptions are swallowed.
+  `finish(id)`. A confirmed upgrade with nobody to take the stream is `upgrade-unclaimed`. `onError` exceptions are
+  swallowed.
+- **`ctx.upgrade(replyParams?)`** (M9, §5.6): available iff the call has `upgrade: true`, the method supports or
+  requires upgrade and the driver passed `options.upgrade` (its hand-over: `() => ByteChannel`, called once the
+  confirming reply was written and the session is `upgraded`); otherwise, when called a second time (also while the
+  first is writing) or after the call's final reply (e.g. a notify without `more`), it rejects with a `TypeError` and
+  nothing is written. It produces the final reply like a returned value (validated per `validateReplies`; an invalid
+  one in `"throw"` mode, or a non-plain value, ends the call with `InternalError` and rejects with the problem), waits
+  for its write (a failed write or a session closed meanwhile rejects with `ConnectionClosedError`) and resolves with
+  the hand-over's channel. Afterwards the call is claimed (no `upgrade-unclaimed`), the return value is ignored, a
+  later throw is `handler-threw`, and `ctx.notify()` rejects with a `TypeError`. The raw flag is
+  `ctx.upgradeRequested` (M3's boolean `ctx.upgrade` became the method).
 - **`ctx.notify(v)`**: with `more`, a `continues` reply serialized with the other sends (resolves when written;
   validated like any reply, a `"throw"` failure ends the call with `InternalError` and rejects; the rejected
   promise has a no-op handler attached, so a fire-and-forget notify is never an unhandled rejection). Without `more`
@@ -785,7 +799,12 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
   `close()` is immediate: `read()` gives `null` from then on (also a read waiting for its delay; undelivered split
   pieces are dropped), and queued or later writes reject, also a zero-length one.
 - **Leftovers**: `JSON.parse` keeps the last of duplicate keys while sd-varlink rejects duplicates; not detectable
-  without a custom parser. sd-varlink rejects `null` flags; we accept them per UAPI (null ≡ absent). Upgraded data
+  without a custom parser. sd-varlink rejects `null` flags; we accept them per UAPI (null ≡ absent). For an `upgrade`
+  call to a `[Requires 'more' flag]` method we send `ExpectedMore`; sd-varlink sends it only in state
+  `VARLINK_PROCESSING_METHOD` (sd-varlink.c:1386), so there the call gets no reply at all (not copied). sd-varlink lets
+  any method callback upgrade once the client set the flag (`sd_varlink_reply_and_upgrade` checks only the call flag,
+  sd-varlink.c:2704); `ctx.upgrade()` also needs the method's upgrade support, so a typed handler cannot upgrade
+  a call its IDL does not allow (deliberate). Upgraded data
   pipelined behind an upgrade call that is not yet processed counts against `maxMessageSize`; if it overflows, the
   server session closes with `MessageTooLargeError` instead of handing over a truncated stream.
 
@@ -818,6 +837,19 @@ over `pair()`, unix and tcp sockets.
   `closeReason` is the ProtocolError, transport error, CallTimeoutError, abort reason or `close(reason)`, undefined
   for `close()` and a clean EOF. Closing rejects every queued and pending call with `ConnectionClosedError`
   (`cause` where there is one) and settles `closed` once the channel's `closed` did; later calls reject at once.
+- **Upgrade** (M9, §5.6): `upgrade(method, params, options)` is op kind `upgrade` (`init.upgrade`), with the timeout,
+  abort and pipelining rules of a single call (calls queued after it reach `ClientSession.call()` while it is pending
+  and reject with its `UpgradePendingError`). The session's `upgraded` event is routed while the reader loop is
+  processing the chunk that held the reply, so no further `read()` is issued: the channel handed out is an
+  `UpgradedChannel` (`src/rpc/upgrade.ts`, internal) over the transport whose first read is
+  `takeUpgradeRemainder()` (bytes past the reply's NUL in that chunk) and which delegates everything else (writes and
+  their backpressure, `end()`, `close()`, `closed`, `capabilities`) to the transport. The connection is then
+  finished without touching the channel: `isClosed` true, `closeReason` undefined, `closed` resolved, `close()` a
+  no-op for the transport, later calls reject with `ConnectionClosedError("connection was upgraded")`. The confirming
+  reply is decoded like a single reply (typed: always; `"throw"` failure → rejects and closes the channel, which nobody
+  else owns). A descriptor without an `upgrade` flag is a `TypeError` before anything is sent (strings are sent as
+  is). Typed clients and proxies get `.upgrade()` (§5.3); the Pool has none (an upgraded connection can never return
+  to it), so a typed client over a pool rejects `.upgrade()` with `OperationNotSupportedError`.
 - **Timeouts**: armed when a call reaches the head of the reply FIFO (or, for oneway, when its write starts: it
   covers the write); `call`/`collect` whole call, `stream` until the first reply, then `idleTimeout` (re-armed per
   reply, paused while the stream's buffer is full). Expiry rejects with `CallTimeoutError` and closes. Timers and
@@ -857,7 +889,7 @@ over `pair()`, unix and tcp sockets.
   otherwise would make generated types lie; a descriptor's classes fill only the registry's gaps (generated
   built-ins map to the core classes, so a client generated from another implementation's `org.varlink.service`
   binds); descriptors go through `bindDescriptor` (§4.9: an `int`-free one binds in either `ints` mode). Typed overloads (descriptor must be registered) exist
-  for `call`, `oneway`, `stream`, `collect`. `getInfo`/`getInterfaceDescription` always validate their replies
+  for `call`, `oneway`, `stream`, `collect`, `upgrade` (M9). `getInfo`/`getInterfaceDescription` always validate their replies
   (`"throw"`); `getInterface` parses + validates and checks the declared name (`TypeError` otherwise).
 - **Proxy** (`conn.proxy(name, {validateReplies = "throw"})`): `getInterface` + a private `compileInterface` (not
   registered); a frozen null-prototype object (so `px.toString`, `px.constructor`, `px.__proto__` are `undefined`
@@ -915,6 +947,14 @@ over `pair()`, unix and tcp sockets.
   next). Clean EOF is not gone. A read
   rejection reports `transport-error`, aborts the active call's signal (`ConnectionClosedError`), closes session and
   channel; `channel.closed` settling does the same without a report. An unclaimed upgrade closes the connection.
+  **Upgrade hand-over** (M9): dispatch gets `upgrade: () => handOver()`, which returns an `UpgradedChannel` over the
+  transport whose reads are, in order, `session.takeUpgradeRemainder()` (the client's early data), the outcome of the
+  reader's `read()` still in flight at that moment (the reader reads ahead while the upgrade call waits for dispatch,
+  so this is the common case; the reader then drops it), or an EOF/rejection the reader saw after the confirming
+  reply, then the transport's reads; after the hand-over the reader and dispatcher leave the channel alone (the
+  dispatcher ends without closing it). The connection still counts (`connections`, exit-on-idle) until the channel
+  closes. Shutdown: graceful aborts the upgraded handler's signal (if it still runs) but neither waits for its
+  connection (each wait races its `released` promise) nor closes it at the deadline; `graceful: false` closes it.
   `handle()` resolves once the channel is closed and the reader ended (a handler that ignores its signal is not
   awaited) and never rejects; at `maxConnections` (or after shutdown) the channel is closed at once. `serve()` takes the
   listener's iterator synchronously and iterates it in the background; while the server runs, a listener already
@@ -944,6 +984,29 @@ over `pair()`, unix and tcp sockets.
   callback fired, or at once after `end()`/`close()`/destroy (F3: no `flush` event, `drain` is implicit in the
   callback). `end()` = `socket.end()`, resolves on `finish` or `close`; `close()` = `destroy()`, idempotent;
   `closed` resolves on `close`. An `error` listener is always attached (F1/F8). `capabilities: {}`.
+  **A write failing because the peer is gone** (EPIPE, ECONNRESET, ECONNABORTED, ENOTCONN, ESHUTDOWN) does not
+  destroy the socket (M9 fix round 3): Node's Writable would mark the readable side errored at once (`readableAddChunk`
+  then drops every later chunk, even one read in the same event-loop pass) and destroy the socket, losing what the
+  peer sent before it went (VM interop: `yes | varlink-js call --upgrade` into a `head -n1`-like service printed
+  nothing, 3 of 3 runs, Linux). The channel wraps the socket's `_write`/`_writev` so such an error never reaches the
+  Writable: that write and every later one (also any whose callback had not fired) reject with the error, the write
+  side is ended (`socket.end()`), and the socket reads ahead into the channel's buffer up to 1 MiB (`DRAIN_LIMIT`,
+  plus Node's highWaterMark), so it closes on its own when the peer sent less than that; past it the socket keeps
+  its backpressure and stays open until the reader drains it to the EOF/error or the owner calls `close()` (an
+  upgraded channel's owner must close it, as always). Reads return those bytes, then the EOF or the error. A read
+  error (the peer's reset) also no longer drops what Node had already buffered for a paused socket: those bytes are
+  read out before the destroy, so e.g. a server now gets a call the client sent just before it reset (it may run;
+  before M9 it was usually dropped). Server and client sessions are unaffected in practice: a failed write closes
+  the session, which closes the channel at once. Other write
+  errors reach Node as before. Guarantee: AF_UNIX keeps the peer's queued bytes readable before the error (Linux
+  `unix_stream_read_generic` reports `sk_err` only on an empty queue), so they are delivered. TCP is best effort:
+  the peer's close with unread data sends an RST, which on Linux leaves the receive queue readable
+  (`tcp_recvmsg` drains it before `sk_err`) and on macOS kept it in every local run, but the peer's own kernel drops
+  whatever it had not yet transmitted. Bun's own `net.Socket` closes natively on the failed write (unix: ECANCELED)
+  and drops the bytes; the guard cannot reach below that (its tests skip there). Deno runs the same tests and
+  passes them (`deno test`, macOS; Linux via the Runtimes workflow). The spawn
+  channel (§5.8, ssh-*) is unaffected: a child's stdin and stdout are separate pipes, stdin's EPIPE destroys only
+  stdin (test: a child that answers one line and exits while we write); `exec:` uses a socketpair, so this guard.
 - **`connect(address, {…ConnectionOptions, signal})`**: `unix` (path), `unix-abstract` (Linux: Node path
   `"\0" + name`; elsewhere `OperationNotSupportedError`), `tcp` (`noDelay`), the spawned kinds `exec`, `ssh-unix`,
   `ssh-exec` (M8, §5.8, process options in `spawn`); other kinds → `OperationNotSupportedError` naming the kind
@@ -1001,7 +1064,16 @@ over `pair()`, unix and tcp sockets.
   (F10–F14, F16), `test/fuzz/server.test.ts` (fast-check, seeded, `VARLINK_FUZZ_RUNS` default 200; each case's
   deadline covers the writes too, and the replies are counted against the server's own framing/decoding of what was
   written: at most one final reply per non-oneway call, none for oneway calls, exactly one each when the input was
-  all valid non-upgrade calls, fully written and ended). The F1 idle test mocks `setTimeout`/`setInterval`/`Date`
+  all valid non-upgrade calls, fully written and ended). M9: `test/regression/upgrade.test.ts` (every transport:
+  echo both ways, 8 MiB each way at once, half-close each way, early data in the call's chunk and in later writes,
+  error reply then a call, `UpgradePendingError`, timeout/abort close, unclaimed, `close()` after the upgrade, Q4 on the
+  wire, an upgrade call's error reply and a plain call pipelined in one chunk, the client's early data and/or EOF
+  arriving before the handler's `ctx.upgrade()` (the EOF read ahead while paused), a read still in flight at the
+  hand-over, graceful vs hard shutdown with a plain connection whose handler ignores its signal so the deadline fires
+  and force-closes it but not the upgraded one; the early-EOF and in-flight cases also over a `fromNodeStreams`
+  channel; plus a raw service writing reply + first bytes in one write over unix and tcp),
+  `test/unit/rpc/upgrade.test.ts` (same-chunk remainder over `pair()`, typed client/proxy/pool, write backpressure
+  into a handler that does not read, exit-on-idle, `UpgradedChannel`), `test/unit/websocket/upgrade.test.ts`. The F1 idle test mocks `setTimeout`/`setInterval`/`Date`
   before the server and connections exist, ticks an hour, and checks the accepted `net.Socket`s have no timeout. Soak: `VARLINK_SOAK_SECONDS=600 node test/fuzz/soak.ts` runs the same generator
   against one server, prints RSS every 10 s and exits non-zero on an unhandled rejection, uncaught exception, hang
   or a server that stops answering (`VARLINK_FC_SEED` fixes the seed).
@@ -1053,7 +1125,12 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   follows the queued data; `close()` and our own failures reject waiting writes at once) and rejects on an unclean
   close or a clean one the peer started (RFC 6455 lets the peer discard data frames arriving after its Close; two
   Close frames crossing on the wire cannot be told apart from ours). `end()` (WebSocket has no half-close) is `close(1000)` after the queued data and resolves on the `close` event;
-  reads go on until then. `close(reason?)` is an idempotent hard close: queue dropped, a pending read gives `null`,
+  reads go on until then. So over WebSocket `end()` closes the whole connection, not just our side: a protocol
+  upgrade's stream (M9) cannot half-close, and what the peer writes after our `end()` may be lost (a bridge
+  tears its backend down at the Close; `call --upgrade ws://…` sends stdin's EOF this way, §4.14). The
+  `ByteChannel` interface stays as it is (no half-close capability flag); prefer unix/tcp/exec:/ssh for upgrade
+  pipes. `test/unit/websocket/upgrade.test.ts` checks that the bytes written before `end()` reach the service,
+  which then sees EOF, and that our reads end with `null`. `close(reason?)` is an idempotent hard close: queue dropped, a pending read gives `null`,
   pending and later writes reject, `ws.close(1000)` if CONNECTING/OPEN. `closed` never rejects and settles once the
   `close` event arrived and the end of the stream was read (or after a local `close()`), one microtask after that
   read settled: a read that settles inside its executor has no reaction yet, and the Connection, which closes when
@@ -1061,7 +1138,12 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   `close()`/`end()` settles `closed` and `end()` if the peer never answers the closing handshake: waiting writes
   reject, a pending or later read rejects once with `ConnectionClosedError("the websocket did not close in time")`
   (after `end()` reads were still allowed), then `null`, and the listeners are removed; the `close` event clears it. Every listener is removed on the `close` event (the socket's last event).
-  `capabilities: {}`.
+  `capabilities: {}`. The channel's own failures — the receive limit, an unsupported or unreadable message, and the write
+  rejections they cause (as `cause`) — are `ConnectionClosedError`s marked with an own
+  `local: true` property; those caused by the peer (its close, an `error` event, no answer to our Close within the guard time) are not, so a caller can tell a
+  local failure from a disconnect (`call --upgrade` does, §4.14). The other channels (`fromNodeSocket`, the spawn /
+  ssh streams, `pair()`) reject reads only for peer-side reasons (their backpressure is real) and writes only after a close
+  (`ConnectionClosedError`) or because the peer is gone (its errno, e.g. EPIPE; §4.11), so they need no mark.
 - **`connect(address, options)`**: kind `websocket` (`http(s)` URLs dialled as `ws(s)`); `http` → `TypeError` naming
   `createHttpClient` from `varlink-js/http`; other kinds → `OperationNotSupportedError` naming `varlink-js/node`.
   Options: `ConnectionOptions`, the channel options (checked before dialling), `signal`, `protocols`, `WebSocket`
@@ -1153,7 +1235,9 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   the browser's TLS client certificate; in Node pass a `WebSocket` constructor that can); the json-seq error-record
   ambiguity: a reply whose only fields are a string `error` and optionally `parameters` is taken for an error record
   when it is the last record of the body, and is held back by one record otherwise; simple mode has no oneway, no
-  upgrade and no pipelining, and concurrent calls are unordered; neither mode carries fds. `connect()` checks the
+  upgrade and no pipelining, and concurrent calls are unordered; neither mode carries fds. WebSocket mode upgrades like
+  any Connection (M9), but only through a bridge that relays bytes: one that frames per varlink message (cuts at NUL,
+  the fixture's `message`/`split` modes) never forwards upgraded bytes without a NUL. `connect()` checks the
   channel options and `timeout` before dialling but the other `ConnectionOptions` (`ints`, `interfaces`, …) only in
   `createConnection`, after the handshake. The websocket/http mode-mismatch errors quote addresses without their user/password
   (`parseAddress`'s own "invalid varlink address" errors, a core M4 file, still quote the raw input).
@@ -1235,7 +1319,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   `target.addInterface(desc)` (a Connection: idempotent, `TypeError` for an ints mismatch of an interface that
   uses `int` or a different IDL; a Pool:
   as in §4.11) and returns a frozen null-prototype object with one frozen function per method (`.stream()`,
-  `.collect()`, `.oneway()`; `.upgrade()` comes with M9) over the target's typed overloads. `TypedMethod`'s
+  `.collect()`, `.oneway()`, `.upgrade()` since M9: TypeError for a method without an upgrade flag,
+  OperationNotSupportedError over a Pool) over the target's typed overloads. `TypedMethod`'s
   parameters are optional iff the input has no required field. Replies are always decoded: the connection's
   `validateReplies` `"off"` (the default) acts as `"warn"` for typed calls (§4.11), so valid replies match their
   types, while an invalid one under `"off"`/`"warn"` is delivered raw and reported to `onError` (`invalid-reply`);
@@ -1286,7 +1371,7 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
 |---|---|
 | `info`, `list-interfaces ADDRESS` | GetInfo: varlinkctl's vertical table (labels right-aligned, interfaces sorted with duplicates kept like `strv_sort`, continuation lines aligned) / sorted names (duplicates kept); JSON: the reply / its `interfaces` |
 | `list-methods`, `introspect ADDRESS [IFACE…]` | none = all of GetInfo's (sorted, unique: `strv_sort_uniq`); names checked before connecting; `list-methods` sorted unique `iface.Method`, ` (experimental)` only on a TTY (stdout and stderr, `on_tty()`); `introspect` text = `formatInterface` per interface, blank line between, unparsable → warning + raw text; JSON: the reply objects, JSON-SEQ when more than one |
-| `call ADDRESS METHOD [PARAMS]` | PARAMS or stdin (absent or `-`; blank = `{}`; the TTY notice unless `-q`); `--more` (JSON-SEQ, one awaited write per reply), `-E`, `--collect` (one array), `--oneway` (exit once written), `--graceful=ERROR`, `-q`; the three modes are mutually exclusive |
+| `call ADDRESS METHOD [PARAMS]` | PARAMS or stdin (absent or `-`; blank = `{}`; the TTY notice unless `-q`); `--more` (JSON-SEQ, one awaited write per reply), `-E`, `--collect` (one array), `--oneway` (exit once written), `--graceful=ERROR`, `-q`; the three modes are mutually exclusive; `--upgrade` (M9, below) |
 | `validate-idl [FILE]`, `format [FILE…]` | stdin when absent or `-`; errors `FILE:LINE:COL: reason` (`<stdin>`); `format --check` (names the non-canonical files on stderr), `-i` (atomic: a temp file `.<first 32 code points of the name>.<8 hex>.tmp` in the same directory with the original's mode and, best effort, its owner, renamed over it — through a symlink, its target; removed on failure; written in place instead, not atomically, when the file has other hard links or the temp file cannot be created: `EACCES`/`EPERM`/`EROFS`/`ENAMETOOLONG`, e.g. a writable file in a read-only directory) |
 | `codegen FILE…`, `codegen --address ADDR IFACE…` | `generate()` / `generateFromService`; `-o DIR` writes `<DIR>/<iface>.ts` (paths on stderr unless `-q`), else one input to stdout; output names that clash case-insensitively (`a.B`/`a.b` on macOS) fail before anything is written; `--ints`, `--import-path` |
 | `bridge ADDRESS` | raw bytes stdin ↔ socket (`openSocket` of `src/node/connect.ts`), unix/abstract/tcp only; one chunk at a time both ways (the socket paused while a stdout write is pending; the next stdin chunk pulled once the socket took the last); stdin EOF half-closes, peer EOF ends it (0; stdin's iterator is `return()`ed) |
@@ -1295,14 +1380,46 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
 - **Options**: `node:util` `parseArgs`, one table per command plus the global ones (`-h`, `-V`, `--json=`, `-j`,
   `-q`); options anywhere (a lenient pass over the union of the tables finds the command, then a strict pass with
   its table; `--j`/`--E` rejected). Order counts like varlinkctl (`-E --timeout=5` has a timeout, `--timeout=5 -E`
-  none). `--timeout`: empty = none, else systemd's `parse_sec` (time-util.c): a sum of `NUMBER[.DIGITS][ ]UNIT`
-  terms (`1min 30s`, `1.5h`; a bare number is seconds; units by first prefix match in its table order, `seconds
+  none). `--timeout`: empty = none, else systemd's `parse_sec` (time-util.c): a sum of `[+]NUMBER[.DIGITS][ ]UNIT`
+  terms (`1min 30s`, `1.5h`, `+5s`: strtoll's sign, M9; `+` must be followed by digits, `-` is ERANGE; a bare number is seconds; units by first prefix match in its table order, `seconds
   second sec s`, `minutes minute min m`, `months month M` (30.44 d), `msec ms`, `hours hour hr h`, `days day d`,
   `weeks week w`, `years year y` (365.25 d), `usec us µs μs`; not `nsec ns`, which are parse_nsec's), `infinity` = none; whole
   microseconds, rounded down per term and fraction digit like `parse_time`, ≥ 2⁶⁴−1 µs fails to parse, and zero
   after rounding is "Timeout cannot be zero."; the deadline is µs/1000 ms (fractional, the timers make it ≥ 1 ms);
   default 45 s; it bounds the connect and the whole call, `--more` included (sd-varlink's semantics: the CLI runs its own
   deadline and sets the library's timeouts to 0, §5.1's stream timeout does not apply); beyond 2³¹−1 ms it means none.
+- **`call --upgrade`** (M9, `upgrade.ts`, after varlinkctl.c:801-947 at 6bd4689f): PARAMETERS from argv only (absent
+  or `-` → `{}`; stdin is the stream, never parameters); with `--more`/`-E`/`--collect`/`--oneway`/`--graceful` a usage
+  error with varlinkctl's text (`--upgrade may not be combined with --collect/--more/--oneway/--push-fd=/--graceful.`).
+  An error reply is `Upgrade via M() failed with error: NAME` (exit 1), a local failure `Failed to upgrade connection
+  via M(): …`; the confirming reply's parameters are not printed (varlinkctl passes `ret_parameters=NULL`). Then a byte
+  pipe with socket-forward semantics (src/shared/socket-forward.c): stdin → channel (stdin's EOF → `channel.end()`),
+  channel → stdout (one awaited write per chunk: backpressure both ways), exit 0 once both directions are done. As in
+  socket-forward, a disconnect (systemd's `ERRNO_IS_DISCONNECT` errnos such as ECONNRESET/EPIPE, or the channels'
+  `ConnectionClosedError`, also as a `cause`) is no failure: while writing to the channel it ends stdin → channel
+  quietly (stdin is no longer read, e.g. `yes | … ` into a service that reads one line, answers and goes: its answer
+  on stdout, exit 0; the failed write does not drop what the service sent before going, §4.11), while reading it is
+  that direction's EOF. A `ConnectionClosedError` marked `local: true` (anywhere on the `cause` chain:
+  the WebSocket channel's own receive-limit / bad-data failures, §4.12; the Close guard timeout is the peer's,
+  so it ends the pipe like a disconnect, exit 0) is no disconnect but a
+  failure, so output cut short by the 64 MiB receive limit exits 1 instead of looking like the service's end. When
+  channel → stdout ends, stdout is ended at once (`CliOutput.end`, after socket-forward's
+  `socket_forward_direction_done`: `shutdown(SHUT_WR)`, `close()` where that fails with ENOTSOCK). In `node-io.ts`:
+  when fd 1 is a socket (`fstat`), `stream.end()` shuts its write side down after the last write and waits for
+  `finish`, which also covers a socket that is stdin too (socat's `EXEC:`, inetd-style `StandardInput=socket`, where
+  closing fd 1 alone would send no FIN); otherwise (Node never closes fds 0-2) fd 1 is closed one turn after the
+  drain (`setImmediate`, so libuv drops a pending writability watch on it first) and /dev/null opened in its place —
+  unless fd 1 and fd 2 are the same file (same `dev`+`ino`, e.g. `2>&1`), where closing fd 1 would not end the
+  reader's stream anyway: that reader sees EOF when the process exits. A TTY and Windows are left alone (no early
+  EOF there). So a downstream reader sees EOF while stdin → channel goes on until stdin's EOF. Any other transport
+  failure is `Upgraded connection failed: …` (1); stdout EPIPE (or any other disconnect errno: ECONNRESET from a
+  socket stdout whose reader reset it, CLI-wide, see Signals) stops the command quietly (0, as everywhere in the
+  CLI, and both directions: see the differences below); signals as for other calls (130/143, the channel closed, an `exec:` child stopped and awaited
+  through the channel's close). `--timeout` (and `+5s`, M9: parse_time takes strtoll's `+` per term, `-` stays
+  rejected) bounds the connect and the upgrade call only. Every connection kind upgrades (unix, abstract, tcp, exec:,
+  ssh-*, WebSocket); simple HTTP mode is a clear error. Over WebSocket there is no half-close: `end()` closes the
+  whole connection (§4.12), so `call --upgrade ws://…` sends stdin's EOF as a WebSocket Close and output the service
+  writes after that may be lost (the bridge tears the backend down); prefer unix/tcp/exec:/ssh for upgrade pipes.
 - **Output**: `pretty` = sd-json's (TAB, `"key" : value`, `{}`/`[]`, final LF), `short` = minimal + LF, `-j` =
   pretty on a TTY (stdout and stderr both TTYs, systemd's `on_tty()`). `call` defaults to `-j` (varlinkctl.c ~900),
   also for `--json=off`; the others print text unless asked. Strings as `JSON.stringify`, numbers as JS prints them,
@@ -1332,8 +1449,9 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   watch it; `certify server` shuts down and returns 0, as USAGE says). The local commands (`validate-idl`, `format`,
   `codegen FILE…`, help, version) are raced with the signal in `run`, so the first one stops them too; they check
   `io.signal` before each file they read or write, so a multi-file `format -i`/`codegen -o` does not go on (the one
-  file in flight finishes unobserved). A stdout write failing with EPIPE (`| head -1`) is a
-  `BrokenPipeError`: the command stops, closes, exits 0, prints nothing. `node-io.ts` opens stdin only when read and
+  file in flight finishes unobserved). A stdout write failing with EPIPE (`| head -1`), or with any other errno of
+  systemd's `ERRNO_IS_DISCONNECT` (ECONNRESET, ENOTCONN, … when stdout is a socket; the list lives in `io.ts`,
+  shared with `call --upgrade`), is a `BrokenPipeError`: the command stops, closes, exits 0, prints nothing. `node-io.ts` opens stdin only when read and
   destroys it at the end, so the process always exits by itself.
 - **Differences from varlinkctl**: no colours, no pager, no `--no-ask-password`/polkit, no `sd_notify`
   (`READY=1`/`VARLINKERROR=`), no experimental-method notice (an extra round trip); the error *name* instead of
@@ -1343,8 +1461,15 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   executable); `--json` takes no `help`; maps print integer-like keys first (JS object order, sd-json keeps the
   wire order); reals print as JS does (`1e+300`; not checked against sd-json's formatter, whose source was not at
   hand; `/`, DEL, C1 and non-ASCII are left raw as by `JSON.stringify`); `format`, `codegen`, `bridge`, `certify`
-  and the HTTP/WebSocket targets are ours; `--upgrade` (M9), `--exec`, `--push-fd` (M11), `serve`,
-  `list-registry`, `list-sockets`, `--user`/`--system`, `monitor` options are not in M7.
+  and the HTTP/WebSocket targets are ours; `--upgrade` came with M9; `--exec`, `--push-fd` (M11), `serve`,
+  `list-registry`, `list-sockets`, `--user`/`--system`, `monitor` options are not implemented (M9 left `serve`,
+  `--exec` and `--push-fd` out of scope). `call --upgrade`: a broken stdout (EPIPE) ends both directions and closes
+  the connection (exit 0), where socket-forward ends only channel → stdout and goes on forwarding stdin until its
+  EOF (the service then sees a close instead of a half-close): stopping only that direction can deadlock against a
+  cat-like service whose output nobody reads any more. Over WebSocket, stdin's EOF closes the whole connection
+  (no half-close, see above). No early EOF on stdout when it is a TTY or on Windows, nor when stdout and stderr are
+  the same pipe or file (`2>&1`; socket-forward's `close()` would not end that reader's stream either): the reader
+  then sees EOF when the command exits.
 - **Checked against varlinkctl** (systemd 255.4 in the UTM VM, Node 24.22.1, M7; scripts and results in
   `test/e2e/cli/varlinkctl/`): byte-identical stdout and the same exit code for `info`, `info -j`,
   `list-interfaces` (both), `introspect -j`, `call --json=short`, `call --oneway`, `call --more` (JSON-SEQ) against
@@ -1365,7 +1490,15 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   polled until its progress counter stops — then everything arrives intact). `test/e2e/cli/` spawns `node
   src/cli/main.ts` (`--version`, info, call, SEQ bytes, oneway, piped stdin, exit codes, EPIPE after closing its
   stdout, SIGINT → 130, SIGTERM → 143, bridge as a byte pipe, bridge exiting by itself when the peer closes while
-  its stdin stays open, `certify client` ↔ `certify server` as two children).
+  its stdin stays open, `certify client` ↔ `certify server` as two children). M9: `test/unit/cli/upgrade.test.ts`
+  (unix/tcp, interactive, argv-only parameters, error reply, timeout of the call only, HTTP error, SIGINT/SIGTERM,
+  EPIPE, peer reset, 8 MiB backpressure each way) and `test/e2e/cli/upgrade.test.ts` (piped stdin, 4 MiB, `-`, error
+  reply, flag combinations, SIGINT, an `exec:` child that exits once the stream is done, stdout ended early on a
+  FIFO, on one socket shared with stdin (FIN while stdin stays open) and not with `2>&1`); the WebSocket channel's
+  local failures (`local: true`) exit 1 through the pipe, and every disconnect errno on stdout is a
+  `BrokenPipeError`. Fix round 3: an endless (`yes`-like) stdin into a service that answers one line and closes must
+  put the answer on stdout (in-process over unix/tcp; real process over unix and `exec:`), plus the channel-level
+  cases in `test/unit/node/socket.test.ts` and `test/regression/upgrade.test.ts` (§4.11).
 
 ---
 
@@ -1397,10 +1530,10 @@ const all = await conn.collect("…GetUserRecord", { service: "…" });         
 await conn.getInfo();                                   // org.varlink.service.GetInfo
 const iface = await conn.getInterface("io.systemd.Hostname");  // parsed IDL (idl.Interface)
 
-// Upgrade (M9)
+// Upgrade (M9, §5.6)
 const { parameters, channel } = await conn.upgrade("com.example.Decompress.XZ", {});
-// On success `conn` is finished as a varlink connection and `channel` carries the custom protocol.
-// On an error reply this rejects with the VarlinkError and `conn` stays usable (UAPI).
+// On success `conn` is finished as a varlink connection and `channel` (a ByteChannel that owns the transport)
+// carries the custom protocol. On an error reply this rejects with the VarlinkError and `conn` stays usable (UAPI).
 
 await conn.close();
 ```
@@ -1447,7 +1580,9 @@ connection or opens one (up to `max`, then waits). A connection that
 closed or failed is discarded, never reused (F4). Streams hold their lease until they end, so
 cancelling one stream doesn't kill other calls. `pool.addInterface(descriptorOrIdl)` registers an interface on
 every connection it hands out (§4.11), and `call`/`oneway`/`stream`/`collect` have the same typed descriptor
-overloads as Connection, so `X.client(pool)` works like `X.client(conn)` (§5.3).
+overloads as Connection, so `X.client(pool)` works like `X.client(conn)` (§5.3). There is no `pool.upgrade()` (M9):
+an upgraded connection can never return to the pool, so upgrade on a Connection of your own (a typed client over a
+pool rejects `.upgrade()` with `OperationNotSupportedError`).
 
 ### 5.3 Typed calls (codegen output, §5.7)
 
@@ -1463,8 +1598,10 @@ const { configuration } = await ftl.CalculateConfiguration({ current, target });
 try { await ftl.Jump({ configuration }); }
 catch (e) { if (OrgExampleFtl.NotEnoughEnergy.is(e)) … }   // typed error
 
-// Each method is callable (single reply) and also has .stream(), .collect(), .oneway() (.upgrade() comes with
-// M9), mirroring the untyped Connection API, so the return type never depends on a runtime option.
+// Each method is callable (single reply) and also has .stream(), .collect(), .oneway() and .upgrade() (M9),
+// mirroring the untyped Connection API, so the return type never depends on a runtime option. Generated method
+// descriptor types do not carry the IDL flags, so .upgrade() exists on every method's type; on a method without an
+// upgrade flag it rejects with a TypeError at run time, nothing sent.
 for await (const c of ftl.Monitor.stream({})) { c.condition.state }  // "idle" | "spooling" | "busy"
 ```
 
@@ -1543,8 +1680,9 @@ comment survives as UAPI requires), or `InterfaceNotFound` (fixes F9).
   ctx.notify(x)`; methods meant to stream should declare `more: "requires"` (§4.10).
 
 Handler context `ctx`: `signal` (aborts when the client disconnects or the server shuts down),
-`more`/`oneway`/`upgrade` flags, `method`, `peer` (M11), `fds` (M11), `notify(partial)` (send a
-`continues` reply from a plain async handler, sd-varlink style), `upgrade()` (M9).
+`more`/`oneway`/`upgradeRequested` flags, `method`, `peer` (M11), `fds` (M11), `notify(partial)` (send a
+`continues` reply from a plain async handler, sd-varlink style), `upgrade(replyParams?)` (M9, §5.6; the flag was
+`ctx.upgrade` before M9 and is `upgradeRequested` now that `upgrade` is the method).
 
 **Dispatch rules (the spec, from UAPI.20; these fix F5–F7):**
 
@@ -1561,7 +1699,8 @@ Handler context `ctx`: `signal` (aborts when the client disconnects or the serve
 | Plain handler, call with `more` | single reply without `continues` (allowed by spec) |
 | Method requires `upgrade` (`[Requires 'upgrade' flag]` or `requiresUpgrade`), call without `upgrade` | `org.varlink.service.ExpectedUpgrade` |
 | Method only *supports* `upgrade`, call without it | handler runs as a plain call (`ctx.upgrade` unavailable) |
-| `upgrade` set on a method that does not support it | provisional (M3): `InvalidParameter {parameter: "upgrade"}`; M9 settles Q4 |
+| Method supports/requires `upgrade`, call with it | handler runs with `ctx.upgrade()` available (§5.6) |
+| `upgrade` set on a method that does not support it | Q4 (M9, as sd-varlink): handler runs as a plain call (`ctx.upgradeRequested` true, `ctx.upgrade()` rejects), its reply or error goes out, the connection stays varlink; a `[Requires 'more' flag]` method still answers `ExpectedMore` |
 | Handler throws `VarlinkError` | that error (name + params) |
 | Handler throws anything else | `onError` hook, then the internal error reply (see Q2); no details leak |
 | Generator throws after yielding | error reply ends the stream (an error is always final) |
@@ -1630,19 +1769,35 @@ See §6.
 
 ### 5.6 Upgrade (M9)
 
-Client: `conn.upgrade(method, params)` sends the call, waits for the single confirming reply, then
-returns `{parameters, channel}`. `channel` is the §4.2 wrapper: it first yields the bytes the framer had
-already read past the reply's `NUL`, then reads from the socket. That satisfies UAPI ("MUST NOT
-consume") in effect: no byte is lost or misinterpreted. On an error reply the promise rejects and the
-connection stays a varlink connection.
+Implemented in M9 (details §4.10, §4.11; CLI §4.14).
 
-Server: a handler declared `upgrade: true` receives `ctx.upgrade(replyParams?) → Promise<ByteChannel>`.
-The session stops reading after the upgrade call (§4.5), so the only bytes already buffered are the
-client's early data, which the wrapper channel hands over. If the handler throws a `VarlinkError` before
-calling `ctx.upgrade()`, the error is sent and the session resumes reading varlink calls. If it returns
-normally without calling `ctx.upgrade()`, the return value goes out as the confirming reply (any
-non-error reply confirms, per UAPI), nobody owns the upgraded stream, and the server closes the
-connection and reports it to `onError`.
+Client: `conn.upgrade(method, params, {timeout, signal})` → `Promise<UpgradeResult> = {parameters, channel}`
+(descriptor overload typed; typed clients and proxies have `.upgrade()`; no Pool, no simple HTTP mode). It sends
+the call, waits for the confirming reply (any non-error reply confirms, per UAPI), then returns. `channel` is the §4.2
+wrapper: it first yields the bytes the framer had already read past the reply's `NUL` (also those in the reply's own
+chunk), then reads from the transport; writes, half-close (`end()`), `close()` and `closed` are the transport's, so
+backpressure holds and nothing is buffered beyond those bytes. That satisfies UAPI ("MUST NOT consume") in effect: no
+byte is lost or misinterpreted. The channel owns the transport: `conn` is finished (calls reject with
+`ConnectionClosedError`, `closed` resolves) and `conn.close()` leaves the channel alone. On an error reply the promise
+rejects and the connection stays a varlink connection. While pending, later calls reject with `UpgradePendingError`;
+`timeout` covers the time to the confirming reply, and a timeout or abort closes the connection (nobody can tell
+whether the service upgraded).
+
+Server: a handler of a method that supports or requires upgrade, called with `upgrade: true`, gets
+`ctx.upgrade(replyParams?) → Promise<ByteChannel>`: it sends the confirming reply (validated per `validateReplies`),
+resolves once it was written, and the channel first yields the client's early data (the session stopped splitting
+after the upgrade call, §4.5) and then the transport. A second call, a call after the call ended, or one where it is
+unavailable rejects with a `TypeError` and writes nothing; afterwards the return value and later throws do not reach
+the wire (a throw is `handler-threw`) and `ctx.notify()` rejects. If the handler throws a `VarlinkError` before calling
+`ctx.upgrade()`, the error is sent and the session resumes reading varlink calls. If it returns normally without
+calling `ctx.upgrade()`, the return value goes out as the confirming reply, nobody owns the upgraded stream, and the
+server closes the connection and reports `upgrade-unclaimed`. An upgraded connection is no varlink session any more
+but counts as open (exit-on-idle, `connections`) until its channel closes; a graceful shutdown neither waits for it nor
+closes it (it aborts the handler's signal if the handler still runs), `graceful: false` destroys it.
+
+Q4 (sd-varlink's behaviour, §9): an `upgrade: true` call to a method without upgrade support runs as a plain call;
+`ctx.upgrade()` is then unavailable. sd-varlink lets any callback upgrade once the client set the flag; we do not
+(deliberate: the typed API stays honest).
 
 ### 5.7 Codegen
 
@@ -1921,6 +2076,29 @@ without NUL → connection closed and memory bounded, wire output contains no `c
   - UTM Linux VM (`~/oss/vm/README.md`, once available): a newer systemd for `--upgrade` (≥ 261),
     `exec:` against `/usr/lib/systemd/systemd-pcrextend`-style binaries, socket activation with
     `systemd-socket-activate`, abstract sockets, fd passing with the native addon, the registry.
+  - M9 upgrade interop (VM only, not CI, not `npm test`): `VARLINKCTL=/path/to/varlinkctl [NODE=node]
+    [SOCKET_ACTIVATE=…] test/interop/vm/upgrade.sh` (helpers `upgrade-server.ts`, `upgrade-client.ts`), one PASS/FAIL
+    line per case, exit 1 on any failure: (a) `varlinkctl call --upgrade` → a varlink-js server's
+    `org.example.Upgrade.Cat` (requires upgrade, cat-like), 1 MiB; (b) `systemd-socket-activate -l SOCK varlinkctl
+    serve org.example.Upgrade.Cat cat` (serve needs socket activation) ← `varlink-js call --upgrade` and ←
+    `conn.upgrade()`; (c) Q4: a plain method with `upgrade: true` then a plain call, against both sides (two plain
+    replies expected; the line prints what came back). Run against varlinkctl 262.2 in the UTM VM, 2026-11-15
+    (systemd built from source, commit 63511d72): all 5 cases PASS (a, b1, b2, c1, c2); c2 confirmed Q4 on the wire
+    (`GetInfo` with `upgrade: true`, then a plain call: two plain replies from sd-varlink). M9 review 2 added (d)
+    `yes | … call --upgrade` into a service that reads one line, writes it back and goes (`varlinkctl serve
+    org.example.Upgrade.Head -- head -n1`: the `--` is needed, varlinkctl otherwise parses the command's options,
+    "unrecognized option '-n'"; and the varlink-js fixture's `Head`), both CLIs against both servers: d2 and d4
+    (varlink-js) PASS only with exit 0 and `y` on stdout; d1 and d3 (varlinkctl) and `d parity` (both CLIs' exit
+    codes) are INFO lines, since what they show is systemd's behaviour; (e) the service ends first (`varlinkctl serve
+    … echo BYE`) while stdin stays open 3 s: stdout's reader (a FIFO) must see EOF before stdin closes; e2 (varlink-js)
+    is PASS/FAIL, e1 (varlinkctl) INFO. The first VM run of (d) found a bug of ours: varlink-js exited 0 with EMPTY
+    stdout against both servers, 3 of 3 (the failing writes made Node destroy the socket before the answer was read;
+    fixed in §4.11). Final run on the M9 head (Node 24.22.3, varlinkctl 262.2), output in
+    `test/interop/vm/results-systemd-262.log`: a, b1, b2, c1, c2, d2, d4, e2 PASS. INFO, i.e. systemd's own
+    behaviour: varlinkctl died of SIGPIPE (exit 141) in d1 and d3 (it printed `y` in d3; in d1 against `serve --
+    head -n1` it printed `y` in only 1 of 3 earlier runs); e1: varlinkctl gives the FIFO reader EOF only at exit,
+    because it forwards a reopened copy of stdout (`dup_stdio_fd`), so socket-forward's close at the peer's EOF
+    leaves fd 1 open.
 - **Runtimes**: CI matrix Node 22 / 24 / 26; Bun latest and Deno 2 run the unit tests plus the unix/tcp
   integration subset (M10).
 
@@ -2004,7 +2182,7 @@ Defaults are what gets built if there's no answer.
 | Q1 | Publish as `varlink-js@1.0.0` (same npm name, breaking major) once you approve, or under a new name? | Same name, major bump. Nothing published without your OK. |
 | Q2 | Wire error for *unexpected* handler exceptions: there's no standard one, and UAPI says calls SHOULD only return errors defined in an interface. Options: (a) a tiny interface the server auto-registers (so it is introspectable), e.g. `io.github.pzmarzly.varlinkjs` with `error InternalError ()`, no details on the wire; (b) reuse systemd's `io.systemd.System` (but we can't fill its `errno` honestly); (c) close the connection (kills unrelated pipelined calls). Interface name is your call. | (a), details only to `onError`. |
 | Q3 | Default `ints` mode: `"number"` (reject unsafe ints) vs `"bigint"`. | `"number"` with rejection. Opt in to `bigint`. |
-| Q4 | `upgrade` flag on a method that doesn't support it: `InvalidParameter{parameter:"upgrade"}` vs `ExpectedUpgrade` vs treat as a plain call. UAPI is silent. Need to check what sd-varlink does (M9). | Match sd-varlink once checked. |
+| Q4 | `upgrade` flag on a method that doesn't support it: `InvalidParameter{parameter:"upgrade"}` vs `ExpectedUpgrade` vs treat as a plain call. UAPI is silent. | **Resolved in M9: a plain call, as sd-varlink** (systemd 6bd4689f, 263~devel): `varlink_idl_validate_method_call()` (sd-varlink-idl.c:2126-2142) checks only `REQUIRES_MORE` without `more` and `REQUIRES_UPGRADE` without `upgrade`; `varlink_dispatch_method()` sets `PROCESSING_METHOD_UPGRADE` (sd-varlink.c:1339-1342) and calls the callback as usual (1412-1419); a plain `sd_varlink_reply()` is allowed there (`VARLINK_STATE_WANTS_REPLY`, varlink-internal.h:79-83) and leads back to `IDLE_SERVER` (sd-varlink.c:2587, 2647-2657, 1460-1466), errors go out as usual; the client takes any non-error reply as acceptance (965-980); only `sd_varlink_respond_and_upgrade()` checks the call flag (2704-2708), not the IDL. Not copied: no `ExpectedMore` for an upgrade call to a `[Requires 'more' flag]` method (sent only in `VARLINK_PROCESSING_METHOD`, 1386; we send it), and any callback may upgrade (our `ctx.upgrade()` needs the method's upgrade support). Confirmed on the wire by the M9 interop run (§7.4, case c2: `GetInfo` with `upgrade: true`, then a plain call, got two plain replies from sd-varlink of systemd 262.2). |
 | Q5 | Native addon for fd passing / peer creds (M11): own small N-API addon vs depending on `usocket`/`peercred`. | Evaluate in M11. Prefer own ~200-line C addon with prebuilds, Linux only. |
 | Q6 | Keep TCP listen support in the server (systemd dropped TCP; UAPI says OPTIONAL)? | Keep, bind `127.0.0.1` in all examples. |
 
@@ -2028,7 +2206,7 @@ M ≈ 1, L ≈ 2–3).
 | **M6** | Codegen (`generate()`, types, descriptors, error classes, `client()` factory, `Handlers` type), regenerate built-in interfaces into `src/interfaces/` and switch M4's built-ins to them | `src/codegen/`, `src/interfaces/`, `test/unit/codegen/` | M4 | Generated code for the corpus typechecks; typed e2e tests over `pair()` | M |
 | **M7** | CLI `varlink-js`: `info`, `list-interfaces`, `list-methods`, `introspect`, `call` (`--more`, `-E`, `--collect`, `--oneway`, `--timeout`, `--graceful`, `-j`/`--json`, `-q`), `format`, `validate-idl`, `codegen`, `bridge` (stdio ↔ address), `certify` | `src/cli/` | M5, M6 | CLI e2e tests; output matches varlinkctl conventions (JSON-SEQ for `--more`). **Implemented** (§4.14) | M |
 | **M8** | Addresses II and activation: `exec:`, `ssh-unix:`, `ssh-exec:`, bridge argv, `listenAuto()`/`listenFromEnv()`, stdio serving, exit-on-idle, registry lookup and server-side registry binding (`server.serve(listener, {registry: true})` symlinks the entrypoint into `/run/varlink/registry/<iface>` for every registered interface except `org.varlink.service`, or `registry: ["…"]` for an explicit list; removed on shutdown), resolver client | `src/node/spawn*`, `src/node/activation*`, `src/node/registry*` | M4 | Tests on macOS + VM (`systemd-socket-activate`, ssh to localhost) | M |
-| **M9** | `upgrade`: client + server + CLI `--upgrade`; resolve Q4 | touches `src/core/protocol/`, `src/rpc/`, `src/cli/` | M7, M8 | Interop with `varlinkctl call --upgrade` / `serve` in VM (systemd ≥ 261) | S |
+| **M9** | `upgrade`: client + server + CLI `--upgrade`; resolve Q4 | touches `src/core/protocol/`, `src/rpc/`, `src/cli/` | M7, M8 | Interop with `varlinkctl call --upgrade` / `serve` in VM (systemd ≥ 261). **Implemented** (§5.6, §4.14; Q4 resolved; `test/interop/vm/upgrade.sh` run against varlinkctl 262.2 in the UTM VM, 2026-11-15: all 5 cases PASS, §7.4) | S |
 | **M10** | WebSocket + HTTP client transports; Bun and Deno CI; browser smoke test (Playwright optional) | `src/websocket/`, `src/http/`, `.github/workflows/runtimes.yml` | M4 | Tests against a local WebSocket bridge fixture; Bun/Deno green | M |
 | **M11** | `varlink-js-native` (separate package in `native/`): fds (incl. client `fds`/`acceptFds` and CLI `--push-fd`), peer creds, `user.varlink` xattr tagging (`listen`/`server`/`entrypoint`/`client`, best effort), per-UID limits; resolve Q5 | `native/` (+ small touches to `src/rpc/`, `src/cli/` after M9) | M4 (addon), M9 (rpc/CLI integration) | fd passing to/from a systemd service in the VM | L |
 | **M12** | Docs: README, `docs/MIGRATION.md`, TSDoc, examples (incl. a safe reference server bound to 127.0.0.1, mode 0644), release workflow (not run); open PR `rewrite → master` **inside the fork** for Pawel | `README.md`, `docs/`, `examples/` (except certification), `.github/workflows/release.yml` | M5–M7 (others may follow) | PR open with test evidence | S |
