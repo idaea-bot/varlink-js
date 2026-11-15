@@ -1,11 +1,15 @@
 // `validate-idl`, `format` and `codegen` in-process (DESIGN.md §4.14).
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { parseCommandLine } from "../../../src/cli/args.ts";
+import { createContext, type Context } from "../../../src/cli/context.ts";
+import { codegen, format, validateIdl } from "../../../src/cli/idl.ts";
+import { signalExitCode } from "../../../src/cli/io.ts";
 import { generate } from "../../../src/codegen/index.ts";
 import { formatInterface, parseInterface } from "../../../src/idl/index.ts";
-import { IDL, runCli, startFixture, tempDir, waitFor, type Fixture } from "./helpers.ts";
+import { fakeIo, IDL, runCli, startFixture, tempDir, waitFor, type Fixture } from "./helpers.ts";
 
 const CANONICAL = formatInterface(parseInterface(IDL));
 const MESSY = "interface   org.example.messy\nmethod  F( a :int )->( )\n";
@@ -133,7 +137,7 @@ describe("format", () => {
     assert.deepEqual((await readdir(sub)).sort(), ["link.varlink", "mode.varlink"]);
   });
 
-  test("-i failing to write: the original is untouched, the temp file removed", async (t) => {
+  test("-i in a read-only directory: a writable file is written in place (no temp file possible)", async (t) => {
     if (process.getuid?.() === 0) {
       t.skip("root ignores directory permissions");
       return;
@@ -145,6 +149,29 @@ describe("format", () => {
     await chmod(sub, 0o555);
     try {
       const r = await runCli(["format", "-i", path]);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stderr, "");
+      assert.equal(await readFile(path, "utf8"), MESSY_CANONICAL);
+      assert.deepEqual(await readdir(sub), ["x.varlink"]);
+    } finally {
+      await chmod(sub, 0o755);
+    }
+  });
+
+  test("-i failing to write: the original is untouched, no temp file left", async (t) => {
+    if (process.getuid?.() === 0) {
+      t.skip("root ignores file permissions");
+      return;
+    }
+    // A read-only file in a read-only directory: neither the temp file nor the in-place write can happen.
+    const sub = join(dir.path, "readonly-file");
+    await mkdir(sub);
+    const path = join(sub, "x.varlink");
+    await writeFile(path, MESSY);
+    await chmod(path, 0o444);
+    await chmod(sub, 0o555);
+    try {
+      const r = await runCli(["format", "-i", path]);
       assert.equal(r.code, 1);
       assert.match(r.stderr, /^Failed to write '.*x\.varlink': .*EACCES/);
       assert.equal(await readFile(path, "utf8"), MESSY);
@@ -152,6 +179,32 @@ describe("format", () => {
     } finally {
       await chmod(sub, 0o755);
     }
+  });
+
+  test("-i on a file with hard links: written in place, every link sees the new text", async () => {
+    const sub = join(dir.path, "hardlink");
+    await mkdir(sub);
+    const path = join(sub, "a.varlink");
+    const other = join(sub, "b.varlink");
+    await writeFile(path, MESSY);
+    await link(path, other);
+    const r = await runCli(["format", "-i", path]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(await readFile(path, "utf8"), MESSY_CANONICAL);
+    assert.equal(await readFile(other, "utf8"), MESSY_CANONICAL);
+    assert.equal((await stat(path)).ino, (await stat(other)).ino);
+    assert.deepEqual((await readdir(sub)).sort(), ["a.varlink", "b.varlink"]);
+  });
+
+  test("-i on a long but valid file name (255 bytes): the short temp name fits", async () => {
+    const sub = join(dir.path, "longname");
+    await mkdir(sub);
+    const path = join(sub, `${"n".repeat(255 - ".varlink".length)}.varlink`);
+    await writeFile(path, MESSY);
+    const r = await runCli(["format", "-i", path]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(await readFile(path, "utf8"), MESSY_CANONICAL);
+    assert.equal((await readdir(sub)).length, 1);
   });
 
   test("invalid input: like validate-idl, the other files still processed", async () => {
@@ -193,6 +246,64 @@ describe("signals during the local commands", () => {
       assert.equal(r.code, code);
       assert.equal(r.stderr, "");
     });
+
+  // run() returns 130 at the first signal; the command itself must not go on with the next file. Called directly, so
+  // the test sees when it stopped.
+  const runCommand = async (
+    command: (ctx: Context) => Promise<number>,
+    argv: string[],
+    onStderr: (text: string, controller: AbortController) => void,
+  ): Promise<unknown> => {
+    const controller = new AbortController();
+    const io = fakeIo({
+      signal: controller.signal,
+      onStderr: (text) => {
+        onStderr(text, controller);
+      },
+    });
+    try {
+      await command(createContext(io, parseCommandLine(argv)));
+      return undefined;
+    } catch (e) {
+      return e;
+    }
+  };
+
+  test("codegen -o: a signal after the first file is written stops before the second", async () => {
+    const a = await file("sig-a.varlink", IDL);
+    const b = await file("sig-b.varlink", MESSY);
+    const out = join(dir.path, "sig-out");
+    const reason = await runCommand(codegen, ["codegen", "-o", out, a, b], (_text, controller) => {
+      controller.abort("SIGINT");
+    });
+    assert.equal(reason, "SIGINT");
+    assert.equal(signalExitCode(reason), 130);
+    assert.deepEqual(await readdir(out), ["org.example.cli.ts"]);
+  });
+
+  test("format -i: a signal after the first file is written leaves the next ones untouched", async () => {
+    const first = await file("sig-1.varlink", MESSY);
+    // Fails to parse: its message on stderr is where the signal comes.
+    const broken = await file("sig-2.varlink", "interface x\n");
+    const third = await file("sig-3.varlink", MESSY);
+    const reason = await runCommand(format, ["format", "-i", first, broken, third], (_text, controller) => {
+      controller.abort("SIGTERM");
+    });
+    assert.equal(reason, "SIGTERM");
+    assert.equal(await readFile(first, "utf8"), MESSY_CANONICAL);
+    assert.equal(await readFile(third, "utf8"), MESSY);
+  });
+
+  test("validate-idl: an already-aborted signal reads nothing", async () => {
+    const controller = new AbortController();
+    controller.abort("SIGINT");
+    const io = fakeIo({ signal: controller.signal, stdin: MESSY });
+    await assert.rejects(
+      validateIdl(createContext(io, parseCommandLine(["validate-idl", "-"]))),
+      (e) => e === "SIGINT",
+    );
+    assert.equal(io.stdoutText(), "");
+  });
 });
 
 describe("codegen", () => {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import { parseCommandLine, parseTimeout } from "../../../src/cli/args.ts";
-import { escapeControls } from "../../../src/cli/io.ts";
+import { abortable, escapeControls } from "../../../src/cli/io.ts";
 import { formatJson } from "../../../src/cli/json.ts";
 import { USAGE } from "../../../src/cli/run.ts";
 import { jsonCodec } from "../../../src/index.ts";
@@ -172,9 +172,25 @@ describe("parseCommandLine", () => {
       "1500nsec",
     ])
       assert.throws(() => parseTimeout(bad), /^UsageError: Failed to parse --timeout= parameter/, bad);
-    // Out of range: at or above 2⁶⁴ − 1 µs.
-    assert.throws(() => parseTimeout("18446744073709551615us"), /Failed to parse/);
-    assert.equal(parseTimeout("18446744073709551614us"), Number(18446744073709551614n) / 1000);
+    // Out of range (parse_time's ERANGE): a whole part above 2⁶³ − 1 (strtoll), or at or above ⌊(2⁶⁴ − 1) / unit
+    // in µs⌋, checked per term before adding; and a sum at or above 2⁶⁴ − 1 µs.
+    for (const big of [
+      "18446744073709551615us",
+      "18446744073709551614us",
+      "9300000000000000000us",
+      "9223372036854775808us",
+      "584542y",
+      "584542.5y",
+      "307445734561min",
+      "9223372036854775807us 9223372036854775808us",
+    ])
+      assert.throws(() => parseTimeout(big), /Failed to parse/, big);
+    assert.equal(parseTimeout("9223372036854775807us"), Number(9223372036854775807n) / 1000);
+    assert.equal(parseTimeout("584541y"), Number(584541n * 31_557_600_000_000n) / 1000);
+    assert.equal(parseTimeout("584541.9y"), Number(584541n * 31_557_600_000_000n + 28_401_840_000_000n) / 1000);
+    assert.equal(parseTimeout("307445734560min"), Number(307445734560n * 60_000_000n) / 1000);
+    // Two terms below the limits whose sum is 2⁶⁴ − 2 µs: still in range.
+    assert.equal(parseTimeout("9223372036854775807us 9223372036854775807us"), Number(18446744073709551614n) / 1000);
     // Zero after rounding down to whole microseconds.
     for (const zero of ["0", "0.0s", "0ms", "0.0000001", "0.5us", "0 0"])
       assert.throws(() => parseTimeout(zero), /^UsageError: Timeout cannot be zero\.$/, zero);
@@ -261,6 +277,31 @@ describe("escapeControls", () => {
     }
     const others = `é€😀${String.fromCharCode(0xa0, 0x200d, 0x2027, 0x202f, 0x2065, 0x206a)}`;
     assert.equal(escapeControls(others), others);
+  });
+});
+
+describe("abortable", () => {
+  test("an already-aborted signal: rejects with its reason; the promise's later rejection is not unhandled", async () => {
+    const unhandled: unknown[] = [];
+    const listener = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", listener);
+    try {
+      const controller = new AbortController();
+      controller.abort("SIGINT");
+      let fail: (e: Error) => void = () => undefined;
+      const later = new Promise<never>((_resolve, reject) => {
+        fail = reject;
+      });
+      await assert.rejects(abortable(later, controller.signal), (e) => e === "SIGINT");
+      fail(new Error("late failure"));
+      for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setTimeout(r, 10));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
   });
 });
 

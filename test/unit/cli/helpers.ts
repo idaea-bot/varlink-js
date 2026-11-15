@@ -142,6 +142,8 @@ export interface FakeIoOptions {
   signal?: AbortSignal;
   /** Called with stdout's text so far after each write. */
   onStdout?: (text: string) => void;
+  /** Called with each stderr write's text once it is recorded. */
+  onStderr?: (text: string) => void;
   /** Awaited by each stdout write before it is recorded (a slow or blocked reader). */
   beforeStdoutWrite?: (data: Uint8Array) => Promise<void>;
 }
@@ -208,6 +210,7 @@ export function fakeIo(options: FakeIoOptions = {}): FakeIo {
       write: async (data) => {
         await Promise.resolve();
         stderrChunks.push(bytesOf(data));
+        options.onStderr?.(typeof data === "string" ? data : decoder.decode(data));
       },
     },
     env: options.env ?? {},

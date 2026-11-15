@@ -1,8 +1,14 @@
 // `varlink-js call` in-process (DESIGN.md §4.14): every mode and option against the test service over unix and tcp,
 // error replies, local failures, timeouts, int precision, stdin parameters, signals, EPIPE and escaping.
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { ESC, RS, rawServer, runCli, startFixture, waitFor, type Fixture } from "./helpers.ts";
+import { SPAWN_SKIP } from "../node/helpers.ts";
+import { ESC, RS, rawServer, runCli, startFixture, tempDir, waitFor, type Fixture } from "./helpers.ts";
+
+const EXEC_CHILD = resolve(import.meta.dirname, "exec-child.ts");
 
 let fx: Fixture;
 before(async () => {
@@ -240,19 +246,114 @@ describe("call: error replies", () => {
   });
 });
 
+// exec: through varlink-js/node's connect (DESIGN.md §4.7): a real child (exec-child.ts) on a socketpair. Spawned
+// children are Node-only for now, so these skip under Bun and Deno like the src/node spawn tests.
+describe("call over exec:", { skip: SPAWN_SKIP }, () => {
+  let state: { path: string; remove(): Promise<void> };
+  before(async () => {
+    state = await tempDir();
+  });
+  after(async () => {
+    await state.remove();
+  });
+
+  const gone = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (e) {
+      return (e as { code?: unknown }).code === "ESRCH";
+    }
+  };
+
+  /** A fresh state dir and an executable wrapper that records its pid there, then execs the child with node. */
+  const child = async (): Promise<{ address: string; pid(): Promise<number>; hanging(): boolean }> => {
+    const dir = await mkdtemp(join(state.path, "c-"));
+    const wrapper = join(dir, "child.sh");
+    const script = `#!/bin/sh\necho $$ > "${dir}/pid"\nexec "${process.execPath}" "${EXEC_CHILD}" "--state=${dir}" "$@"\n`;
+    await writeFile(wrapper, script, { mode: 0o755 });
+    const pidFile = join(dir, "pid");
+    return {
+      address: `exec:${wrapper}`,
+      pid: async () => {
+        await waitFor(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").endsWith("\n"), 10_000);
+        return Number(readFileSync(pidFile, "utf8"));
+      },
+      hanging: () => existsSync(join(dir, "hang")),
+    };
+  };
+
+  test("a method that answers: exit 0, the reply printed, the child gone after run() returns", async () => {
+    const c = await child();
+    const r = await runCli(["call", c.address, "org.example.execchild.Answer", "{}"]);
+    assert.equal(r.code, 0, r.stderr);
+    const pid = await c.pid();
+    assert.equal(r.stdout, `{"pid":${String(pid)}}\n`);
+    assert.equal(r.stderr, "");
+    await waitFor(() => gone(pid), 10_000);
+  });
+
+  test("--timeout against a method that never answers: exit 1 with the timeout message, the child gone", async () => {
+    const c = await child();
+    // 1 s rather than 0.2 s: long enough that the wrapper has recorded its pid before the SIGTERM on a loaded machine
+    // (the message is the same whether the child had started serving or not).
+    const r = await runCli(["call", "--timeout=1", c.address, "org.example.execchild.Hang", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "Method call org.example.execchild.Hang() failed: timed out after 1s\n");
+    const pid = await c.pid();
+    await waitFor(() => gone(pid), 10_000);
+  });
+
+  test("a signal (io.signal) during the call: 130, the child gone", async () => {
+    const c = await child();
+    const controller = new AbortController();
+    const running = runCli(["call", c.address, "org.example.execchild.Hang", "{}"], { signal: controller.signal });
+    await waitFor(() => c.hanging(), 20_000);
+    controller.abort("SIGINT");
+    const r = await running;
+    assert.equal(r.code, 130);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "");
+    const pid = await c.pid();
+    await waitFor(() => gone(pid), 10_000);
+  });
+
+  test("a child that exits without serving: `Method call M() failed: …`, one line, exit 1", async () => {
+    const dir = await mkdtemp(join(state.path, "x-"));
+    const wrapper = join(dir, "exit.sh");
+    await writeFile(wrapper, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const r = await runCli(["call", `exec:${wrapper}`, "a.b.C", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "Method call a.b.C() failed: connection closed by peer\n");
+  });
+
+  test("a missing executable: `Failed to connect to exec:…: … ENOENT`, exit 1", async () => {
+    const r = await runCli(["call", "exec:/nonexistent/varlink-js-cli-test", "a.b.C", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(
+      r.stderr,
+      "Failed to connect to exec:/nonexistent/varlink-js-cli-test: " +
+        "ENOENT: no such file or directory, access '/nonexistent/varlink-js-cli-test'\n",
+    );
+  });
+
+  test("bridge exec:… fails at once with the clear error; no child is started", async () => {
+    const c = await child();
+    const r = await runCli(["bridge", c.address]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "exec addresses are not supported by bridge (unix:, unix:@ and tcp: are).\n");
+    assert.equal(existsSync(join(c.address.slice("exec:".length), "..", "pid")), false);
+  });
+});
+
 describe("call: local failures", () => {
   test("connect refused: `Failed to connect to ADDRESS: …`, exit 1", async () => {
     const r = await runCli(["call", "unix:/nonexistent/dir/sock", "a.b.C", "{}"]);
     assert.equal(r.code, 1);
     assert.match(r.stderr, /^Failed to connect to unix:\/nonexistent\/dir\/sock: .*ENOENT/);
-  });
-
-  test("exec: goes to varlink-js/node's connect; a failure is one line, exit 1", async () => {
-    // Before M8 the adapter cannot dial exec: (connect fails); after M8 /bin/true starts and exits without serving
-    // (the call fails). Either way: one line, no stack, exit 1.
-    const r = await runCli(["call", "exec:/bin/true", "a.b.C", "{}"]);
-    assert.equal(r.code, 1);
-    assert.match(r.stderr, /^(Failed to connect to exec:\/bin\/true|Method call a\.b\.C\(\) failed): [^\n]*\n$/);
   });
 
   test("--timeout=0.2 against a handler that never answers: exit 1 quickly", async () => {

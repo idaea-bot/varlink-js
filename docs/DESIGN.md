@@ -1258,7 +1258,7 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
 | `info`, `list-interfaces ADDRESS` | GetInfo: varlinkctl's vertical table (labels right-aligned, interfaces sorted with duplicates kept like `strv_sort`, continuation lines aligned) / sorted names (duplicates kept); JSON: the reply / its `interfaces` |
 | `list-methods`, `introspect ADDRESS [IFACE…]` | none = all of GetInfo's (sorted, unique: `strv_sort_uniq`); names checked before connecting; `list-methods` sorted unique `iface.Method`, ` (experimental)` only on a TTY (stdout and stderr, `on_tty()`); `introspect` text = `formatInterface` per interface, blank line between, unparsable → warning + raw text; JSON: the reply objects, JSON-SEQ when more than one |
 | `call ADDRESS METHOD [PARAMS]` | PARAMS or stdin (absent or `-`; blank = `{}`; the TTY notice unless `-q`); `--more` (JSON-SEQ, one awaited write per reply), `-E`, `--collect` (one array), `--oneway` (exit once written), `--graceful=ERROR`, `-q`; the three modes are mutually exclusive |
-| `validate-idl [FILE]`, `format [FILE…]` | stdin when absent or `-`; errors `FILE:LINE:COL: reason` (`<stdin>`); `format --check` (names the non-canonical files on stderr), `-i` (atomic: a uniquely named temp file in the same directory with the original's mode, renamed over it — through a symlink, its target; removed on failure) |
+| `validate-idl [FILE]`, `format [FILE…]` | stdin when absent or `-`; errors `FILE:LINE:COL: reason` (`<stdin>`); `format --check` (names the non-canonical files on stderr), `-i` (atomic: a temp file `.<first 32 code points of the name>.<8 hex>.tmp` in the same directory with the original's mode and, best effort, its owner, renamed over it — through a symlink, its target; removed on failure; written in place instead, not atomically, when the file has other hard links or the temp file cannot be created: `EACCES`/`EPERM`/`EROFS`/`ENAMETOOLONG`, e.g. a writable file in a read-only directory) |
 | `codegen FILE…`, `codegen --address ADDR IFACE…` | `generate()` / `generateFromService`; `-o DIR` writes `<DIR>/<iface>.ts` (paths on stderr unless `-q`), else one input to stdout; output names that clash case-insensitively (`a.B`/`a.b` on macOS) fail before anything is written; `--ints`, `--import-path` |
 | `bridge ADDRESS` | raw bytes stdin ↔ socket (`openSocket` of `src/node/connect.ts`), unix/abstract/tcp only; one chunk at a time both ways (the socket paused while a stdout write is pending; the next stdin chunk pulled once the socket took the last); stdin EOF half-closes, peer EOF ends it (0; stdin's iterator is `return()`ed) |
 | `certify server\|client ADDRESS` | `Listening on <address>` (real port for `:0`), graceful stop on SIGINT/SIGTERM (0) / every step (escaped: `client_id` and replies are the peer's), `Certification passed` |
@@ -1284,7 +1284,8 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
 - **Target** (`target.ts`): `parseAddress`; `websocket` → `varlink-js/websocket` `connect`, `http` →
   `createHttpClient` (oneway → its `OperationNotSupportedError`; introspection goes to the named interface's service,
   or with none to the bridge's only service — several → a clear error), anything else → `varlink-js/node` `connect`
-  (exec:/ssh-* print its error today and work once M8 lands). Connections: `ints: "bigint"`, `validateReplies:
+  (exec:, ssh-unix:/ssh:, ssh-exec: spawn their child there, §4.7; closing the connection SIGTERMs it and waits for
+  its exit). Connections: `ints: "bigint"`, `validateReplies:
   "off"`, `timeout: 0`; every path closes them.
 - **Integers**: parameters go through `jsonCodec.decode` (lossless), replies are raw (unsafe ints are bigints), and
   the printer writes bigints as digits: 2⁶³−1, −2⁶³, 2⁶⁴−1 round-trip through `call`, `--more`, `--collect`.
@@ -1296,10 +1297,13 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   C0/DEL/C1 as `\xNN` and U+2028/U+2029 and the bidi controls (U+061C, U+200E/F, U+202A–E, U+2066–9; codegen's class)
   as `\uNNNN` (IDL text keeps LF and TAB).
 - **Signals, EPIPE**: main.ts turns the first SIGINT/SIGTERM into `io.signal` (reason = the signal name; a second
-  one exits at once); `run` closes the connection and returns 130/143 (stdin reads, connects, calls, `bridge` all
+  one exits at once: an `exec:`/`ssh-*` child still in its SIGTERM → SIGKILL wait, killTimeout 2 s, is not
+  SIGKILLed then, so one that ignores SIGTERM outlives the CLI; the Connection does not expose the child to kill it
+  from the CLI, a known limit); `run` closes the connection and returns 130/143 (stdin reads, connects, calls, `bridge` all
   watch it; `certify server` shuts down and returns 0, as USAGE says). The local commands (`validate-idl`, `format`,
-  `codegen FILE…`, help, version) are raced with the signal in `run`, so the first one stops them too (what is in
-  flight finishes unobserved). A stdout write failing with EPIPE (`| head -1`) is a
+  `codegen FILE…`, help, version) are raced with the signal in `run`, so the first one stops them too; they check
+  `io.signal` before each file they read or write, so a multi-file `format -i`/`codegen -o` does not go on (the one
+  file in flight finishes unobserved). A stdout write failing with EPIPE (`| head -1`) is a
   `BrokenPipeError`: the command stops, closes, exits 0, prints nothing. `node-io.ts` opens stdin only when read and
   destroys it at the end, so the process always exits by itself.
 - **Differences from varlinkctl**: no colours, no pager, no `--no-ask-password`/polkit, no `sd_notify`

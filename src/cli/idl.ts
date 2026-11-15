@@ -1,6 +1,6 @@
 // `validate-idl`, `format` and `codegen` (DESIGN.md §4.14): the IDL tools over files or stdin (`-`).
-import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { chmod, chown, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { generate, generateFromService, type GeneratedFile, type GenerateOptions } from "../codegen/index.ts";
 import { formatInterface, IdlSyntaxError, isInterfaceName, parseInterface, type Interface } from "../core/idl/index.ts";
@@ -16,8 +16,17 @@ interface Input {
   readonly text: string;
 }
 
+/**
+ * Stops a local command once io.signal aborted (throws its reason; run() maps it to 130/143). run() returns at the
+ * first signal already; this keeps the rest of a multi-file `format -i` or `codegen -o` from going on unobserved.
+ */
+function stopIfSignalled(ctx: Context): void {
+  ctx.io.signal?.throwIfAborted();
+}
+
 /** Reads FILE, or stdin for `-`. @throws {CliError} on a read error or invalid UTF-8. */
 async function readInput(ctx: Context, file: string): Promise<Input> {
+  stopIfSignalled(ctx);
   const name = file === "-" ? STDIN_NAME : file;
   let bytes: Uint8Array;
   try {
@@ -66,18 +75,43 @@ export async function validateIdl(ctx: Context): Promise<number> {
   return 0;
 }
 
+/** Errors creating the temp file that mean "cannot make one here" (not "cannot write at all"): write in place. */
+const NO_TEMP_FILE = new Set(["EACCES", "EPERM", "EROFS", "ENAMETOOLONG"]);
+
 /**
- * Replaces `file` with `text` atomically: a uniquely named temp file in the same directory (the original's mode),
- * renamed over it, so a failure (ENOSPC, a crash) leaves the original whole. The temp file is removed on failure.
+ * Replaces `file` with `text` atomically: a uniquely named temp file in the same directory (the original's mode, and
+ * owner where we may set it), renamed over it, so a failure (ENOSPC, a crash) leaves the original whole. The temp file
+ * is removed on failure. Written in place instead (not atomic) when the file has other hard links (a rename would
+ * split them) or the temp file cannot be created (a writable file in a read-only directory).
  */
 async function replaceFile(file: string, text: string): Promise<void> {
   // Through a symlink: the file it points to is replaced, not the link.
   const target = await realpath(file);
-  const mode = (await stat(target)).mode & 0o7777;
-  const temp = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+  const st = await stat(target);
+  if (st.nlink > 1) {
+    await writeFile(target, text);
+    return;
+  }
+  const mode = st.mode & 0o7777;
+  // Short, so a long-but-valid name still leaves room: `.<first 32 code points>.<8 hex>.tmp`.
+  const prefix = Array.from(basename(target)).slice(0, 32).join("");
+  const temp = join(dirname(target), `.${prefix}.${randomBytes(4).toString("hex")}.tmp`);
   try {
     await writeFile(temp, text, { mode, flag: "wx" });
-    // writeFile's mode is filtered by the umask; set it exactly.
+  } catch (e) {
+    const code = String((e as NodeJS.ErrnoException).code);
+    // Created but not written (ENOSPC): remove it. EEXIST: someone else's file, left alone.
+    if (code !== "EEXIST") await rm(temp, { force: true }).catch(() => undefined);
+    if (!NO_TEMP_FILE.has(code)) throw e;
+    await writeFile(target, text);
+    return;
+  }
+  try {
+    // Best effort: keep the owner (only root or the owner of both may; EPERM is ignored).
+    await chown(temp, st.uid, st.gid).catch((e: unknown) => {
+      if ((e as NodeJS.ErrnoException).code !== "EPERM") throw e;
+    });
+    // writeFile's mode is filtered by the umask; set it exactly (after chown, which may clear setuid/setgid).
     await chmod(temp, mode);
     await rename(temp, target);
   } catch (e) {
@@ -112,6 +146,7 @@ export async function format(ctx: Context): Promise<number> {
       }
     } else if (ctx.cli.inPlace) {
       if (formatted !== input.text) {
+        stopIfSignalled(ctx);
         try {
           await replaceFile(file, formatted);
         } catch (e) {
@@ -216,12 +251,14 @@ export async function codegen(ctx: Context): Promise<number> {
     for (const f of files) await ctx.out(f.code);
     return 0;
   }
+  stopIfSignalled(ctx);
   try {
     await mkdir(out, { recursive: true });
   } catch (e) {
     throw new CliError(`Failed to create '${out}': ${describeError(e)}`);
   }
   for (const f of files) {
+    stopIfSignalled(ctx);
     const path = join(out, f.fileName);
     try {
       await writeFile(path, f.code);

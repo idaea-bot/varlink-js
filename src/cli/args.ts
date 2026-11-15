@@ -147,6 +147,8 @@ const UNITS: readonly (readonly [string, bigint])[] = [
 ];
 /** systemd's USEC_INFINITY (2⁶⁴ − 1): sums at or above it are out of range. */
 const USEC_INFINITY = 2n ** 64n - 1n;
+/** strtoll's limit (2⁶³ − 1): a term's whole part above it is ERANGE. */
+const INT64_MAX = 2n ** 63n - 1n;
 /** parse_time's WHITESPACE: space, TAB, LF, CR. */
 const WHITESPACE = /^[ \t\n\r]*/;
 const TERM = /^(\d*)(?:(\.)(\d*))?/;
@@ -176,10 +178,14 @@ function parseSec(text: string): bigint | "infinity" | undefined {
     if (unit === undefined && afterSpace === p && p !== "") return undefined;
     if (unit !== undefined) p = afterSpace.slice(unit[0].length);
     const perUnit = unit?.[1] ?? NS_PER_S;
-    // In microseconds like parse_time (nanosecond terms are rounded down); each fraction digit d at position i adds
-    // d × ⌊unit / 10^i⌋ µs.
-    total += (BigInt(whole === "" ? "0" : whole) * perUnit) / NS_PER_US;
-    let m10 = perUnit / NS_PER_US;
+    const wholeUnits = BigInt(whole === "" ? "0" : whole);
+    const multiplier = perUnit / NS_PER_US;
+    // parse_time's ERANGE: strtoll's overflow, then `l >= USEC_INFINITY / multiplier` (multiplier in µs), both
+    // checked before the term is added.
+    if (wholeUnits > INT64_MAX || wholeUnits >= USEC_INFINITY / multiplier) return undefined;
+    // In microseconds like parse_time; each fraction digit d at position i adds d × ⌊unit / 10^i⌋ µs.
+    total += wholeUnits * multiplier;
+    let m10 = multiplier;
     for (const d of digits) {
       m10 /= 10n;
       total += BigInt(d) * m10;

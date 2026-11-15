@@ -1,5 +1,5 @@
-// Address → target (DESIGN.md §4.14): one small interface over a Connection (unix, unix:@, tcp, and whatever
-// varlink-js/node's connect() learns later, e.g. exec:/ssh-* in M8; WebSocket mode) and the simple HTTP mode client.
+// Address → target (DESIGN.md §4.14): one small interface over a Connection (unix, unix:@, tcp, the spawned exec:,
+// ssh-unix: and ssh-exec: of varlink-js/node's connect(); WebSocket mode) and the simple HTTP mode client.
 // The CLI bounds everything with its own deadline signal, so the library's timeouts are off (0).
 import type { AddressSpec } from "../core/address/index.ts";
 import { createHttpClient, type HttpClient } from "../http/index.ts";

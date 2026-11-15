@@ -109,6 +109,8 @@ export function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefine
       reject(signal.reason);
     };
     if (signal.aborted) {
+      // Nobody awaits `promise` now: its later rejection must not be an unhandled one.
+      promise.catch(() => undefined);
       onAbort();
       return;
     }

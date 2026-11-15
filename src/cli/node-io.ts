@@ -51,6 +51,10 @@ function output(stream: NodeJS.WriteStream, fd: number): CliOutput {
  * The process's CliIo. stdin is opened only when a command reads it (isTTY comes from the fd, so asking does not
  * open it). The first SIGINT/SIGTERM aborts `signal` with the signal's name, so run() closes its connections and
  * returns 130/143; a second one exits at once with that status.
+ *
+ * Limit: an `exec:`/`ssh-*` child is SIGTERMed when the connection closes and SIGKILLed only after the library's
+ * killTimeout (2 s). A second signal during that wait exits before the SIGKILL, so a child that ignores SIGTERM
+ * outlives the CLI; the Connection does not expose the child, so the CLI cannot kill it itself (DESIGN.md §4.14).
  */
 export function nodeIo(): NodeIo {
   const controller = new AbortController();

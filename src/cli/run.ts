@@ -68,7 +68,9 @@ codegen:
      --import-path=SPEC        Module the generated code imports (default varlink-js)
      --address=ADDRESS         Fetch the interfaces from a running service
 
-ADDRESS: unix:/path, /path, ./path, unix:@abstract (Linux), tcp:host:port, ws(s)://…, http(s)://… (HTTP bridge).
+ADDRESS: unix:/path, /path, ./path, unix:@abstract (Linux), tcp:host:port, exec:/path (spawn a service on a
+socket), ssh-unix:host:/path (alias ssh:), ssh-exec:host:command, ws(s)://…, http(s)://… (HTTP bridge).
+bridge takes unix:, unix:@ and tcp: only.
 Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM ('certify server': 0, it stops
 gracefully).
 `;
