@@ -1,7 +1,7 @@
 // Socket activation (DESIGN.md §5.8): listeners from LISTEN_FDS/LISTEN_FDNAMES, SYSTEMD_VARLINK_LISTEN, stdio.
 // Reference: sd-daemon.c (sd_listen_fds, sd_listen_fds_with_names), sd-varlink.c (sd_varlink_server_listen_name,
 // sd_varlink_server_listen_auto).
-import { lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { fstatSync, lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { connect, Socket, type NetConnectOpts } from "node:net";
 import { formatAddress, type AddressSpec } from "../core/address/parse.ts";
 import { OperationNotSupportedError } from "../core/errors/local.ts";
@@ -198,15 +198,18 @@ class OneShotListener implements Listener {
  * Bun (as of 1.4.4): `new net.Socket({ fd })` on an inherited socket fd never reads or writes (it gets no handle,
  * and the process exits as if nothing were pending), but `net.connect({ fd })` opens a real socket over it: reads,
  * writes, `end()` sends a FIN, `destroy()` closes the fd, for blocking and `O_NONBLOCK` fds alike. Node and Deno
- * reject `net.connect({ fd })` (no port or path), so only Bun takes that path.
+ * reject `net.connect({ fd })` (no port or path), so only Bun takes that path, and only for a socket fd: that is
+ * all it was checked on, so a pipe or FIFO forced to `accept: "connected"` keeps `new Socket({ fd })` (Node's pipe
+ * handle path; on Bun that edge case is unchecked).
  */
 const FD_NEEDS_CONNECT = process.versions.bun !== undefined;
 
 /** The channel over a connected activation fd (exported for tests); closing it closes the fd. */
 export function connectedChannel(fd: number): ByteChannel {
-  const socket = FD_NEEDS_CONNECT
-    ? connect({ fd, allowHalfOpen: true } as unknown as NetConnectOpts)
-    : new Socket({ fd, readable: true, writable: true, allowHalfOpen: true });
+  const socket =
+    FD_NEEDS_CONNECT && fstatSync(fd).isSocket()
+      ? connect({ fd, allowHalfOpen: true } as unknown as NetConnectOpts)
+      : new Socket({ fd, readable: true, writable: true, allowHalfOpen: true });
   return fromNodeSocket(socket);
 }
 
@@ -522,7 +525,9 @@ function stdioChannel(): ByteChannel {
  * `dup`s them away; that needs the native addon): closing the channel ends `process.stdout`, which sends FIN on a
  * socket stdout (what our spawners and ssh give a child) — after `close()` only if no write is still pending (the
  * destroyed stream skips its `_final`) — but cannot close a pipe or a terminal, so the peer may see EOF only when
- * the process exits. Serve with `exitOnIdle` and `await server.closed; process.exit()`.
+ * the process exits. On Bun and Deno (as of 1.4.4 / 2.9.8) `process.stdout.end()` sends no FIN even on a socket, so
+ * there the peer sees EOF only at exit and the must-exit rule is required. Serve with `exitOnIdle` and
+ * `await server.closed; process.exit()`.
  */
 export function listenStdio(): Listener {
   return new OneShotListener("stdio:", stdioChannel, () => undefined);

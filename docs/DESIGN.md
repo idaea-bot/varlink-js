@@ -478,9 +478,11 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
     checks half-close, close and the fd on every runtime.
   - Deno: a socket `process.stdin` is a plain Duplex with `emitClose: false` that never emits `close` after
     `destroy()` (it only sets `closed`). For such a stream (`emitClose: false` and not a `net.Socket`, which emits
-    `close` itself), on Deno only, the streams channel checks `closed` after its own `destroy()`, right away and a
-    turn later, so `Connection.closed`/`server.closed` of a stdio server resolve. Child pipes (`net.Socket`s) still
-    wait for the event.
+    `close` itself), on Deno only, the streams channel also counts the stream as closed once its `_destroy` calls
+    back (it wraps it; `closed` is set there), whoever destroyed it (our `close()`, auto-destroy after EOF, an
+    error), so `Connection.closed`/`server.closed` of a stdio server resolve. A clean `end` alone does not count.
+    `stream.finished()` cannot do it: for such a stream it fires on `end`/`finish` and never on a destroy. Child
+    pipes (`net.Socket`s) still wait for the event.
   - Deno: `spawn()` fails with `EBADF` when one fd fills two stdio slots, so the `/dev/null` cover of inherited
     activation fds opens one `/dev/null` per slot.
 

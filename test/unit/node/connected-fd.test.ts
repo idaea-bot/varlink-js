@@ -87,6 +87,11 @@ async function run(
   return { report: JSON.parse(out) as ChildReport, peerGot, peerEof, code };
 }
 
+/** fd 3 was closed: EBADF, or the number already names another file (the runtime reused it). */
+function assertFdClosed(fd: string): void {
+  assert.ok(fd === "EBADF" || fd === "reused", `fd 3 after close: ${fd}`);
+}
+
 const NONBLOCKING_SKIP = IS_DENO ? "as of Deno 2.9.8 a net.Socket has no real fd (_handle.fd) to pass on" : false;
 
 for (const kind of ["pipe", "nonblocking"] as const) {
@@ -99,7 +104,7 @@ for (const kind of ["pipe", "nonblocking"] as const) {
       assert.equal(r.peerGot, "pong");
       assert.ok(r.peerEof);
       assert.equal(r.report.secondClose, "ok");
-      assert.equal(r.report.fd, "EBADF");
+      assertFdClosed(r.report.fd);
       assert.equal(r.report.readAfterClose, null);
     });
 
@@ -110,7 +115,7 @@ for (const kind of ["pipe", "nonblocking"] as const) {
       assert.ok(r.peerEof);
       // The peer sends "after" only once it saw our EOF: had EOF come from close(), the child could not read it.
       assert.equal(r.report.got, "pingafter");
-      assert.equal(r.report.fd, "EBADF");
+      assertFdClosed(r.report.fd);
     });
   });
 }

@@ -394,8 +394,8 @@ function spawnChild(file: string, args: readonly string[], o: CheckedProcessOpti
   const slots = [...stdio];
   const uncovered = uncoveredActivationFds(slots.length);
   if (uncovered.length === 0) return new ChildHandle(spawn(file, args, { ...options, stdio }), o.killTimeout);
-  // One /dev/null per slot (Deno 2.9.8 fails the spawn with EBADF if one fd fills two slots); ours are closed once the
-  // child has its copies.
+  // One /dev/null per slot (as of Deno 2.9.8 the spawn fails with EBADF if one fd fills two slots); ours are closed
+  // once the child has its copies.
   const devNulls = openDevNulls(uncovered.length);
   let open = true;
   const release = (): void => {

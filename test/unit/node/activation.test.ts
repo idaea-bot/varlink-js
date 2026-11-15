@@ -94,7 +94,12 @@ interface Report {
   exists?: boolean;
   bound?: string[];
   left?: string[];
-  fds?: { ours: Record<string, string>; theirs: Record<string, string | null> };
+  fds?: {
+    ours: Record<string, string | null>;
+    theirs: Record<string, string | null>;
+    oursKinds: Record<string, string | null>;
+    theirsKinds?: Record<string, string | null>;
+  };
 }
 
 /** Runs the child in --report mode: its one JSON line. */
@@ -303,6 +308,30 @@ describe("listenFromEnv in an activated child", () => {
       }
     },
   );
+
+  test("each uncovered activation fd reaches our spawned children as its own /dev/null (fstat, any POSIX)", async () => {
+    const a = await unixSocket("devnull-a");
+    const b = await unixSocket("devnull-b");
+    try {
+      const r = await report({
+        fds: [a.fd, b.fd],
+        env: { LISTEN_FDS: "2", LISTEN_FDNAMES: "varlink:other" },
+        args: ["--accept=listening", "--grandchild"],
+      });
+      assert.equal(r.result, "listener");
+      const fds = r.fds;
+      assert.ok(fds !== undefined);
+      // As of Deno 2.9.8 node:fs fstat sees an inherited fd only through the runtime's own fd table (only a Deno
+      // parent passes them on), and once the listener has fd 3, fstat(3) gives EBADF there; fd 4 stays visible.
+      if (process.versions.deno === undefined) assert.equal(fds.oursKinds["3"], "socket");
+      assert.equal(fds.oursKinds["4"], "socket");
+      // One /dev/null per slot (as of Deno 2.9.8 the spawn fails with EBADF if one fd fills two slots).
+      assert.deepEqual(fds.theirsKinds, { "3": "devnull", "4": "devnull" });
+    } finally {
+      await closeServer(a.server);
+      await closeServer(b.server);
+    }
+  });
 
   test(
     "the /dev/null cover also applies to an exec: grandchild with a listening socket",

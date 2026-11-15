@@ -4,22 +4,25 @@
 // - close: close() twice, awaits closed;
 // - end: end() (the peer answers our EOF with "after" and its own EOF), reads to EOF, then close(), awaits closed.
 // Then prints one JSON line on stdout: what it read, whether fd 3 was a socket, the second close()'s outcome, and
-// fstat(3)'s error code after the close.
+// what fd 3 is after the close (fstat's error code, or `reused`/`open` by dev + inode).
 import { fstatSync } from "node:fs";
 import { connectedChannel } from "../../../src/node/activation.ts";
 
 const [scenario = "", delay = "0"] = process.argv.slice(2);
 await new Promise((resolve) => setTimeout(resolve, Number(delay)));
 
+const before = fstatSync(3);
+/** fd 3 after the close: its fstat error code, `reused` if the number now names another file, `open` if not closed. */
 const fdCode = (): string => {
   try {
-    fstatSync(3);
-    return "open";
+    const after = fstatSync(3);
+    // The runtime may have opened something on the freed number in between.
+    return after.dev === before.dev && after.ino === before.ino ? "open" : "reused";
   } catch (e) {
     return String((e as { code?: unknown }).code);
   }
 };
-const socket = fstatSync(3).isSocket();
+const socket = before.isSocket();
 const ch = connectedChannel(3);
 const dec = new TextDecoder();
 let got = "";

@@ -6,11 +6,12 @@
 // JSON line on stdout and exit, without serving), --fd-address=<address> (report `listen({fd: 3}, {address})`;
 // with --registry=<dir> it serves it with that registry, shuts down and reports the directory's entries instead),
 // --grandchild (with --report: also report what a bridge grandchild, fd-links-child.ts, sees on our activation fd
-// numbers, Linux),
+// numbers: /proc links on Linux, fstat kinds everywhere),
 // --grandchild-exec=<cmd> (the same through an `exec:` grandchild with a listening socket, `cmd` being this
 // fixture's wrapper; Ping reports fds 3…6 as /proc shows them),
 // --hold (after the server closed, stay alive instead of exiting, until signalled).
 import { existsSync, readdirSync, readlinkSync } from "node:fs";
+import { fdKind, type FdKind } from "./fd-kind.ts";
 import { resolve } from "node:path";
 import type { Listener } from "../../../src/core/protocol/index.ts";
 import { connectExec, listen, listenAuto } from "../../../src/node/index.ts";
@@ -105,11 +106,21 @@ function fdLinks(fds: readonly number[]): Record<string, string | null> {
   return out;
 }
 
-/** What /proc/self/fd/<n> is for each of our activation fd numbers, ours and as a grandchild sees it. */
-async function grandchild(): Promise<{ ours: Record<string, string>; theirs: Record<string, string | null> }> {
+interface GrandchildFds {
+  /** /proc/self/fd links (null: no /proc). */
+  ours: Record<string, string | null>;
+  theirs: Record<string, string | null>;
+  /** By fstat, any POSIX system; --grandchild only. */
+  oursKinds: Record<string, FdKind>;
+  theirsKinds?: Record<string, FdKind>;
+}
+
+/** What each of our activation fd numbers is, ours and as a grandchild sees it. */
+async function grandchild(): Promise<GrandchildFds> {
   const count = Number(before.LISTEN_FDS ?? "0");
   const fds = Array.from({ length: count }, (_, i) => 3 + i);
-  const ours = Object.fromEntries(fds.map((fd) => [fd, readlinkSync(`/proc/self/fd/${String(fd)}`)]));
+  const ours = fdLinks(fds);
+  const oursKinds = Object.fromEntries(fds.map((fd) => [fd, fdKind(fd)]));
   const exec = flag("grandchild-exec");
   if (exec !== undefined) {
     // exec: listening mode: its fd 3 is a listening socket of ours; every other activation fd must be covered.
@@ -117,7 +128,7 @@ async function grandchild(): Promise<{ ours: Record<string, string>; theirs: Rec
     const reply = (await conn.call("org.example.child.Ping")) as { fds: Record<string, string | null> };
     await conn.close();
     await conn.closed;
-    return { ours, theirs: reply.fds };
+    return { ours, theirs: reply.fds, oursKinds };
   }
   // helpers.ts' childCommand(), inlined (helpers.ts imports node:test).
   const deno = process.versions.deno === undefined ? [] : ["run", "-A", "--no-check"];
@@ -128,7 +139,8 @@ async function grandchild(): Promise<{ ours: Record<string, string>; theirs: Rec
     text += new TextDecoder().decode(chunk.bytes);
   ch.close();
   await ch.closed;
-  return { ours, theirs: JSON.parse(text) as Record<string, string | null> };
+  const theirs = JSON.parse(text) as { links: Record<string, string | null>; kinds: Record<string, FdKind> };
+  return { ours, theirs: theirs.links, oursKinds, theirsKinds: theirs.kinds };
 }
 
 const found = await auto();

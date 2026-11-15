@@ -1,12 +1,16 @@
-// Grandchild for activation-child.ts --grandchild: prints, as one JSON object on stdout, what /proc/self/fd/<n> is
-// for each fd number in argv (null: closed, or no /proc).
+// Grandchild for activation-child.ts --grandchild: prints, as one JSON object on stdout, for each fd number in argv,
+// what /proc/self/fd/<n> is (`links`; null: closed, or no /proc) and what fstat says it is (`kinds`, see fdKind).
 import { readlinkSync } from "node:fs";
+import { fdKind, type FdKind } from "./fd-kind.ts";
 
-const out: Record<string, string | null> = {};
-for (const fd of process.argv.slice(2))
+const links: Record<string, string | null> = {};
+const kinds: Record<string, FdKind> = {};
+for (const fd of process.argv.slice(2)) {
   try {
-    out[fd] = readlinkSync(`/proc/self/fd/${fd}`);
+    links[fd] = readlinkSync(`/proc/self/fd/${fd}`);
   } catch {
-    out[fd] = null;
+    links[fd] = null;
   }
-process.stdout.write(JSON.stringify(out));
+  kinds[fd] = fdKind(Number(fd));
+}
+process.stdout.write(JSON.stringify({ links, kinds }));

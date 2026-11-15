@@ -187,15 +187,33 @@ describe("fromNodeStreams over streams that never emit close (Deno process.stdin
   // As of Deno 2.9.8 a socket process.stdin is such a Duplex; on Node and Bun only the close event counts.
   const skip =
     process.versions.deno === undefined ? "Deno-only path (emitClose: false streams re-check closed)" : false;
-  const silent = (destroy?: Duplex["_destroy"]): Duplex =>
+  const silent = (destroy?: Duplex["_destroy"], allowHalfOpen = true): Duplex =>
     new Duplex({
       emitClose: false,
+      allowHalfOpen,
       read: () => undefined,
       write: (_chunk, _encoding, callback) => {
         callback();
       },
       ...(destroy === undefined ? {} : { destroy }),
     });
+  const later =
+    (ms: number): Duplex["_destroy"] =>
+    (error, callback) => {
+      setTimeout(() => {
+        callback(error);
+      }, ms);
+    };
+  /** Whether `promise` settled within `ms`. */
+  const settlesWithin = (promise: Promise<unknown>, ms: number): Promise<boolean> =>
+    Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => {
+          resolve(false);
+        }, ms);
+      }),
+    ]);
 
   test("closed resolves after close(), and the close listeners for it are dropped", { skip }, async () => {
     const duplex = silent();
@@ -219,5 +237,46 @@ describe("fromNodeStreams over streams that never emit close (Deno process.stdin
     assert.equal(duplex.closed, false);
     await ch.closed;
     assert.ok(duplex.closed);
+  });
+
+  test("closed resolves when _destroy calls back 50 ms after close()", { skip }, async () => {
+    const duplex = silent(later(50));
+    const ch = fromNodeStreams(duplex, duplex);
+    ch.close();
+    assert.equal(await settlesWithin(ch.closed, 20), false);
+    assert.equal(duplex.closed, false);
+    await ch.closed;
+    assert.ok(duplex.closed);
+  });
+
+  test("closed resolves when the stream destroys itself after EOF, without close()", { skip }, async () => {
+    // allowHalfOpen: false, like Deno's process.stdin: EOF ends the writable, then auto-destroy.
+    const duplex = silent(later(50), false);
+    const ch = fromNodeStreams(duplex, duplex);
+    duplex.push(null);
+    assert.equal(await ch.read(), null);
+    await ch.closed;
+    assert.ok(duplex.closed);
+  });
+
+  test("closed resolves when the stream is destroyed with an error, without close()", { skip }, async () => {
+    const duplex = silent(later(10));
+    const ch = fromNodeStreams(duplex, duplex);
+    duplex.destroy(new Error("EPIPE"));
+    await ch.closed;
+    assert.ok(duplex.closed);
+    await assert.rejects(ch.read(), /EPIPE/);
+  });
+
+  test("a clean end of the readable alone does not resolve closed", { skip }, async () => {
+    const duplex = silent();
+    const ch = fromNodeStreams(duplex, duplex);
+    duplex.push(null);
+    assert.equal(await ch.read(), null);
+    assert.equal(await settlesWithin(ch.closed, 50), false);
+    // Still open for writing.
+    await ch.write(new TextEncoder().encode("x"));
+    ch.close();
+    await ch.closed;
   });
 });
