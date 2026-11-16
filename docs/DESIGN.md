@@ -384,7 +384,9 @@ vendor extensions: kept in `ext`, otherwise ignored); `parameters` neither objec
 Rules that need call context (a `continues` reply to a call without `more`, a reply with no pending call)
 are enforced in the sessions (§4.5), not in the decoder. A syntactically valid message whose `method`
 is not a fully-qualified `interface.Method` gets a reply (§5.4), not a close.
-Encoding always writes `parameters` (`{}` when empty, as sd-varlink does: some peers index it directly) and
+Encoding always writes `parameters` (`{}` when empty: some peers index it directly). This is a deliberate
+difference: sd-varlink omits empty parameters (`JSON_BUILD_PAIR_VARIANT_NON_EMPTY`, sd-varlink.c:1955) and the spec
+says senders SHOULD omit them (varlink.md:611, 632-633); receivers MUST treat both forms alike. Encoding also
 omits false flags (no `continues:false`, `oneway:false`, …) and an absent `error` (F17).
 
 ### 4.5 Sessions (sans-IO state machines)
@@ -429,6 +431,10 @@ ServerSession:
 | `ssh-exec:host:cmdline` | `ssh -e none -T host env SYSTEMD_VARLINK_LISTEN=- cmdline`, varlink on its stdio | sd-varlink.c:445 |
 | `ws://`, `wss://`, and `http://`/`https://` whose path ends in `/ws/services/{svc}` | WebSocket mode (full protocol) | UAPI |
 | any other `http://`/`https://` URL | simple HTTP mode, URL = bridge base URL (no oneway/upgrade/pipelining); service via option or derived from the method | UAPI |
+
+`unix:` followed by a relative path (`unix:relative/path`, `unix:./x`) is accepted as an AF_UNIX path relative to the
+current directory. This is a deliberate difference: sd-varlink refuses a `unix:` path that is not absolute
+(sd-varlink.c:613-616); we keep it for the CLI and tests, like the bare `./rel/path` form.
 
 Anything after `;` is ignored (UAPI: future extensions). Programmatic `bridge: string[]` (spawn argv,
 speak on its stdio) covers python/libvarlink `--bridge` (`connectBridge(argv)`, §5.8).
@@ -713,7 +719,8 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
   code point boundary) and then log-safe quoted like §4.9 messages (`safeQuote`: control, bidi, U+2028/2029 and
   other format characters escaped). Decoded `parameters` are used by reference. Encode key order: call `method, parameters,
   oneway|more|upgrade, ext…`; reply `error?, parameters, continues?, ext…`; caller bugs (bad types, several flags,
-  `continues` with `error`, an ext key without `.`) are `TypeError`s, as are codec failures.
+  `continues` with `error`, an ext key without `.`, an ext value that is not a plain object: vendor members MUST be
+  objects, varlink.md:780-786) are `TypeError`s, as are codec failures. Decoding keeps any vendor value as received.
 - **ClientSession**: `call(init)` returns `{id, bytes}` (ids from 1, increasing); oneway calls get an id but never
   enter the reply FIFO. `call()` throws `UpgradePendingError` while an upgrade call is pending and
   `ConnectionClosedError` when closed or upgraded, and never changes state when it throws. `receive()` returns
@@ -732,7 +739,9 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
   buffer cap, json-stream.c:1245-1246, with room for one partial message: without a complete message reading goes on,
   the framer caps the partial one; so at most about 2 × `maxMessageSize` + one chunk buffered, and since the buffer
   doubles, a framer capacity of about 4 × `maxMessageSize` per connection in the worst case while reading, which
-  drops back once the messages are consumed), while paused
+  drops back once the messages are consumed), while at least one complete message is buffered and the buffered,
+  not yet dispatched calls hold `maxQueuedFds` (default 253) received fds or more (M11; fds a call event handed out
+  no longer count; a partial message with fds keeps reading, so one message carrying more is still accepted), while paused
   after an upgrade call, after EOF or a framing error, and when not open. A malformed message, when reached, is
   `{type: "close", error}` (calls before it are answered first, nothing is written for it). An upgrade call pauses
   splitting until it ends: an error reply resumes, and so does any reply after `ignoreUpgrade(id)` (M9, Q4: dispatch
@@ -1192,8 +1201,8 @@ them); the globals are read as `unknown` and checked with `typeof … === "funct
   `fetch` (default `globalThis.fetch`, looked up per request, absent → `OperationNotSupportedError` at call time;
   always called as a plain function, never as a method, which browsers refuse), `headers` (sent with every request;
   checked at construction: token names, values without CR/LF/NUL; the client's `Content-Type`/`Accept` replace any
-  case variant), `service`, `timeout` (45 000, 0 = none), `ints`, `validateReplies`, `codec`, `errors`, `interfaces`,
-  `maxMessageSize` (16 MiB: a whole non-streaming body and each json-seq record), `onError` (as on a Connection).
+  case variant), `service`, `timeout` (45 000, 0 = none), `ints`, `validateReplies` (as on a Connection: for typed calls
+  `"off"` acts as `"warn"`), `codec`, `errors`, `interfaces`, `maxMessageSize` (16 MiB: a whole non-streaming body and each json-seq record), `onError` (as on a Connection).
   Methods mirror Connection (same option names; a per-call `service` overrides the client's): `call`, `stream`,
   `collect` (with the typed descriptor overloads; the descriptor's interface must be registered), `addInterface`
   (the same rules as on a Connection: `bindDescriptor`, compatible IDL for the built-ins, their classes fill gaps),
@@ -1752,6 +1761,12 @@ the client to its `onError` (`fds-dropped`), and the message goes on without fds
 message's fds on its `reply`/`error`/`call` event; an upgrade confirmation's and post-upgrade fds are closed. An
 `acceptFds` call's error reply keeps its fds on the rejected error as `fds` (non-enumerable; the caller owns them);
 other error replies' fds are closed.
+The framer counts the fds it holds for messages not yet returned (`queuedFds`); `ServerSession.wantsInput` is false
+while a complete call is buffered and that count reaches `maxQueuedFds` (server option, default 253 = SCM_MAX_FD), so
+the reader parks until the dispatcher takes calls (their fds then belong to the handler and no longer count). A
+partial message keeps reading, so one message carrying more than the bound is still accepted. This caps the fds a
+connection pins while its handler is busy at about the bound plus one message's (sd-varlink, reading one message at a
+time, holds at most 253), instead of `maxQueuedCalls` × 253.
 Dispatch gives handlers `ctx.fds`, `ctx.takeFd(i, parameter = "fds")`, `ctx.pushFds(...fds)` and `ctx.peer` (§5.4),
 closes unclaimed received fds and unsent pushed duplicates when the call finished, and passes a reply's pushed fds
 to `send(bytes, fds)`. The `UpgradedChannel` is bytes only: it switches fd input off, closes fds that still come,
@@ -2067,7 +2082,13 @@ json-stream.c:1318-1321). Strict mode is opt-in on the listener, like `SD_VARLIN
 `listen(…, {native, fdPassingInputStrict: true, allowFdPassingInput})` (pass the server's `allowFdPassingInput`) sets
 SO_PASSRIGHTS on the listening socket and per connection (§4.15), so on Linux ≥ 6.16 a client sending fds to a server
 without input fails its `sendmsg` with `EPERM` (its call rejects, its connection closes).
-fds the kernel truncated (MSG_CTRUNC) are dropped and reported to `onError` as `fds-dropped`; the call runs. No
+fds the kernel truncated (MSG_CTRUNC) are dropped and reported to `onError` as `fds-dropped`; the call runs.
+Received fds are bounded per connection by `maxQueuedFds` (default 253, SCM_MAX_FD): while the calls buffered but not
+yet dispatched to a handler hold that many fds (with a complete call buffered), the connection stops reading
+(backpressure, as for `maxQueuedCalls`) and resumes once they are dispatched; fds a handler received (`ctx.fds`) no
+longer count. One message carrying more than the bound is still accepted (the kernel caps it at 253). Without the
+bound, 64 pipelined calls × 253 fds could pin about 16 000 fds per connection; sd-varlink reads one message at a time
+and holds at most 253. No
 per-method or per-connection switch (sd's `sd_varlink_set_allow_fd_passing_*` from a connect callback): input must be
 decided before the call's bytes are read, and we have no connect callback.
 
@@ -2103,7 +2124,9 @@ Limits: from sd-varlink, `maxConnections` 4096, `maxConnectionsPerUid` (M11, §4
 flag, sd-varlink.c:47; counted where peer credentials are available; a connection over it is closed and reported as
 `connection-limit`, root included; with it set, unreadable credentials or an invalid UID are refused as
 `connection-refused`) and `maxMessageSize` 16 MiB; our own default, `maxQueuedCalls` 64 per connection
-(beyond that, stop reading: backpressure). No idle timeout on server connections (F1). Optional
+(beyond that, stop reading: backpressure), and `maxQueuedFds` 253 (M11, SCM_MAX_FD: received fds held by a
+connection's buffered, not yet dispatched calls; at that many, with a complete call buffered, stop reading; one
+message carrying more is still accepted; sd-varlink reads one message at a time, so it holds at most 253). No idle timeout on server connections (F1). Optional
 `exitOnIdle: ms` for socket-activated services (M8): the *server* shuts down after that long without any open
 connection (0 = when the last one closed), and `server.closed` resolves after any shutdown (§5.8).
 

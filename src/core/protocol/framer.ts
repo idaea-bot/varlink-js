@@ -61,6 +61,8 @@ export class Framer {
   #returnedTotal = 0;
   /** fds per message (by stream ordinal), received with the chunk that started the message. */
   readonly #fds: { ordinal: number; fds: FdHandle[] }[] = [];
+  /** Total number of fds in {@link #fds}. */
+  #queuedFds = 0;
   /** fds of the message next() returned last, until takeFds() or the next next() (which closes them). */
   #lastFds: FdHandle[] | undefined;
 
@@ -81,6 +83,11 @@ export class Framer {
   /** Number of complete (NUL-terminated) messages currently buffered and not yet returned by next(). */
   get completeMessages(): number {
     return this.#complete;
+  }
+
+  /** Number of fds held for messages next() has not returned yet (complete or not). */
+  get queuedFds(): number {
+    return this.#queuedFds;
   }
 
   /**
@@ -118,6 +125,7 @@ export class Framer {
         return;
       }
       this.#fds.push({ ordinal: this.#completedTotal, fds: [...fds] });
+      this.#queuedFds += fds.length;
     }
     if (bytes.length === 0) return;
     this.#reserve(bytes.length);
@@ -144,6 +152,7 @@ export class Framer {
     const head = this.#fds[0];
     if (head?.ordinal === ordinal) {
       this.#fds.shift();
+      this.#queuedFds -= head.fds.length;
       this.#lastFds = head.fds;
     }
     const nul = this.#buf.subarray(0, this.#end).indexOf(NUL, this.#start);
@@ -190,6 +199,7 @@ export class Framer {
     closeFds(this.#lastFds);
     this.#lastFds = undefined;
     for (const entry of this.#fds.splice(0)) closeFds(entry.fds);
+    this.#queuedFds = 0;
   }
 
   /**

@@ -320,14 +320,17 @@ console.log(`Listening on ${listener.address}`);
 - `call --more` prints the replies as JSON-SEQ (RFC 7464) as they arrive, like varlinkctl; `-E` is
   `--more --timeout=infinity`; `--collect` prints one array; `--oneway` exits once the call is written;
   `--graceful=ERROR` treats that error reply as success.
-- Global options: `--json=pretty|short|off`, `-j`, `-q`, `--timeout=SECS` (a systemd time span, default 45 s,
-  `infinity` for none). Unlike the library's stream timeout, the CLI's timeout covers the connect and the whole call,
-  `--more` included, as in varlinkctl.
-- Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM; `certify server` exits 0 after a
-  signal (it stops gracefully).
+- Global options: `--json=pretty|short|off`, `-j`, `-q`. `--timeout=SECS` (a systemd time span, default 45 s,
+  `infinity` for none) is accepted by the commands that talk to a service: `info`, `list-interfaces`, `list-methods`,
+  `introspect`, `call`, `codegen`, `bridge` and `certify` (not by `validate-idl` or `format`). Unlike the library's
+  stream timeout, the CLI's timeout covers the connect and the whole call, `--more` included, as in varlinkctl.
+- Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM; `call --exec` returns the command's
+  exit status (128 + the signal number if a signal ended it); `certify server` exits 0 after a signal (it stops
+  gracefully).
 - `call --upgrade ADDRESS METHOD [PARAMS]` (as varlinkctl): after the confirming reply, stdin goes to the service and
-  its bytes to stdout until both sides are done; parameters come from the command line only.
-- `call --push-fd=FD|PATH` and `call --exec ADDRESS METHOD [PARAMS] -- CMD…` (as varlinkctl) need the optional
+  its bytes to stdout until both sides are done; parameters come from the command line only. `--upgrade --exec` is
+  not supported.
+- `call --push-fd=FD|PATH` and `call --exec ADDRESS METHOD PARAMS -- CMD…` (as varlinkctl; PARAMS is required) need the optional
   `varlink-js-native` addon (Linux; see `native/README.md`; `VARLINK_JS_NATIVE=<path to native/index.js>` points the
   CLI at a local build). Not available yet: `serve` and `list-registry`.
 - Integers are lossless in the CLI (it uses `ints: "bigint"` internally): 2⁶³−1 and 2⁶⁴−1 round-trip.
@@ -358,6 +361,7 @@ subpaths above.
 |---|---|---|---|
 | Largest message (client, server, HTTP client) | 16 MiB | `maxMessageSize` | `test/docs/defaults.test.ts`, `test/unit/protocol/framer.test.ts` |
 | Complete calls buffered per server connection (then reading stops) | 64 | `maxQueuedCalls` (server) | `test/docs/defaults.test.ts`, `test/unit/protocol/server-session.test.ts` |
+| Received fds held by buffered, not yet dispatched calls per server connection (then reading stops; one message carrying more is still accepted) | 253 (`SCM_MAX_FD`) | `maxQueuedFds` (server, with `allowFdPassingInput`) | `test/unit/protocol/server-session.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
 | Open server connections (more are closed at once) | 4096 | `maxConnections` (server) | `test/docs/defaults.test.ts` |
 | Connections per UID | off (opt-in, as sd-varlink's `SD_VARLINK_SERVER_ACCOUNT_UID`; needs the native addon) | `maxConnectionsPerUid` (server) | `test/unit/rpc/server-peer.test.ts` |
 | Call timeout (clock starts at the head of the reply queue) | 45 s, 0 = none | `timeout` (connection, or per call) | `test/docs/defaults.test.ts`, `test/unit/rpc/connection.test.ts` |

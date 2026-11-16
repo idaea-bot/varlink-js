@@ -2,10 +2,21 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { MessageTooLargeError, ProtocolError } from "../../../src/core/errors/index.ts";
-import { DEFAULT_MAX_QUEUED_CALLS, ServerSession, type ServerEvent } from "../../../src/core/protocol/index.ts";
+import {
+  DEFAULT_MAX_QUEUED_CALLS,
+  DEFAULT_MAX_QUEUED_FDS,
+  ServerSession,
+  type FdHandle,
+  type ServerEvent,
+} from "../../../src/core/protocol/index.ts";
 import { concat, frame, messages, msg, utf8 } from "./helpers.ts";
 
 const M = "org.example.test.Method";
+
+/** n fake received fds (only the session's bookkeeping is under test). */
+function fakeFds(n: number): FdHandle[] {
+  return Array.from({ length: n }, (_, i) => ({ fd: 100 + i, close: () => undefined }));
+}
 
 function callOf(ev: ServerEvent | null): { id: number; method: string; parameters: Record<string, unknown> } {
   assert.ok(ev?.type === "call", `expected a call, got ${JSON.stringify(ev)}`);
@@ -232,6 +243,41 @@ describe("ServerSession backpressure", () => {
 
   test("maxQueuedCalls must be a positive integer", () => {
     for (const bad of [0, -1, 1.5]) assert.throws(() => new ServerSession({ maxQueuedCalls: bad }), RangeError);
+  });
+
+  test("maxQueuedFds: wantsInput is false while buffered calls hold that many fds; dispatched fds stop counting", () => {
+    const s = new ServerSession({ maxQueuedFds: 3 });
+    s.receive(msg({ method: M }), fakeFds(2));
+    assert.equal(s.wantsInput, true); // 2 < 3
+    s.receive(msg({ method: M }), fakeFds(1));
+    assert.equal(s.wantsInput, false); // 3 fds held by calls not yet dispatched
+    const ev = s.nextEvent();
+    assert.ok(ev?.type === "call");
+    assert.equal(ev.fds?.length, 2);
+    assert.equal(s.wantsInput, true); // the handler's 2 fds no longer count: 1 < 3
+    reply(s, ev.id);
+    s.receive(msg({ method: M }), fakeFds(2));
+    assert.equal(s.wantsInput, false); // 1 + 2
+    callOf(s.nextEvent());
+    assert.equal(s.wantsInput, true);
+    assert.equal(DEFAULT_MAX_QUEUED_FDS, 253);
+  });
+
+  test("maxQueuedFds: one message carrying more is accepted; a partial message with fds keeps reading", () => {
+    const s = new ServerSession({ maxQueuedFds: 2 });
+    assert.equal(s.wantsInput, true);
+    s.receive(utf8(`{"method":"${M}"`), fakeFds(5));
+    assert.equal(s.wantsInput, true); // no complete call yet: it needs more bytes
+    s.receive(utf8("}\0"));
+    assert.equal(s.wantsInput, false);
+    const ev = s.nextEvent();
+    assert.ok(ev?.type === "call");
+    assert.equal(ev.fds?.length, 5);
+    assert.equal(s.wantsInput, true);
+  });
+
+  test("maxQueuedFds must be a positive integer", () => {
+    for (const bad of [0, -1, 1.5]) assert.throws(() => new ServerSession({ maxQueuedFds: bad }), RangeError);
   });
 
   test("wantsInput is false after EOF and when closed", () => {

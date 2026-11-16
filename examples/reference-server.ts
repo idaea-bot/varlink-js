@@ -18,6 +18,7 @@
 // (exit 0). Usage errors exit with 2, other failures with 1.
 import { parseArgs } from "node:util";
 import { createServer, parseAddress, streamOf, VarlinkError, type AddressSpec } from "../src/index.ts";
+import { safeQuote } from "../src/core/errors/local.ts";
 import { listen } from "../src/node/index.ts";
 
 const DEFAULT_ADDRESS = "unix:./org.example.reference.sock";
@@ -90,7 +91,8 @@ const server = createServer({
   version: "1",
   url: "https://github.com/pzmarzly/varlink-js",
   onError: (error, info) => {
-    const where = info.method === undefined ? "" : ` in ${info.method}`;
+    // The method name is peer-controlled: quote it log-safe (control and bidi characters escaped).
+    const where = info.method === undefined ? "" : ` in ${safeQuote(info.method)}`;
     console.error(`reference-server: ${info.reason}${where}: ${error instanceof Error ? error.message : "error"}`);
   },
 });

@@ -28,7 +28,7 @@ export interface CallInit {
   oneway?: boolean;
   more?: boolean;
   upgrade?: boolean;
-  /** Vendor extension keys; each must contain `.`. Written after the headers. */
+  /** Vendor extension keys; each must contain `.` and its value be a plain object. Written after the headers. */
   ext?: Record<string, unknown>;
 }
 
@@ -162,6 +162,8 @@ function appendExt(out: Record<string, unknown>, ext: unknown, headers: Readonly
   for (const key of Object.keys(ext)) {
     if (!key.includes(".") || headers.has(key))
       throw new TypeError(`ext key ${quoteKey(key)} must contain "." (vendor extension)`);
+    // Vendor members MUST be objects (varlink.md:780-786).
+    if (!isPlainObject(ext[key])) throw new TypeError(`ext value ${quoteKey(key)} must be a plain object`);
     defineData(out, key, ext[key]);
   }
 }
@@ -170,7 +172,8 @@ function appendExt(out: Record<string, unknown>, ext: unknown, headers: Readonly
  * Encodes a call: `method, parameters, oneway|more|upgrade, ext…`. `parameters` is always written; false flags
  * are omitted (F17).
  *
- * @throws {TypeError} on caller bugs (bad types, several flags, bad ext keys) and from the codec.
+ * @throws {TypeError} on caller bugs (bad types, several flags, bad ext keys or non-object ext values) and from the
+ *   codec.
  */
 export function encodeCall(call: CallInit, codec: Codec): string {
   if (typeof call.method !== "string") throw new TypeError("method must be a string");
@@ -191,7 +194,8 @@ export function encodeCall(call: CallInit, codec: Codec): string {
  * Encodes a reply: `error?, parameters, continues?, ext…`. `parameters` is always written; `continues: false`
  * and an absent `error` are omitted (F17).
  *
- * @throws {TypeError} on caller bugs (bad types, `continues` with `error`, bad ext keys) and from the codec.
+ * @throws {TypeError} on caller bugs (bad types, `continues` with `error`, bad ext keys or non-object ext values) and
+ *   from the codec.
  */
 export function encodeReply(reply: ReplyInit, codec: Codec): string {
   const continues = checkFlag(reply.continues, "continues");

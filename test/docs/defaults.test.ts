@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { setImmediate as turn } from "node:timers/promises";
 import { describe, mock, test } from "node:test";
-import { DEFAULT_MAX_QUEUED_CALLS } from "../../src/core/protocol/server-session.ts";
+import { DEFAULT_MAX_QUEUED_CALLS, DEFAULT_MAX_QUEUED_FDS } from "../../src/core/protocol/server-session.ts";
 import { createHttpClient } from "../../src/http/index.ts";
 import {
   CallTimeoutError,
@@ -116,6 +116,7 @@ describe("exported default constants", () => {
   test("values", () => {
     assert.equal(DEFAULT_MAX_MESSAGE_SIZE, 16 * MiB);
     assert.equal(DEFAULT_MAX_QUEUED_CALLS, 64);
+    assert.equal(DEFAULT_MAX_QUEUED_FDS, 253);
     assert.equal(DEFAULT_TIMEOUT, 45_000);
     assert.equal(DEFAULT_HIGH_WATER_MARK, 64);
     assert.equal(DEFAULT_COLLECT_MAX, 1024);

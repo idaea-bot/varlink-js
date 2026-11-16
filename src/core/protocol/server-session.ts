@@ -10,6 +10,9 @@ import { decodeCall, encodeReply, type Call } from "./messages.ts";
 /** Default `maxQueuedCalls`: complete messages buffered before the driver stops reading. */
 export const DEFAULT_MAX_QUEUED_CALLS: number = 64;
 
+/** Default `maxQueuedFds`: SCM_MAX_FD, the most fds one message can carry (what sd-varlink holds at a time). */
+export const DEFAULT_MAX_QUEUED_FDS: number = 253;
+
 /** Options for {@link ServerSession}. */
 export interface ServerSessionOptions {
   /** Default {@link jsonCodec}. */
@@ -18,6 +21,11 @@ export interface ServerSessionOptions {
   maxMessageSize?: number;
   /** Complete messages buffered before {@link ServerSession.wantsInput} turns false. Default 64. */
   maxQueuedCalls?: number;
+  /**
+   * M11: received fds held by buffered, not yet dispatched calls before {@link ServerSession.wantsInput} turns false
+   * (with a complete call buffered). Default 253. One message carrying more is still accepted.
+   */
+  maxQueuedFds?: number;
 }
 
 /** What {@link ServerSession.nextEvent} returns. */
@@ -56,6 +64,7 @@ export class ServerSession {
   readonly #codec: Codec;
   readonly #framer: Framer;
   readonly #maxQueued: number;
+  readonly #maxQueuedFds: number;
   readonly #maxMessageSize: number;
   #state: "open" | "upgraded" | "closed" = "open";
   readonly #closedController = new AbortController();
@@ -77,6 +86,10 @@ export class ServerSession {
     const max = options?.maxQueuedCalls ?? DEFAULT_MAX_QUEUED_CALLS;
     if (!Number.isSafeInteger(max) || max <= 0) throw new RangeError("maxQueuedCalls must be a positive safe integer");
     this.#maxQueued = max;
+    const maxFds = options?.maxQueuedFds ?? DEFAULT_MAX_QUEUED_FDS;
+    if (!Number.isSafeInteger(maxFds) || maxFds <= 0)
+      throw new RangeError("maxQueuedFds must be a positive safe integer");
+    this.#maxQueuedFds = maxFds;
   }
 
   /** `upgraded` after the final non-error reply to an upgrade call: the rest of the stream is not varlink. */
@@ -92,6 +105,9 @@ export class ServerSession {
    * keeps reading (the partial message needs it; the framer caps it at maxMessageSize). So a connection buffers at
    * most about 2 × maxMessageSize + one read chunk; as the framer's buffer doubles, its capacity is about
    * 4 × maxMessageSize in the worst case while reading, and drops back once the messages are consumed.
+   * Likewise for fds (M11): false while at least one complete message is buffered and the buffered, not yet
+   * dispatched calls hold maxQueuedFds received fds or more (fds a call event handed out no longer count). So a
+   * connection holds at most maxQueuedFds - 1 + one read's fds (the kernel caps one message at 253, SCM_MAX_FD).
    */
   get wantsInput(): boolean {
     const complete = this.#framer.completeMessages;
@@ -101,7 +117,7 @@ export class ServerSession {
       !this.#paused &&
       this.#framer.accepting &&
       complete < this.#maxQueued &&
-      (complete === 0 || this.#framer.buffered < this.#maxMessageSize)
+      (complete === 0 || (this.#framer.buffered < this.#maxMessageSize && this.#framer.queuedFds < this.#maxQueuedFds))
     );
   }
 

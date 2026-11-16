@@ -14,7 +14,7 @@ import {
 } from "../core/protocol/dispatch.ts";
 import { checkMaxMessageSize, closeFds } from "../core/protocol/framer.ts";
 import { isPlainObject } from "../core/protocol/messages.ts";
-import { DEFAULT_MAX_QUEUED_CALLS, ServerSession } from "../core/protocol/server-session.ts";
+import { DEFAULT_MAX_QUEUED_CALLS, DEFAULT_MAX_QUEUED_FDS, ServerSession } from "../core/protocol/server-session.ts";
 import { jsonCodec, type Codec } from "../core/types/codec.ts";
 import { compileInterfaceText, type CompiledInterface, type IntsMode } from "../core/types/compile.ts";
 import {
@@ -70,6 +70,12 @@ export interface ServerOptions {
   maxMessageSize?: number;
   /** Complete calls buffered per connection before reading stops; default 64. */
   maxQueuedCalls?: number;
+  /**
+   * M11: received fds held by a connection's buffered, not yet dispatched calls before reading stops (with
+   * `allowFdPassingInput`); default 253 (SCM_MAX_FD, what sd-varlink holds for one message). A single message
+   * carrying more is still accepted; fds already handed to a handler (`ctx.fds`) do not count.
+   */
+  maxQueuedFds?: number;
   /** Open connections; more are closed at once (`connection-limit`); default 4096. */
   maxConnections?: number;
   /**
@@ -83,7 +89,7 @@ export interface ServerOptions {
   maxConnectionsPerUid?: number;
   /**
    * M11: accept fds sent with calls (`ctx.fds`), on connections that can pass fds (SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT).
-   * Default false: fds that arrive anyway are closed and the connection is closed as a protocol error.
+   * Default false: fds that arrive anyway are closed unseen and the call goes ahead without them (as in sd-varlink).
    */
   allowFdPassingInput?: boolean;
   /** M11: let handlers send fds with replies (`ctx.pushFds`; SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT). Default false. */
@@ -564,6 +570,7 @@ export class Server {
   readonly #codec: Codec;
   readonly #maxMessageSize: number;
   readonly #maxQueuedCalls: number;
+  readonly #maxQueuedFds: number;
   readonly #maxConnections: number;
   /** Undefined: no per-UID accounting (M11: opt-in, like SD_VARLINK_SERVER_ACCOUNT_UID). */
   readonly #maxConnectionsPerUid: number | undefined;
@@ -603,6 +610,7 @@ export class Server {
     this.#codec = options?.codec ?? jsonCodec;
     this.#maxMessageSize = checkMaxMessageSize(options?.maxMessageSize);
     this.#maxQueuedCalls = checkPositiveInt(options?.maxQueuedCalls, "maxQueuedCalls", DEFAULT_MAX_QUEUED_CALLS);
+    this.#maxQueuedFds = checkPositiveInt(options?.maxQueuedFds, "maxQueuedFds", DEFAULT_MAX_QUEUED_FDS);
     this.#maxConnections = checkPositiveInt(options?.maxConnections, "maxConnections", DEFAULT_MAX_CONNECTIONS);
     this.#maxConnectionsPerUid =
       options?.maxConnectionsPerUid === undefined
@@ -774,6 +782,7 @@ export class Server {
         codec: this.#codec,
         maxMessageSize: this.#maxMessageSize,
         maxQueuedCalls: this.#maxQueuedCalls,
+        maxQueuedFds: this.#maxQueuedFds,
       });
     } catch (e) {
       // Options were checked at construction; keep the "never rejects" promise anyway.

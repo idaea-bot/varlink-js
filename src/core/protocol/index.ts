@@ -37,6 +37,7 @@ export {
 } from "./messages.ts";
 export {
   DEFAULT_MAX_QUEUED_CALLS,
+  DEFAULT_MAX_QUEUED_FDS,
   ServerSession,
   type ServerEvent,
   type ServerSessionOptions,

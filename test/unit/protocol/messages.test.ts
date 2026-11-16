@@ -186,8 +186,8 @@ describe("encodeCall", () => {
     [{ method: M, more: true }, `{"method":"${M}","parameters":{},"more":true}`],
     [{ method: M, upgrade: true, more: false }, `{"method":"${M}","parameters":{},"upgrade":true}`],
     [
-      { ext: { "com.example.t": 1 }, more: true, parameters: { x: null }, method: M },
-      `{"method":"${M}","parameters":{"x":null},"more":true,"com.example.t":1}`,
+      { ext: { "com.example.t": { id: 1 } }, more: true, parameters: { x: null }, method: M },
+      `{"method":"${M}","parameters":{"x":null},"more":true,"com.example.t":{"id":1}}`,
     ],
   ];
   for (const [init, text] of cases) {
@@ -213,6 +213,25 @@ describe("encodeCall", () => {
     ];
     for (const init of bad) assert.throws(() => encodeCall(init as CallInit, jsonCodec), TypeError);
   });
+
+  test("ext values must be plain objects (varlink.md: vendor members are objects); the key is safely quoted", () => {
+    for (const value of [5, "x", true, null, [], [1], new Date()]) {
+      for (const encode of [
+        () => encodeCall({ method: M, ext: { "org.example": value } }, jsonCodec),
+        () => encodeReply({ ext: { "org.example": value } }, jsonCodec),
+      ])
+        assert.throws(encode, (e: unknown) => e instanceof TypeError && e.message.includes('"org.example"'));
+    }
+    assert.throws(
+      () => encodeCall({ method: M, ext: { [`a.${String.fromCharCode(0x1b)}`]: 1 } }, jsonCodec),
+      (e: unknown) => e instanceof TypeError && e.message.includes('"a.\\u001b"'),
+    );
+    const bare = Object.assign(Object.create(null) as object, { k: 1 });
+    assert.equal(
+      encodeCall({ method: M, ext: { "org.example": bare } }, jsonCodec),
+      `{"method":"${M}","parameters":{},"org.example":{"k":1}}`,
+    );
+  });
 });
 
 describe("encodeReply", () => {
@@ -223,7 +242,7 @@ describe("encodeReply", () => {
     [{ continues: true, parameters: { i: 1 } }, `{"parameters":{"i":1},"continues":true}`],
     [{ parameters: { p: 1 }, error: "a.b.C" }, `{"error":"a.b.C","parameters":{"p":1}}`],
     [{ error: "a.b.C", continues: false }, `{"error":"a.b.C","parameters":{}}`],
-    [{ ext: { "x.y": true }, continues: true }, `{"parameters":{},"continues":true,"x.y":true}`],
+    [{ ext: { "x.y": { on: true } }, continues: true }, `{"parameters":{},"continues":true,"x.y":{"on":true}}`],
   ];
   for (const [init, text] of cases) {
     test(text, () => {
@@ -246,12 +265,12 @@ describe("encodeReply", () => {
   });
 
   test("round trip through decode", () => {
-    const text = encodeReply({ error: "a.b.C", parameters: { x: [1, "2"] }, ext: { "v.k": 1 } }, jsonCodec);
+    const text = encodeReply({ error: "a.b.C", parameters: { x: [1, "2"] }, ext: { "v.k": { n: 1 } } }, jsonCodec);
     assert.deepEqual(decodeReply(jsonCodec.decode(text)), {
       error: "a.b.C",
       parameters: { x: [1, "2"] },
       continues: false,
-      ext: { "v.k": 1 },
+      ext: { "v.k": { n: 1 } },
     });
   });
 });

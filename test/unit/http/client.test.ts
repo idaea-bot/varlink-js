@@ -14,6 +14,7 @@ import {
   type InterfaceDescriptor,
   InterfaceNotFoundError,
   InvalidParameterError,
+  type MethodDescriptor,
   isVarlinkLocalError,
   jsonCodec,
   MessageTooLargeError,
@@ -23,9 +24,12 @@ import {
   ValidationError,
   VarlinkError,
 } from "../../../src/index.ts";
+import type { ByteChannel } from "../../../src/core/protocol/index.ts";
 import { OrgVarlinkService } from "../../../src/interfaces/index.ts";
 import { fromNodeSocket, listen } from "../../../src/node/index.ts";
 import { openSocket } from "../../../src/node/connect.ts";
+import { createConnection, createServer } from "../../../src/rpc/index.ts";
+import { pair } from "../../../src/testing/index.ts";
 import { startBridge, type Bridge, type RequestLog } from "../websocket/bridge.ts";
 import {
   createService,
@@ -815,5 +819,85 @@ describe("createHttpClient(): address errors never quote credentials", () => {
       (e: unknown) =>
         e instanceof TypeError && /varlink-js\/websocket/.test(e.message) && !e.message.includes("s3cret"),
     );
+  });
+});
+
+describe("typed calls decode their replies on every client (validateReplies off acts as warn)", () => {
+  const TYPED = "org.example.typed";
+  const TYPED_IDL = `interface org.example.typed
+
+method Small() -> (n: int)
+
+method Big() -> (n: int)
+
+method Extra() -> (text: string)
+`;
+  const descriptor = (ints: "number" | "bigint"): InterfaceDescriptor => ({
+    name: TYPED,
+    idl: TYPED_IDL,
+    ints,
+    methods: Object.fromEntries(
+      ["Small", "Big", "Extra"].map((name) => [name, { interface: TYPED, name, method: `${TYPED}.${name}` }]),
+    ),
+    errors: {},
+  });
+  let server: ReturnType<typeof createServer>;
+  let typedBridge: Bridge;
+  const open = (): Promise<ByteChannel> => {
+    const [client, end] = pair();
+    void server.handle(end);
+    return Promise.resolve(client);
+  };
+
+  before(async () => {
+    // The server sends the invalid Extra reply anyway (its validateReplies is "warn").
+    server = createServer({ onError: () => undefined });
+    server.addInterface(TYPED_IDL, {
+      Small: () => ({ n: 5 }),
+      Big: () => ({ n: 2n ** 60n + 1n }),
+      Extra: () => ({ text: "t", extra: true }),
+    });
+    typedBridge = await startBridge({ backend: open, services: [TYPED] });
+  });
+
+  after(async () => {
+    await typedBridge.close();
+    await server.shutdown({ graceful: false });
+  });
+
+  /** The same typed call through a Connection (over pair()) and an HttpClient (through the bridge). */
+  async function both(ints: "number" | "bigint", member: string): Promise<PromiseSettledResult<unknown>[]> {
+    const desc = descriptor(ints);
+    const method = desc.methods[member] as MethodDescriptor<object, object>;
+    const conn = createConnection(await open(), { ints, interfaces: [desc] });
+    try {
+      return await Promise.allSettled([
+        conn.call(method, {}),
+        createHttpClient(typedBridge.base, { ints, interfaces: [desc] }).call(method, {}),
+      ]);
+    } finally {
+      await conn.close();
+    }
+  }
+
+  test('ints: "bigint": a small int comes back as a bigint', async () => {
+    for (const r of await both("bigint", "Small")) {
+      assert.equal(r.status, "fulfilled");
+      assert.deepEqual(r.value, { n: 5n });
+    }
+  });
+
+  test('ints: "number": an unsafe int is rejected', async () => {
+    for (const r of await both("number", "Big")) {
+      assert.equal(r.status, "rejected");
+      assert.ok(r.reason instanceof IntegerRangeError, String(r.reason));
+    }
+  });
+
+  test("an unknown reply field is dropped", async () => {
+    for (const r of await both("number", "Extra")) {
+      assert.equal(r.status, "fulfilled");
+      assert.deepEqual(r.value, { text: "t" });
+    }
   });
 });

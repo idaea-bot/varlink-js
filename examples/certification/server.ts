@@ -23,7 +23,6 @@ try {
   const { server } = await createCertificationServer();
   const listener = await listen(address);
   server.serve(listener);
-  console.log(`Listening on ${listener.address}`);
   const stop = (): void => {
     server.shutdown().then(
       () => process.exit(0),
@@ -35,6 +34,8 @@ try {
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+  // Only now: a test may send SIGINT as soon as it sees this line.
+  console.log(`Listening on ${listener.address}`);
 } catch (e) {
   console.error(`certification server: ${describeError(e)}`);
   process.exit(1);

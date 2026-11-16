@@ -751,10 +751,16 @@ static napi_value fd_array_value(napi_env env, const int *fds, size_t n) {
 /** Collects the SCM_RIGHTS fds of a received message (all of them closed if they do not fit). Returns the count. */
 static size_t collect_fds(struct msghdr *mh, int *fds, size_t cap) {
   size_t n = 0;
+  const uint8_t *end = (const uint8_t *)mh->msg_control + mh->msg_controllen;
   for (struct cmsghdr *c = CMSG_FIRSTHDR(mh); c != NULL; c = CMSG_NXTHDR(mh, c)) {
+    // A header shorter than CMSG_LEN(0) is malformed: ignore it, and stop (CMSG_NXTHDR could not step past it).
+    if (c->cmsg_len < CMSG_LEN(0)) break;
     if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
-    size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
     const uint8_t *data = CMSG_DATA(c);
+    size_t k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+    // Never read past the control buffer, whatever cmsg_len says (e.g. not shrunk on truncation).
+    size_t room = data < end ? (size_t)(end - data) / sizeof(int) : 0;
+    if (k > room) k = room;
     for (size_t i = 0; i < k; i++) {
       int fd;
       memcpy(&fd, data + i * sizeof(int), sizeof fd);

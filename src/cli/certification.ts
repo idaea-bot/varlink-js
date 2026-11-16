@@ -13,6 +13,7 @@ import {
   type ServerOptions,
   type UntypedHandlers,
 } from "../index.ts";
+import { safeQuote } from "../core/errors/local.ts";
 import { CERTIFICATION_IDL } from "./certification-idl.ts";
 import { VERSION } from "./version.ts";
 
@@ -306,7 +307,7 @@ export async function createCertificationServer(
     onError:
       onError ??
       ((error, info) => {
-        const where = info.method === undefined ? "" : ` in ${info.method}`;
+        const where = info.method === undefined ? "" : ` in ${safeQuote(info.method)}`;
         console.error(`certification server: ${info.reason}${where}: ${describeError(error)}`);
       }),
   });

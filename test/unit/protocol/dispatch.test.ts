@@ -317,14 +317,14 @@ describe("dispatch table (§5.4 rows, check order)", () => {
           return { pong: p.ping };
         },
       },
-      { method: `${I}.Ping`, parameters: { ping: "hi" }, more: true, ext: { "com.example.trace": "t" } },
+      { method: `${I}.Ping`, parameters: { ping: "hi" }, more: true, ext: { "com.example.trace": { id: "t" } } },
     );
     assert.deepEqual(params, { ping: "hi" });
     assert.equal(ctx?.method, `${I}.Ping`);
     assert.equal(ctx.more, true);
     assert.equal(ctx.oneway, false);
     assert.equal(ctx.upgradeRequested, false);
-    assert.deepEqual(ctx.ext, { "com.example.trace": "t" });
+    assert.deepEqual(ctx.ext, { "com.example.trace": { id: "t" } });
     assert.equal(ctx.signal.aborted, false);
     // Plain handler called with more: a single reply without continues (F6).
     assert.deepEqual(r.replies, [{ parameters: { pong: "hi" } }]);

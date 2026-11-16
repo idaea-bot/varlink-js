@@ -503,6 +503,7 @@ describe("Server: connection errors and limits", () => {
   test("options are checked", () => {
     assert.throws(() => createServer({ maxConnections: 0 }), RangeError);
     assert.throws(() => createServer({ maxQueuedCalls: 1.5 }), RangeError);
+    assert.throws(() => createServer({ maxQueuedFds: 0 }), RangeError);
     assert.throws(() => createServer({ vendor: 1 as never }), TypeError);
     assert.throws(() => createServer({ validateReplies: "loud" as never }), TypeError);
   });

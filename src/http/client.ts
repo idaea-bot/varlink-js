@@ -78,7 +78,7 @@ export interface HttpClientOptions {
   timeout?: number;
   /** `int` representation for registered interfaces (§4.3); default `"number"`. */
   ints?: IntsMode;
-  /** Reply validation for registered interfaces, as on a Connection; default `"off"`. */
+  /** Reply validation for registered interfaces, as on a Connection; default `"off"` (typed calls: acts as `"warn"`). */
   validateReplies?: ValidateReplies;
   /** Default {@link jsonCodec}. */
   codec?: Codec;
@@ -669,6 +669,7 @@ export class HttpClient {
     more: boolean,
   ): Prepared {
     let name: string;
+    let mode = this.#mode;
     if (typeof method === "string") {
       name = method;
     } else {
@@ -677,11 +678,13 @@ export class HttpClient {
       if (!this.#interfaces.has(method.interface))
         throw new TypeError(`interface ${safeQuote(method.interface)} is not registered on this client`);
       name = method.method;
+      // Typed calls always decode their replies (their result type holds in every mode): "off" acts as "warn".
+      if (mode === "off") mode = "warn";
     }
     if (parseMethodName(name) === null)
       throw new TypeError(`method must be a fully qualified interface.Method name, not ${safeQuote(name)}`);
     const service = options?.service === undefined ? this.#service : checkService(options.service);
-    const spec = this.#specFor(name);
+    const spec = this.#specFor(name, mode);
     const raw: unknown = parameters ?? {};
     const encoded: unknown = spec?.input === undefined ? raw : spec.input.encode(raw);
     if (!isObject(encoded)) throw new TypeError("parameters must be an object");
@@ -693,11 +696,11 @@ export class HttpClient {
     return { method: name, url, body, spec };
   }
 
-  #specFor(method: string): CallSpec | undefined {
+  #specFor(method: string, mode: ValidateReplies): CallSpec | undefined {
     const parts = splitName(method);
     if (parts === null) return undefined;
     const m = this.#interfaces.get(parts.interface)?.compiled.methods.get(parts.member);
-    return m === undefined ? undefined : { input: m.input, output: m.output, mode: this.#mode };
+    return m === undefined ? undefined : { input: m.input, output: m.output, mode };
   }
 
   #requireName(value: unknown, what: string): string {
