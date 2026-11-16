@@ -1,0 +1,29 @@
+{
+  "name": "varlink-js-native",
+  "version": "1.0.0-alpha.0",
+  "private": true,
+  "description": "Optional Node-API addon for varlink-js: fd passing (SCM_RIGHTS), peer credentials, user.varlink xattr (Linux)",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "src",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "test": "node --test \"test/**/*.test.ts\""
+  }
+}

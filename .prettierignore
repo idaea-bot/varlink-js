@@ -1,0 +1,7 @@
+dist/
+build/
+pkg/
+coverage/
+package-lock.json
+# Prose is formatted by hand (tables, wrapped lines).
+*.md

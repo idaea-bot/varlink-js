@@ -1,0 +1,496 @@
+// `varlink-js call` in-process (DESIGN.md §4.14): every mode and option against the test service over unix and tcp,
+// error replies, local failures, timeouts, int precision, stdin parameters, signals, EPIPE and escaping.
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { after, before, describe, test } from "node:test";
+import { childCommand } from "../node/helpers.ts";
+import { ESC, RS, rawServer, runCli, startFixture, tempDir, waitFor, type Fixture } from "./helpers.ts";
+
+const EXEC_CHILD = resolve(import.meta.dirname, "exec-child.ts");
+
+let fx: Fixture;
+before(async () => {
+  fx = await startFixture();
+});
+after(async () => {
+  await fx.close();
+});
+
+const BIG = '{"max":9223372036854775807,"min":-9223372036854775808,"u":18446744073709551615}';
+
+for (const transport of ["unix", "tcp"] as const) {
+  describe(`call over ${transport}`, () => {
+    const addr = (): string => (transport === "unix" ? fx.unix : fx.tcp);
+
+    test("one reply, short JSON when stdout is not a TTY", async () => {
+      const r = await runCli(["call", addr(), "org.example.cli.Echo", '{"value":{"a":[1,2.5,"x"]}}']);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, '{"value":{"a":[1,2.5,"x"]}}\n');
+      assert.equal(r.stderr, "");
+    });
+
+    test("pretty JSON (sd-json format) on a TTY (stdout and stderr, as on_tty())", async () => {
+      const args = ["call", addr(), "org.example.cli.Echo", '{"value":{"a":[1,{}],"b":[]}}'];
+      const r = await runCli(args, { stdoutTTY: true, stderrTTY: true });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, '{\n\t"value" : {\n\t\t"a" : [\n\t\t\t1,\n\t\t\t{}\n\t\t],\n\t\t"b" : []\n\t}\n}\n');
+      // `call … 2>log` on a terminal: short, like varlinkctl.
+      const redirected = await runCli(args, { stdoutTTY: true, stderrTTY: false });
+      assert.equal(redirected.stdout, '{"value":{"a":[1,{}],"b":[]}}\n');
+    });
+
+    test("--more: JSON-SEQ, one record per reply, each written on its own", async () => {
+      const r = await runCli(["call", "--more", addr(), "org.example.cli.Count", '{"n":3}']);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, `${RS}{"i":0}\n${RS}{"i":1}\n${RS}{"i":2}\n`);
+      assert.equal(r.io.stdoutChunks.length, 3);
+    });
+
+    test("--collect: one JSON array, not SEQ", async () => {
+      const r = await runCli(["call", addr(), "org.example.cli.Count", '{"n":3}', "--collect"]);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, '[{"i":0},{"i":1},{"i":2}]\n');
+    });
+
+    test("--oneway: written, nothing printed, exit 0", async () => {
+      const text = `oneway-${transport}`;
+      const r = await runCli(["call", "--oneway", addr(), "org.example.cli.Log", JSON.stringify({ text })]);
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout, "");
+      await waitFor(() => fx.logged.includes(text));
+    });
+
+    test("int precision: 64-bit extremes round-trip exactly through call, --more and --collect", async () => {
+      const single = await runCli(["call", addr(), "org.example.cli.Echo", `{"value":${BIG}}`]);
+      assert.equal(single.code, 0, single.stderr);
+      assert.equal(single.stdout, `{"value":${BIG}}\n`);
+      const more = await runCli(["call", "--more", addr(), "org.example.cli.Count", `{"n":2,"value":${BIG}}`]);
+      assert.equal(more.code, 0, more.stderr);
+      assert.equal(more.stdout, `${RS}{"i":0,"value":${BIG}}\n${RS}{"i":1,"value":${BIG}}\n`);
+      const collect = await runCli(["call", "--collect", addr(), "org.example.cli.Count", `{"n":2,"value":${BIG}}`]);
+      assert.equal(collect.code, 0, collect.stderr);
+      assert.equal(collect.stdout, `[{"i":0,"value":${BIG}},{"i":1,"value":${BIG}}]\n`);
+      const pretty = await runCli(["call", addr(), "org.example.cli.Echo", `{"value":${BIG}}`, "--json=pretty"]);
+      assert.match(pretty.stdout, /"u" : 18446744073709551615\n/);
+      assert.match(pretty.stdout, /"min" : -9223372036854775808,\n/);
+    });
+  });
+}
+
+describe("call: parameters", () => {
+  test("from stdin when PARAMETERS is absent or '-'", async () => {
+    const a = await runCli(["call", fx.unix, "org.example.cli.Echo"], { stdin: `{"value":${BIG}}` });
+    assert.equal(a.code, 0, a.stderr);
+    assert.equal(a.stdout, `{"value":${BIG}}\n`);
+    const b = await runCli(["call", fx.unix, "org.example.cli.Echo", "-"], { stdin: ' {"value": "x"} \n' });
+    assert.equal(b.stdout, '{"value":"x"}\n');
+  });
+
+  test("empty or whitespace-only stdin (or argument) means {}", async () => {
+    const a = await runCli(["call", fx.unix, "org.example.cli.Count"], { stdin: " \n\t" });
+    // Count without n: InvalidParameter, which proves {} was sent.
+    assert.equal(a.code, 1);
+    assert.match(a.stderr, /org\.varlink\.service\.InvalidParameter/);
+    assert.equal(a.stdout, '{"parameter":"n"}\n');
+    const b = await runCli(["call", fx.unix, "org.example.cli.Preview", ""]);
+    assert.equal(b.code, 0, b.stderr);
+    assert.equal(b.stdout, "{}\n");
+  });
+
+  test("the stdin notice on a TTY, not with -q", async () => {
+    const a = await runCli(["call", fx.unix, "org.example.cli.Preview"], { stdin: "{}", stdinTTY: true });
+    assert.equal(a.code, 0);
+    assert.equal(
+      a.stderr,
+      "Expecting method call parameter JSON object on standard input. (Provide empty string or {} for no parameters.)\n",
+    );
+    const b = await runCli(["call", "-q", fx.unix, "org.example.cli.Preview"], { stdin: "{}", stdinTTY: true });
+    assert.equal(b.stderr, "");
+    assert.equal(b.stdout, "");
+  });
+
+  test("not an object, or not JSON: exit 1 before connecting", async () => {
+    for (const p of ["[1]", "null", "1", '"x"', "{", "{} {}"]) {
+      const r = await runCli(["call", "unix:/nonexistent/x", "org.example.cli.Echo", p]);
+      assert.equal(r.code, 1, p);
+      assert.match(r.stderr, /^Failed to parse parameters at <argv>: /, p);
+      assert.equal(r.stdout, "");
+    }
+    const s = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], { stdin: "[]" });
+    assert.match(s.stderr, /^Failed to parse parameters at <stdin>: not a JSON object\n$/);
+    const u = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], { stdin: new Uint8Array([0x7b, 0xff, 0x7d]) });
+    assert.match(u.stderr, /not valid UTF-8/);
+  });
+
+  test("stdin parameters above 16 MiB: `too large`, exit 1, reading stops", async () => {
+    let pulled = 0;
+    const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+    const endless: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          pulled++;
+          return Promise.resolve({ done: false, value: chunk });
+        },
+      }),
+    };
+    const r = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], { stdin: endless });
+    assert.equal(r.code, 1);
+    assert.equal(r.stderr, "Failed to parse parameters at <stdin>: too large (more than 16777216 bytes)\n");
+    assert.equal(pulled, 17);
+    // Exactly 16 MiB is fine (blank: {}, then the connect fails).
+    const limit = await runCli(["call", "unix:/nonexistent/x", "a.b.C"], {
+      stdin: new Uint8Array(16 * 1024 * 1024).fill(0x20),
+    });
+    assert.match(limit.stderr, /^Failed to connect to /);
+  });
+
+  test("an invalid method name is rejected before connecting", async () => {
+    for (const m of ["Echo", "org.example.cli.echo", "org..x.Y", ".A", "org.example.cli."]) {
+      const r = await runCli(["call", "unix:/nonexistent/x", m, "{}"]);
+      assert.equal(r.code, 1, m);
+      assert.match(r.stderr, /^Not a valid qualified method name: /, m);
+    }
+  });
+
+  test("an invalid address", async () => {
+    const r = await runCli(["call", "nonsense", "a.b.C", "{}"]);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /invalid varlink address/);
+  });
+});
+
+describe("call: error replies", () => {
+  test("parameters on stdout, `Method call M() failed: NAME` on stderr, exit 1", async () => {
+    const r = await runCli([
+      "call",
+      fx.unix,
+      "org.example.cli.Fail",
+      '{"error":"org.example.other.Broken","parameters":{"why":"x"}}',
+    ]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, '{"why":"x"}\n');
+    assert.equal(r.stderr, "Method call org.example.cli.Fail() failed: org.example.other.Broken\n");
+  });
+
+  test("-q suppresses the parameters, not the message", async () => {
+    const r = await runCli(["call", "-q", fx.unix, "org.example.cli.Fail", '{"error":"org.example.other.Broken"}']);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "Method call org.example.cli.Fail() failed: org.example.other.Broken\n");
+  });
+
+  test("ExpectedMore gets varlinkctl's message", async () => {
+    const r = await runCli(["call", fx.unix, "org.example.cli.Monitor", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(
+      r.stderr,
+      "Method call org.example.cli.Monitor() failed: called without 'more' flag, but flag needs to be set.\n",
+    );
+    assert.equal(r.stdout, "{}\n");
+  });
+
+  test("an error reply ends --more with a SEQ record and exit 1", async () => {
+    const r = await runCli([
+      "call",
+      "--more",
+      fx.unix,
+      "org.example.cli.Fail",
+      '{"error":"org.example.other.Broken","parameters":{"a":1}}',
+    ]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, `${RS}{"a":1}\n`);
+  });
+
+  test("an error reply in --collect prints its parameters (not an array)", async () => {
+    const r = await runCli(["call", "--collect", fx.unix, "org.example.cli.Fail", '{"error":"org.example.other.X"}']);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "{}\n");
+    assert.equal(r.stderr, "Method call org.example.cli.Fail() failed: org.example.other.X\n");
+  });
+
+  test("--graceful: that error is success, still printed, logged unless -q", async () => {
+    const args = ["call", fx.unix, "org.example.cli.Fail", '{"error":"org.example.other.Fine","parameters":{"k":2}}'];
+    const r = await runCli([...args, "--graceful=org.example.other.Fine", "--graceful=org.example.other.Else"]);
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, '{"k":2}\n');
+    assert.equal(r.stderr, "Method call org.example.cli.Fail() returned expected error: org.example.other.Fine\n");
+    const q = await runCli([...args, "--graceful", "org.example.other.Fine", "-q"]);
+    assert.equal(q.code, 0);
+    assert.equal(q.stdout, "");
+    assert.equal(q.stderr, "");
+    const other = await runCli([...args, "--graceful=org.example.other.Else"]);
+    assert.equal(other.code, 1);
+    const more = await runCli([...args, "--more", "--graceful=org.example.other.Fine"]);
+    assert.equal(more.code, 0);
+    assert.equal(more.stdout, `${RS}{"k":2}\n`);
+    const collect = await runCli([...args, "--collect", "--graceful=org.example.other.Fine"]);
+    assert.equal(collect.code, 0);
+    assert.equal(collect.stdout, '{"k":2}\n');
+  });
+
+  test("peer-controlled error names cannot inject control characters into stderr", async () => {
+    const evil = `org.example.${ESC}[2J${String.fromCharCode(0x9b)}Evil`;
+    const raw = await rawServer([JSON.stringify({ error: evil, parameters: { t: `${ESC}x` } })]);
+    try {
+      const r = await runCli(["call", raw.address, "a.b.C", "{}"]);
+      assert.equal(r.code, 1);
+      assert.equal(r.stderr, "Method call a.b.C() failed: org.example.\\x1b[2J\\x9bEvil\n");
+      assert.ok(!r.stderr.includes(ESC));
+      // JSON output escapes it itself.
+      assert.equal(r.stdout, '{"t":"\\u001bx"}\n');
+    } finally {
+      await raw.close();
+    }
+  });
+});
+
+// exec: through varlink-js/node's connect (DESIGN.md §4.7): a real child (exec-child.ts) on a socketpair, started
+// with the runtime running the tests (childCommand: `deno run -A --no-check` on Deno).
+const EXEC_SKIP: string | false =
+  process.platform === "win32" ? "Windows: the exec: fixtures are /bin/sh scripts" : false;
+describe("call over exec:", { skip: EXEC_SKIP }, () => {
+  let state: { path: string; remove(): Promise<void> };
+  before(async () => {
+    state = await tempDir();
+  });
+  after(async () => {
+    await state.remove();
+  });
+
+  const gone = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (e) {
+      return (e as { code?: unknown }).code === "ESRCH";
+    }
+  };
+
+  /** A fresh state dir and an executable wrapper that records its pid there, then execs the child with the test runtime. */
+  const child = async (): Promise<{ address: string; pid(): Promise<number>; hanging(): boolean }> => {
+    const dir = await mkdtemp(join(state.path, "c-"));
+    const wrapper = join(dir, "child.sh");
+    const script = `#!/bin/sh\necho $$ > "${dir}/pid"\nexec ${childCommand(EXEC_CHILD)
+      .map((w) => `"${w}"`)
+      .join(" ")} "--state=${dir}" "$@"\n`;
+    await writeFile(wrapper, script, { mode: 0o755 });
+    const pidFile = join(dir, "pid");
+    return {
+      address: `exec:${wrapper}`,
+      pid: async () => {
+        await waitFor(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").endsWith("\n"), 10_000);
+        return Number(readFileSync(pidFile, "utf8"));
+      },
+      hanging: () => existsSync(join(dir, "hang")),
+    };
+  };
+
+  test("a method that answers: exit 0, the reply printed, the child gone after run() returns", async () => {
+    const c = await child();
+    const r = await runCli(["call", c.address, "org.example.execchild.Answer", "{}"]);
+    assert.equal(r.code, 0, r.stderr);
+    const pid = await c.pid();
+    assert.equal(r.stdout, `{"pid":${String(pid)}}\n`);
+    assert.equal(r.stderr, "");
+    await waitFor(() => gone(pid), 10_000);
+  });
+
+  test("--timeout against a method that never answers: exit 1 with the timeout message, the child gone", async () => {
+    const c = await child();
+    // 1 s rather than 0.2 s: long enough that the wrapper has recorded its pid before the SIGTERM on a loaded machine
+    // (the message is the same whether the child had started serving or not).
+    const r = await runCli(["call", "--timeout=1", c.address, "org.example.execchild.Hang", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "Method call org.example.execchild.Hang() failed: timed out after 1s\n");
+    const pid = await c.pid();
+    await waitFor(() => gone(pid), 10_000);
+  });
+
+  test("a signal (io.signal) during the call: 130, the child gone", async () => {
+    const c = await child();
+    const controller = new AbortController();
+    const running = runCli(["call", c.address, "org.example.execchild.Hang", "{}"], { signal: controller.signal });
+    try {
+      await waitFor(() => c.hanging(), 20_000);
+    } finally {
+      // Also on a failed wait: otherwise the hanging call and its child keep the test file alive.
+      controller.abort("SIGINT");
+    }
+    const r = await running;
+    assert.equal(r.code, 130);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "");
+    const pid = await c.pid();
+    await waitFor(() => gone(pid), 10_000);
+  });
+
+  test("a child that exits without serving: `Method call M() failed: …`, one line, exit 1", async () => {
+    const dir = await mkdtemp(join(state.path, "x-"));
+    const wrapper = join(dir, "exit.sh");
+    await writeFile(wrapper, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const r = await runCli(["call", `exec:${wrapper}`, "a.b.C", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    // A clean EOF, ECONNRESET when the child exits with our request unread (Linux; seen on CI), or EPIPE when it is
+    // gone before our request is written (Linux, Node 26; seen on CI).
+    assert.match(
+      r.stderr,
+      /^Method call a\.b\.C\(\) failed: (connection closed by peer|connection lost: [^\n]*|connection closed: write failed: [^\n]*)\n$/,
+    );
+  });
+
+  test("a missing executable: `Failed to connect to exec:…: … ENOENT`, exit 1", async () => {
+    const r = await runCli(["call", "exec:/nonexistent/varlink-js-cli-test", "a.b.C", "{}"]);
+    assert.equal(r.code, 1);
+    assert.equal(
+      r.stderr,
+      "Failed to connect to exec:/nonexistent/varlink-js-cli-test: " +
+        "ENOENT: no such file or directory, access '/nonexistent/varlink-js-cli-test'\n",
+    );
+  });
+
+  test("bridge exec:… fails at once with the clear error; no child is started", async () => {
+    const c = await child();
+    const r = await runCli(["bridge", c.address]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, "exec addresses are not supported by bridge (unix:, unix:@ and tcp: are).\n");
+    assert.equal(existsSync(join(c.address.slice("exec:".length), "..", "pid")), false);
+  });
+});
+
+describe("call: local failures", () => {
+  test("connect refused: `Failed to connect to ADDRESS: …`, exit 1", async () => {
+    const r = await runCli(["call", "unix:/nonexistent/dir/sock", "a.b.C", "{}"]);
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /^Failed to connect to unix:\/nonexistent\/dir\/sock: .*ENOENT/);
+  });
+
+  test("--timeout=0.2 against a handler that never answers: exit 1 quickly", async () => {
+    const start = Date.now();
+    const r = await runCli(["call", "--timeout=0.2", fx.unix, "org.example.cli.Hang", "{}"]);
+    assert.equal(r.code, 1);
+    assert.ok(Date.now() - start < 10_000, `took ${String(Date.now() - start)} ms`);
+    assert.equal(r.stderr, "Method call org.example.cli.Hang() failed: timed out after 0.2s\n");
+  });
+
+  test("--timeout bounds the whole --more call (sd-varlink semantics), units accepted", async () => {
+    const start = Date.now();
+    const r = await runCli(["call", "--more", "--timeout=150ms", fx.unix, "org.example.cli.Monitor", "{}"]);
+    assert.equal(r.code, 1);
+    assert.ok(Date.now() - start < 10_000);
+    assert.ok(r.stdout.startsWith(`${RS}{"i":0}\n`));
+    assert.match(r.stderr, /^Method call org\.example\.cli\.Monitor\(\) failed: timed out after 0\.15s\n$/);
+  });
+
+  test("a number out of range in a reply (1e400 → Infinity): exit 1, nothing printed", async () => {
+    const cases: [string[], string][] = [
+      [[], '{"parameters":{"x":[1,1e400]}}'],
+      [["--collect"], '{"parameters":{"x":-1e999}}'],
+      [["--more"], '{"parameters":{"x":1e400}}'],
+      [[], '{"error":"org.example.other.Broken","parameters":{"x":1e400}}'],
+    ];
+    for (const [flags, reply] of cases) {
+      const raw = await rawServer([reply]);
+      try {
+        const r = await runCli(["call", ...flags, raw.address, "a.b.C", "{}"]);
+        assert.equal(r.code, 1, reply);
+        assert.equal(r.stdout, "", reply);
+        assert.equal(r.stderr, "Method call a.b.C() failed: reply contains a number out of range\n", reply);
+      } finally {
+        await raw.close();
+      }
+    }
+  });
+
+  test("a peer that breaks the protocol", async () => {
+    const raw = await rawServer(["not json"]);
+    try {
+      const r = await runCli(["call", raw.address, "a.b.C", "{}"]);
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /^Method call a\.b\.C\(\) failed: /);
+    } finally {
+      await raw.close();
+    }
+  });
+
+  test("a peer that disconnects", async () => {
+    const raw = await rawServer([]);
+    try {
+      const p = runCli(["call", raw.address, "a.b.C", "{}"]);
+      // Disconnect only once the call arrived (a fixed delay could close before the connect on a slow runner).
+      await waitFor(() => raw.received() > 0);
+      await raw.close();
+      const r = await p;
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /^Method call a\.b\.C\(\) failed: /);
+    } finally {
+      await raw.close();
+    }
+  });
+});
+
+describe("call: signals and EPIPE", () => {
+  test("SIGINT during -E: the connection is closed and run returns 130", async () => {
+    const controller = new AbortController();
+    const ended = fx.monitorsEnded;
+    const p = runCli(["call", "-E", fx.unix, "org.example.cli.Monitor", "{}"], {
+      signal: controller.signal,
+      onStdout: (text) => {
+        if (text.split(RS).length > 3) controller.abort("SIGINT");
+      },
+    });
+    const r = await p;
+    assert.equal(r.code, 130);
+    assert.equal(r.stderr, "");
+    await waitFor(() => fx.monitorsEnded > ended);
+  });
+
+  test("SIGTERM gives 143", async () => {
+    const controller = new AbortController();
+    const hangs = fx.hangs;
+    const p = runCli(["call", fx.unix, "org.example.cli.Hang", "{}"], { signal: controller.signal });
+    // Signal once the call is in flight (not during the connect).
+    await waitFor(() => fx.hangs > hangs);
+    controller.abort("SIGTERM");
+    const r = await p;
+    assert.equal(r.code, 143);
+    assert.equal(r.stderr, "");
+  });
+
+  test("a signal while reading stdin parameters", async () => {
+    const controller = new AbortController();
+    let reading = false;
+    const never: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          reading = true;
+          return new Promise(() => undefined);
+        },
+      }),
+    };
+    const p = runCli(["call", fx.unix, "a.b.C"], { stdin: never, signal: controller.signal });
+    await waitFor(() => reading);
+    controller.abort("SIGINT");
+    const r = await p;
+    assert.equal(r.code, 130);
+  });
+
+  test("stdout EPIPE during --more: stops quietly, closes the connection, exit 0", async () => {
+    const ended = fx.monitorsEnded;
+    const r = await runCli(["call", "--more", fx.unix, "org.example.cli.Monitor", "{}"], { stdoutBreaksAfter: 2 });
+    assert.equal(r.code, 0);
+    assert.equal(r.stderr, "");
+    assert.equal(r.stdout, `${RS}{"i":0}\n${RS}{"i":1}\n`);
+    await waitFor(() => fx.monitorsEnded > ended);
+  });
+
+  test("stdout EPIPE on a single reply: exit 0", async () => {
+    const r = await runCli(["call", fx.unix, "org.example.cli.Preview", "{}"], { stdoutBreaksAfter: 0 });
+    assert.equal(r.code, 0);
+    assert.equal(r.stderr, "");
+  });
+});

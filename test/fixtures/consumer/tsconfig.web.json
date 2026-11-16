@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": false,
+    "verbatimModuleSyntax": true,
+    "lib": ["es2022", "dom"],
+    "types": []
+  },
+  "include": ["types-web.ts"]
+}

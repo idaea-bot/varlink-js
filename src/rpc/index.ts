@@ -1,0 +1,45 @@
+// Runtime-agnostic RPC layer over ByteChannel (DESIGN.md §4, §4.11): Connection, Pool, Server, proxy.
+export {
+  Connection,
+  createConnection,
+  DEFAULT_COLLECT_MAX,
+  DEFAULT_HIGH_WATER_MARK,
+  DEFAULT_TIMEOUT,
+  type AcceptFdsOptions,
+  type CallOptions,
+  type CollectOptions,
+  type ConnectionErrorReason,
+  type ConnectionOptions,
+  type ServiceInfo,
+  type StreamIterator,
+  type StreamOptions,
+  type WithAcceptFds,
+  type WithFds,
+} from "./connection.ts";
+export { createPool, Pool, type ConnectionFactory, type PoolOptions } from "./pool.ts";
+export type { InterfaceProxy, ProxyMethod, ProxyOptions } from "./proxy.ts";
+export type { UpgradeResult } from "./upgrade.ts";
+export {
+  createClient,
+  freezeDescriptor,
+  type TypedClient,
+  type TypedMethod,
+  type VarlinkErrorOptions,
+} from "./typed-client.ts";
+export {
+  createServer,
+  Server,
+  type HandlerOptions,
+  type HandlerRegistration,
+  type Handlers,
+  type RegistryBindOptions,
+  type RegistryBinding,
+  type ServeListener,
+  type ServeOptions,
+  type ServerErrorReason,
+  type ServerOptions,
+  type ShutdownOptions,
+  type TypedHandler,
+  type UntypedHandler,
+  type UntypedHandlers,
+} from "./server.ts";

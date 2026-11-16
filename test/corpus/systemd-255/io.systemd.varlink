@@ -1,0 +1,11 @@
+interface io.systemd
+
+error Disconnected()
+
+error TimedOut()
+
+error Protocol()
+
+error System(
+	errno: int
+)

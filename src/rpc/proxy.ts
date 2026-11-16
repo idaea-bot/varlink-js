@@ -1,0 +1,120 @@
+// Untyped introspection proxy (DESIGN.md §5.3, §4.11): fetches an interface from the peer, compiles it privately
+// and exposes one function per method with runtime validation.
+import type { Interface } from "../core/idl/ast.ts";
+import type { ValidateReplies } from "../core/protocol/dispatch.ts";
+import { compileInterface } from "../core/types/compile.ts";
+import {
+  collectSink,
+  connectionInternals,
+  type CallOptions,
+  type CallSpec,
+  type CollectOptions,
+  type Connection,
+  type StreamIterator,
+  type StreamOptions,
+} from "./connection.ts";
+import type { UpgradeResult } from "./upgrade.ts";
+import { checkMode } from "./util.ts";
+
+/** Options for `conn.proxy()`. */
+export interface ProxyOptions {
+  /** Reply validation against the fetched interface; default `"throw"`. */
+  validateReplies?: ValidateReplies;
+}
+
+/** One method of an {@link InterfaceProxy}: callable (single reply), plus the other call shapes. */
+export interface ProxyMethod {
+  (parameters?: Record<string, unknown>, options?: CallOptions): Promise<Record<string, unknown>>;
+  stream(parameters?: Record<string, unknown>, options?: StreamOptions): StreamIterator;
+  collect(parameters?: Record<string, unknown>, options?: CollectOptions): Promise<Record<string, unknown>[]>;
+  oneway(parameters?: Record<string, unknown>, options?: CallOptions): Promise<void>;
+  /**
+   * A call with `upgrade` (see `Connection.upgrade`); rejects with a TypeError, nothing sent, for a method whose IDL
+   * has no upgrade flag.
+   */
+  upgrade(parameters?: Record<string, unknown>, options?: CallOptions): Promise<UpgradeResult>;
+}
+
+/**
+ * A frozen null-prototype object with one {@link ProxyMethod} per method of the interface (by short name; varlink
+ * method names start with an upper-case letter, so they never collide with `name`/`interface`). An unknown method
+ * is `undefined`, and so are `Object.prototype` names (`toString`, `constructor`, `__proto__`, …). Parameters are
+ * always encoded with the method's input type (ValidationError before anything is written); replies are decoded
+ * per `validateReplies`; error parameters are checked against the interface's errors. Methods are typed by an index
+ * signature over capitalized names; index with a `string` via `px[name as Capitalize<string>]`.
+ */
+export interface InterfaceProxy {
+  /** The interface name. */
+  readonly name: string;
+  /** The parsed interface (AST). */
+  readonly interface: Interface;
+  /** A method by short name (`undefined` if the interface has none). */
+  readonly [method: Capitalize<string>]: ProxyMethod | undefined;
+}
+
+/** Builds the proxy for `name` on `conn`. */
+export async function createProxy(conn: Connection, name: string, options?: ProxyOptions): Promise<InterfaceProxy> {
+  const mode = checkMode(options?.validateReplies, "validateReplies", ["off", "warn", "throw"], "throw");
+  const internals = connectionInternals(conn);
+  const ast = await conn.getInterface(name);
+  const compiled = compileInterface(ast, { ints: internals.ints, codec: internals.codec });
+  // No prototype: `px.toString`, `px.constructor`, `px.__proto__` are undefined like any unknown method.
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const m of compiled.methods.values()) {
+    const spec: CallSpec = { input: m.input, output: m.output, mode, errors: compiled };
+    const method = m.method;
+    const fn = (parameters?: Record<string, unknown>, opts?: CallOptions): Promise<Record<string, unknown>> =>
+      new Promise((resolve, reject) => {
+        internals.start("single", method, parameters, opts, spec, {
+          value: (v) => {
+            resolve(v);
+          },
+          fail: reject,
+        });
+      });
+    Object.defineProperties(fn, {
+      stream: {
+        value: (parameters?: Record<string, unknown>, opts?: StreamOptions) =>
+          internals.stream(method, parameters, opts, spec),
+      },
+      collect: {
+        value: (parameters?: Record<string, unknown>, opts?: CollectOptions) =>
+          new Promise<Record<string, unknown>[]>((resolve, reject) => {
+            // As conn.collect(): a failed collection closes the collected replies' fds (acceptFds).
+            internals.start("more", method, parameters, opts, spec, collectSink(resolve, reject));
+          }),
+      },
+      oneway: {
+        value: (parameters?: Record<string, unknown>, opts?: CallOptions) =>
+          new Promise<void>((resolve, reject) => {
+            internals.start("oneway", method, parameters, opts, spec, {
+              value: () => {
+                resolve();
+              },
+              fail: reject,
+            });
+          }),
+      },
+      upgrade: {
+        value: (parameters?: Record<string, unknown>, opts?: CallOptions) =>
+          new Promise<UpgradeResult>((resolve, reject) => {
+            if (m.member.upgrade === undefined) {
+              reject(new TypeError(`${method} does not support upgrade (its IDL has no upgrade flag)`));
+              return;
+            }
+            internals.start("upgrade", method, parameters, opts, spec, {
+              value: () => undefined,
+              fail: reject,
+              upgraded: (v, channel) => {
+                resolve({ parameters: v, channel });
+              },
+            });
+          }),
+      },
+    });
+    Object.defineProperty(out, m.name, { value: Object.freeze(fn), enumerable: true });
+  }
+  Object.defineProperty(out, "name", { value: compiled.name, enumerable: true });
+  Object.defineProperty(out, "interface", { value: ast, enumerable: true });
+  return Object.freeze(out) as unknown as InterfaceProxy;
+}

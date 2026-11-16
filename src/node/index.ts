@@ -1,0 +1,40 @@
+// `varlink-js/node` entry point (DESIGN.md §4.7, §4.11, §5.8): Node sockets (unix, unix:@, tcp, inherited fds),
+// spawned transports (exec:, ssh-*:, bridge), socket activation and stdio serving,
+// and the service registry plus the org.varlink.resolver client (M8 phase B).
+export {
+  listenAuto,
+  listenFromEnv,
+  listenStdio,
+  mergeListeners,
+  type ActivationOptions,
+  type ListenAutoOptions,
+} from "./activation.ts";
+export { connect, type ConnectOptions } from "./connect.ts";
+export { listen, type ListenOptions, type NodeListener } from "./listen.ts";
+export { fdHandle, type NativeAddon, type NativeErrnoError, type NativeSocket } from "./native.ts";
+export { createPool } from "./pool.ts";
+export {
+  bindRegistry,
+  DEFAULT_RESOLVER_ADDRESS,
+  listRegistry,
+  ORG_VARLINK_RESOLVER_IDL,
+  registryDirectory,
+  resolveInterface,
+  resolverGetInfo,
+  resolverResolve,
+  type ListRegistryOptions,
+  type RegistryEntry,
+  type RegistryScope,
+  type ResolveOptions,
+  type ResolverInfo,
+} from "./registry.ts";
+export { fromNodeSocket } from "./socket.ts";
+export { fromNodeStreams, type NodeStreamsOptions } from "./spawn-channel.ts";
+export {
+  connectBridge,
+  connectExec,
+  type ExecOptions,
+  type ExecProcessOptions,
+  type SpawnOptions,
+  type SpawnProcessOptions,
+} from "./spawn.ts";

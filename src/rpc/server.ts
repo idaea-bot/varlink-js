@@ -1,0 +1,1057 @@
+// A varlink server (DESIGN.md §5.4, §4.11): interface registration, the dispatch table, a per-connection driver
+// over ServerSession + dispatchCall (DESIGN.md §4.10 contract), accept loops, limits and shutdown.
+import { ConnectionClosedError, OperationNotSupportedError, safeQuote } from "../core/errors/local.ts";
+import { INTERNAL_ERROR_INTERFACE, ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
+import type { ByteChannel, FdHandle, PeerCredentials, ReadChunk } from "../core/protocol/channel.ts";
+import {
+  dispatchCall,
+  type CallContext,
+  type DispatchErrorReason,
+  type DispatchOptions,
+  type DispatchTable,
+  type Handler,
+  type ValidateReplies,
+} from "../core/protocol/dispatch.ts";
+import { checkMaxMessageSize, closeFds } from "../core/protocol/framer.ts";
+import { isPlainObject } from "../core/protocol/messages.ts";
+import { DEFAULT_MAX_QUEUED_CALLS, DEFAULT_MAX_QUEUED_FDS, ServerSession } from "../core/protocol/server-session.ts";
+import { jsonCodec, type Codec } from "../core/types/codec.ts";
+import { compileInterfaceText, type CompiledInterface, type IntsMode } from "../core/types/compile.ts";
+import {
+  bindDescriptor,
+  type InterfaceDescriptor,
+  type MethodInput,
+  type MethodOutput,
+} from "../core/types/descriptors.ts";
+import { builtinInterfaces, entriesOf, type MethodImplementation, type RegisteredInterface } from "./service.ts";
+import { UpgradedChannel } from "./upgrade.ts";
+import { checkMode, checkPositiveInt, checkTimeout, splitName, Wakeup } from "./util.ts";
+
+/** Why {@link ServerOptions.onError} was called: a dispatch reason (§4.10) or a connection-level one. */
+export type ServerErrorReason =
+  | DispatchErrorReason
+  /** The peer broke the protocol (malformed message, message too large); its connection was closed. */
+  | "protocol-error"
+  /** `read()` rejected (e.g. a reset); the connection was closed. */
+  | "transport-error"
+  /** A channel arrived while `maxConnections` (or `maxConnectionsPerUid` of its UID) were open; it was closed at once. */
+  | "connection-limit"
+  /**
+   * M11: a channel was refused because the per-UID limit needs its peer's credentials and they could not be read, or
+   * name an invalid UID (sd-varlink.c:3494-3497, 3568-3570); it was closed at once.
+   */
+  | "connection-refused"
+  /** M11: the kernel dropped the fds that came with a call (MSG_CTRUNC); the call went on without them. */
+  | "fds-dropped"
+  /** A served listener's iteration failed; that accept loop ended and the listener was closed. */
+  | "accept-failed"
+  /** Removing a listener's registry entries failed (shutdown, or its accept loop ended); the rest carried on. */
+  | "registry-failed";
+
+/** Options for {@link createServer}. */
+export interface ServerOptions {
+  /** GetInfo fields; default `""`. */
+  vendor?: string;
+  product?: string;
+  version?: string;
+  url?: string;
+  /**
+   * Handler bugs, invalid replies, protocol and transport errors (never thrown, never a crash). Default: a one-line
+   * `console.warn` with the reason and method. Exceptions from it are swallowed.
+   */
+  onError?: (error: unknown, info: { method?: string; reason: ServerErrorReason }) => void;
+  /** Reply validation against the IDL; default `"warn"` (§5.4). */
+  validateReplies?: ValidateReplies;
+  /** `int` representation for handlers (§4.3); default `"number"`. Descriptors must match. */
+  ints?: IntsMode;
+  /** Default {@link jsonCodec}. */
+  codec?: Codec;
+  /** Largest call in bytes; default 16 MiB. */
+  maxMessageSize?: number;
+  /** Complete calls buffered per connection before reading stops; default 64. */
+  maxQueuedCalls?: number;
+  /**
+   * M11: received fds held by a connection's buffered, not yet dispatched calls before reading stops (with
+   * `allowFdPassingInput`); default 253 (SCM_MAX_FD, what sd-varlink holds for one message). A single message
+   * carrying more is still accepted; fds already handed to a handler (`ctx.fds`) do not count.
+   */
+  maxQueuedFds?: number;
+  /** Open connections; more are closed at once (`connection-limit`); default 4096. */
+  maxConnections?: number;
+  /**
+   * M11, opt-in like sd-varlink's SD_VARLINK_SERVER_ACCOUNT_UID (sd-varlink.c:3492, 3518): unset (default), connections
+   * are not counted per UID; a number enforces it (sd-varlink uses 128 with the flag, sd-varlink.c:47). More are
+   * closed at once (`connection-limit`), root not exempt (validate_connection, sd-varlink.c:3492-3505). Counted for
+   * channels that know their peer (`capabilities.peer`: unix sockets through varlink-js-native, §4.15); a channel
+   * whose credentials cannot be read, or name an invalid UID, is refused (`connection-refused`,
+   * sd-varlink.c:3494-3497, 3568-3570); channels without the capability (tcp, plain Node sockets) are not counted.
+   */
+  maxConnectionsPerUid?: number;
+  /**
+   * M11: accept fds sent with calls (`ctx.fds`), on connections that can pass fds (SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT).
+   * Default false: fds that arrive anyway are closed unseen and the call goes ahead without them (as in sd-varlink).
+   */
+  allowFdPassingInput?: boolean;
+  /** M11: let handlers send fds with replies (`ctx.pushFds`; SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT). Default false. */
+  allowFdPassingOutput?: boolean;
+  /**
+   * Exit-on-idle for socket-activated services (§5.8), in ms: once serving started (the first `serve()` or
+   * `handle()`), the server shuts down (graceful defaults) when it had no open connection for this long; a new
+   * connection cancels the timer. `0` = as soon as the last connection closed (and at once if none arrives). The
+   * expiry is confirmed one timer turn later, so a connection already pending on a listener is accepted first.
+   * Default: off. Await {@link Server.closed} to exit the process afterwards.
+   */
+  exitOnIdle?: number;
+}
+
+/** Flags a registration may raise over the IDL's (never lower). */
+export interface HandlerOptions {
+  /** Calls without `more` get ExpectedMore. */
+  readonly requiresMore?: true;
+  /** Calls without `upgrade` get ExpectedUpgrade. */
+  readonly requiresUpgrade?: true;
+}
+
+/** A handler, or a handler with {@link HandlerOptions}. */
+export type HandlerRegistration<H> = H | ({ readonly handler: H } & HandlerOptions);
+
+// `void` in the result types lets handlers without a return statement type-check (as in Handler).
+/* eslint-disable @typescript-eslint/no-invalid-void-type */
+/** A handler typed by a method descriptor's input and output. */
+export type TypedHandler<In, Out> = (
+  parameters: In,
+  ctx: CallContext,
+) => Out | undefined | void | Promise<Out | undefined | void> | AsyncIterator<Out, Out | undefined | void, undefined>;
+/* eslint-enable @typescript-eslint/no-invalid-void-type */
+
+/** Handlers for a descriptor's methods, by short name; missing ones answer MethodNotImplemented. */
+export type Handlers<D extends InterfaceDescriptor> = {
+  readonly [K in keyof D["methods"]]?: HandlerRegistration<
+    TypedHandler<MethodInput<D["methods"][K]>, MethodOutput<D["methods"][K]>>
+  >;
+};
+
+/**
+ * An untyped handler: parameters are `Record<string, unknown>`, but (method-style bivariance) a handler may also
+ * annotate them more precisely, e.g. `(p: { text: string }) => p`; the IDL validated them before the call.
+ */
+export type UntypedHandler = {
+  handle(parameters: Record<string, unknown>, ctx: CallContext): ReturnType<Handler>;
+}["handle"];
+
+/** Handlers for `addInterface(idlText, handlers)`, by short method name. */
+export type UntypedHandlers = Readonly<Record<string, HandlerRegistration<UntypedHandler>>>;
+
+/** Where {@link ServeListener.bindRegistry} publishes: a directory, else the scope's registry directory. */
+export interface RegistryBindOptions {
+  directory?: string;
+  /** Default `"system"`. */
+  scope?: "system" | "user";
+}
+
+/** Registry entries published for a listener (DESIGN.md §4.6, §5.4). */
+export interface RegistryBinding {
+  /** The entry paths (created or adopted). */
+  readonly entries: readonly string[];
+  /**
+   * Removes the entries that still point at the listener's socket (a listener on a socket it does not own may keep
+   * them); idempotent.
+   */
+  unbind(): Promise<void>;
+}
+
+/** What `serve()` accepts: a stream of accepted channels, optionally closable (a Listener is one). */
+export interface ServeListener extends AsyncIterable<ByteChannel> {
+  close?(): Promise<void>;
+  /**
+   * Publishes the listener in a service registry directory under each interface name, all or nothing (a Node
+   * unix-path listener has it, see `varlink-js/node` `bindRegistry`). Used by `serve(listener, {registry})`.
+   */
+  bindRegistry?(interfaces: readonly string[], options: RegistryBindOptions): Promise<RegistryBinding>;
+  /**
+   * M11: present on a strict listener (`varlink-js/node` `listen(…, {native, fdPassingInputStrict: true})`): the
+   * `allowFdPassingInput` its listening socket's SO_PASSRIGHTS was set from. `serve()` refuses a listener whose value
+   * differs from the server's (TypeError), since connections accepted from it would refuse (or take) fds until the
+   * server switches each one.
+   */
+  readonly strictFdPassingInput?: boolean;
+}
+
+/** Options for {@link Server.serve}. */
+export interface ServeOptions {
+  /**
+   * Publish the listener in the service registry (UAPI.20; the listener must have `bindRegistry`): `true` = every
+   * interface registered now except `org.varlink.service` and the varlink-js InternalError interface, or a list of
+   * registered names, or `{interfaces, directory, scope}` (`interfaces` default `true`). The binding is unbound at
+   * {@link Server.shutdown} (before the listeners close) and when the accept loop ends; that removes the entries,
+   * except for a listener on a socket it does not own (a Node `listen({fd})` one under socket activation keeps them).
+   */
+  registry?:
+    true | readonly string[] | { interfaces?: true | readonly string[]; directory?: string; scope?: "system" | "user" };
+}
+
+/** A registry binding of one `serve()` call: `ready` never rejects (undefined if binding failed). */
+interface BindState {
+  readonly ready: Promise<RegistryBinding | undefined>;
+  unbound: Promise<void> | undefined;
+}
+
+/** Options for {@link Server.shutdown}. */
+export interface ShutdownOptions {
+  /** Default true: active calls may finish (their signal aborts); false: close everything at once. */
+  graceful?: boolean;
+  /** ms until the rest is closed hard; default 5000; 0 = no deadline (waits for every active handler). */
+  timeout?: number;
+}
+
+const DEFAULT_MAX_CONNECTIONS = 4096;
+
+/** UID_INVALID ((uid_t) -1) and anything that is no uid_t: refused like sd-varlink's !uid_is_valid. */
+function validUid(uid: unknown): uid is number {
+  // systemd's uid_is_valid (user-util.c:52-65): not UID_INVALID (0xFFFFFFFF), nor the 16-bit -1 (0xFFFF).
+  return typeof uid === "number" && Number.isSafeInteger(uid) && uid >= 0 && uid < 0xffffffff && uid !== 0xffff;
+}
+
+/** Graceful close: how long input is discarded after our FIN before the connection is closed hard (ms). */
+const GRACEFUL_LINGER_MS = 2000;
+
+function defaultOnError(_error: unknown, info: { method?: string; reason: ServerErrorReason }): void {
+  const where = info.method === undefined ? "" : ` in ${safeQuote(info.method)}`;
+  console.warn(`varlink-js server: ${info.reason}${where} (set the server's onError to handle it)`);
+}
+
+function checkFlag(value: unknown, name: string): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") throw new TypeError(`${name} must be a boolean`);
+  return value;
+}
+
+function infoString(value: unknown, name: string): string {
+  if (value === undefined) return "";
+  if (typeof value !== "string") throw new TypeError(`${name} must be a string`);
+  return value;
+}
+
+/** Checks a handlers object against the interface: every key a method, every value a handler registration. */
+function implementations(compiled: CompiledInterface, handlers: unknown): Map<string, MethodImplementation> {
+  const impls = new Map<string, MethodImplementation>();
+  if (handlers === undefined) return impls;
+  if (!isPlainObject(handlers)) throw new TypeError("handlers must be a plain object");
+  for (const key of Object.keys(handlers)) {
+    if (!compiled.methods.has(key))
+      throw new TypeError(`${safeQuote(key)} is not a method of interface ${compiled.name}`);
+    const value = handlers[key];
+    if (typeof value === "function") {
+      impls.set(key, { handler: value as Handler<never> });
+      continue;
+    }
+    if (typeof value !== "object" || value === null || typeof (value as { handler?: unknown }).handler !== "function")
+      throw new TypeError(`handler for ${compiled.name}.${key} must be a function or { handler, … }`);
+    const reg = value as { handler: Handler<never>; requiresMore?: unknown; requiresUpgrade?: unknown };
+    for (const flag of ["requiresMore", "requiresUpgrade"] as const)
+      if (reg[flag] !== undefined && reg[flag] !== true)
+        throw new TypeError(`${flag} for ${compiled.name}.${key} must be true or absent`);
+    impls.set(key, {
+      handler: reg.handler,
+      requiresMore: reg.requiresMore === true,
+      requiresUpgrade: reg.requiresUpgrade === true,
+    });
+  }
+  return impls;
+}
+
+interface ConnectionHost {
+  readonly table: DispatchTable;
+  readonly dispatchOptions: Omit<DispatchOptions, "signal">;
+  report(error: unknown, reason: ServerErrorReason, method?: string): void;
+}
+
+/** Per-connection dispatch extras (M11): the peer's credentials and fd output. */
+interface ConnectionExtras {
+  readonly peer: PeerCredentials | undefined;
+  readonly duplicateFd: ((fd: number) => FdHandle) | undefined;
+}
+
+/** One served connection: a reader task and a dispatcher task over one ServerSession (DESIGN.md §4.10). */
+class ServerConnection {
+  readonly #channel: ByteChannel;
+  readonly #session: ServerSession;
+  readonly #host: ConnectionHost;
+  readonly #extras: ConnectionExtras;
+  readonly #readerWake = new Wakeup();
+  readonly #dispatcherWake = new Wakeup();
+  /** The driver signal of the active call. */
+  #active: AbortController | undefined;
+  /** Graceful shutdown: start no new call, close once the active one finished. */
+  #draining = false;
+  /** The connection is being closed by the driver: no more reads, no transport-error reports. */
+  #closing = false;
+  /** Graceful close in progress: the channel is being ended; the reader discards input until EOF. */
+  #finishing: Promise<void> | undefined;
+  /** Graceful close: closes the connection GRACEFUL_LINGER_MS after the channel was ended. */
+  #linger: ReturnType<typeof setTimeout> | undefined;
+  /** The reader's read() that has not settled yet (handed to the upgraded channel if the upgrade happens meanwhile). */
+  #inFlight: Promise<ReadChunk | null> | undefined;
+  /** ctx.upgrade() took the transport: the reader and dispatcher leave the channel alone. */
+  #handedOver = false;
+  /** A read outcome after the confirming reply (EOF, or a rejection), before the hand-over: the channel's next one. */
+  #upgradeEnd: { error?: unknown } | undefined;
+  #resolveReleased: () => void = () => undefined;
+  /** Resolves when the transport was handed to an upgrade handler (graceful shutdown does not wait for it). */
+  readonly released: Promise<void>;
+
+  constructor(channel: ByteChannel, session: ServerSession, host: ConnectionHost, extras: ConnectionExtras) {
+    this.#channel = channel;
+    this.#session = session;
+    this.#host = host;
+    this.#extras = extras;
+    this.released = new Promise((resolve) => {
+      this.#resolveReleased = resolve;
+    });
+  }
+
+  /** The transport belongs to an upgrade handler (until it closes the channel, the connection stays counted). */
+  get upgraded(): boolean {
+    return this.#handedOver;
+  }
+
+  /**
+   * `ctx.upgrade()`'s hand-over, once the confirming reply was written: the transport as a channel that yields the
+   * bytes the session kept past the call (early data), then the outcome of a read already in flight (or one seen
+   * after the reply), then the transport's reads.
+   */
+  #handOver(): ByteChannel {
+    if (this.#closing) throw new ConnectionClosedError("the connection was closed");
+    const head = this.#session.takeUpgradeRemainder();
+    this.#handedOver = true;
+    const channel = new UpgradedChannel(this.#channel, head, { pending: this.#inFlight, ended: this.#upgradeEnd });
+    this.#inFlight = undefined;
+    this.#upgradeEnd = undefined;
+    this.#resolveReleased();
+    this.#readerWake.notify();
+    return channel;
+  }
+
+  /** Serves until the channel is closed. Never rejects. */
+  async run(): Promise<void> {
+    void this.#channel.closed.then(() => {
+      // The channel closed under us (not by the driver): like a disconnect, but not a transport error.
+      if (!this.#closing) this.#gone(undefined);
+    });
+    const reader = this.#reader();
+    void this.#dispatcher();
+    await reader;
+    await this.#channel.closed;
+  }
+
+  /** Graceful shutdown: abort the active call's signal (its replies are still written), start no new calls. */
+  drain(): void {
+    this.#draining = true;
+    this.#active?.abort(new ConnectionClosedError("the server is shutting down"));
+    this.#dispatcherWake.notify();
+  }
+
+  /** Hard close (shutdown deadline, non-graceful shutdown). */
+  force(): void {
+    this.#gone(new ConnectionClosedError("the server is shutting down"));
+  }
+
+  async #reader(): Promise<void> {
+    const session = this.#session;
+    try {
+      for (;;) {
+        if (this.#closing) return;
+        if (this.#finishing !== undefined) {
+          await this.#discard(this.#finishing);
+          return;
+        }
+        if (session.state !== "open") return;
+        if (!session.wantsInput) {
+          await this.#readerWake.wait();
+          continue;
+        }
+        const read = this.#channel.read();
+        this.#inFlight = read;
+        let chunk: ReadChunk | null;
+        try {
+          chunk = await read;
+        } finally {
+          if (this.#inFlight === read) this.#inFlight = undefined;
+        }
+        // The upgraded channel took this read's outcome.
+        if (this.#handedOver) return;
+        // Read again: the state may change during the await (TypeScript still has it narrowed to "open").
+        const state: string = session.state;
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
+        if (!this.#closing && this.#finishing === undefined && state === "upgraded") {
+          // After the confirming reply, before the hand-over: kept for the upgraded channel (bytes only: the
+          // session closes any fds).
+          if (chunk === null) this.#upgradeEnd = {};
+          else session.receive(chunk.bytes, chunk.fds);
+          return;
+        }
+        // Closing, finishing or no longer open: the top of the loop decides (the chunk is dropped).
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
+        if (this.#closing || this.#finishing !== undefined || session.state !== "open") {
+          closeFds(chunk?.fds);
+          continue;
+        }
+        if (chunk === null) session.receiveEnd();
+        else {
+          if (chunk.fdError === "truncated")
+            // MSG_CTRUNC: the call goes on without its fds (json-stream.c:1308-1317 logs, drops, continues).
+            this.#host.report(
+              new Error("file descriptors were dropped: the kernel truncated their control data (MSG_CTRUNC)"),
+              "fds-dropped",
+            );
+          session.receive(chunk.bytes, chunk.fds);
+        }
+        this.#dispatcherWake.notify();
+      }
+    } catch (e) {
+      if (this.#closing || this.#handedOver) return;
+      if (session.state === "upgraded") {
+        // After the confirming reply, before the hand-over: the upgraded channel's first read reports it.
+        this.#upgradeEnd = { error: e };
+        return;
+      }
+      // A graceful finish was in progress: the peer is gone, nothing left to protect (no report).
+      if (this.#finishing !== undefined) {
+        this.#close();
+        return;
+      }
+      this.#host.report(e, "transport-error");
+      this.#gone(e);
+    }
+  }
+
+  /**
+   * Graceful close, second half: once the channel is ended (our FIN after the last reply), read and drop input
+   * until EOF or an error, then close. Unread input at close makes a TCP stack send RST, which can destroy the
+   * reply still in flight. Bounded by the linger (see #finish); the shutdown deadline (force()) still closes at once.
+   */
+  async #discard(ended: Promise<void>): Promise<void> {
+    await ended;
+    try {
+      for (;;) {
+        if (this.#closing) break;
+        const chunk = await this.#channel.read();
+        if (chunk === null) break;
+        // dropped (fds included)
+        closeFds(chunk.fds);
+      }
+    } catch {
+      // The peer is gone: nothing left to protect.
+    }
+    this.#close();
+  }
+
+  async #dispatcher(): Promise<void> {
+    const session = this.#session;
+    /** Ended by a graceful shutdown (not a protocol error, upgrade or close): the last reply must arrive. */
+    let graceful = false;
+    /** The transport went to an upgrade handler: it is not ours to close. */
+    let claimed = false;
+    try {
+      for (;;) {
+        const ev = session.nextEvent();
+        if (ev === null) {
+          if (session.state !== "open") break;
+          if (this.#draining) {
+            graceful = true;
+            break;
+          }
+          await this.#dispatcherWake.wait();
+          continue;
+        }
+        if (ev.type === "close") {
+          if (ev.error !== undefined) this.#host.report(ev.error, "protocol-error");
+          break;
+        }
+        // Graceful shutdown: buffered calls are dropped unanswered.
+        if (this.#draining) {
+          closeFds(ev.fds);
+          graceful = true;
+          break;
+        }
+        // The queue just shrank: a reader parked on a full queue reads again (and so notices a reset).
+        this.#readerWake.notify();
+        const ac = new AbortController();
+        this.#active = ac;
+        await dispatchCall(
+          session,
+          ev.id,
+          ev.call,
+          this.#host.table,
+          (bytes, fds) => (fds === undefined ? this.#channel.write(bytes) : this.#channel.write(bytes, fds)),
+          {
+            ...this.#host.dispatchOptions,
+            signal: ac.signal,
+            upgrade: () => this.#handOver(),
+            fds: ev.fds,
+            peer: this.#extras.peer,
+            duplicateFd: this.#extras.duplicateFd,
+          },
+        );
+        this.#active = undefined;
+        this.#readerWake.notify();
+        // Upgraded: the handler took the transport (ctx.upgrade), or nobody did (dispatch reported
+        // upgrade-unclaimed) and the stream, no longer varlink, is closed below.
+        if (session.state === "upgraded") {
+          claimed = this.#handedOver;
+          break;
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- drain() may run during the await
+        if (this.#draining) {
+          graceful = true;
+          break;
+        }
+      }
+    } catch (e) {
+      // Not reachable by design (dispatchCall never rejects); never an unhandled rejection.
+      this.#host.report(e, "transport-error");
+    }
+    if (claimed) return;
+    if (graceful) this.#finish();
+    else this.#close();
+  }
+
+  /** The peer is gone or the server forces a close: abort the active call and close the session and channel. */
+  #gone(cause: unknown): void {
+    if (this.#closing) return;
+    this.#active?.abort(
+      new ConnectionClosedError("the connection was closed", cause === undefined ? undefined : { cause }),
+    );
+    this.#close();
+  }
+
+  /**
+   * Graceful close (shutdown drain): no more calls; end the channel after the replies written so far, then the
+   * reader discards input until EOF and closes (see #discard). Once ended, the discarding lasts at most
+   * {@link GRACEFUL_LINGER_MS}: a peer that never closes (or never sends anything, leaving the reader in read())
+   * must not hold the shutdown; the shutdown deadline still applies if it comes sooner.
+   */
+  #finish(): void {
+    if (this.#closing || this.#finishing !== undefined) return;
+    this.#session.close();
+    const finishing = Promise.resolve()
+      .then(() => this.#channel.end())
+      .catch(() => undefined);
+    this.#finishing = finishing;
+    void finishing.then(() => {
+      if (!this.#closing)
+        this.#linger = setTimeout(() => {
+          this.#close();
+        }, GRACEFUL_LINGER_MS);
+    });
+    this.#readerWake.notify();
+  }
+
+  #close(): void {
+    if (this.#linger !== undefined) clearTimeout(this.#linger);
+    this.#linger = undefined;
+    this.#closing = true;
+    this.#session.close();
+    this.#channel.close();
+    this.#readerWake.notify();
+    this.#dispatcherWake.notify();
+  }
+}
+
+/**
+ * A varlink server (DESIGN.md §5.4). Register interfaces with {@link implement} / {@link addInterface}, then
+ * {@link serve} listeners or {@link handle} single channels. `org.varlink.service` and the InternalError
+ * interface are built in. Create it with {@link createServer}.
+ */
+export class Server {
+  readonly #info: { vendor: string; product: string; version: string; url: string };
+  readonly #onError: (error: unknown, info: { method?: string; reason: ServerErrorReason }) => void;
+  readonly #ints: IntsMode;
+  readonly #codec: Codec;
+  readonly #maxMessageSize: number;
+  readonly #maxQueuedCalls: number;
+  readonly #maxQueuedFds: number;
+  readonly #maxConnections: number;
+  /** Undefined: no per-UID accounting (M11: opt-in, like SD_VARLINK_SERVER_ACCOUNT_UID). */
+  readonly #maxConnectionsPerUid: number | undefined;
+  readonly #allowFdInput: boolean;
+  readonly #allowFdOutput: boolean;
+  /** Open connections per peer UID (only those whose channel knows its peer), like sd-varlink's by_uid. */
+  readonly #byUid = new Map<number, number>();
+  readonly #interfaces = new Map<string, RegisteredInterface>();
+  readonly #service: RegisteredInterface;
+  readonly #internal: RegisteredInterface;
+  readonly #host: ConnectionHost;
+  readonly #connections = new Set<ServerConnection>();
+  readonly #done = new Map<ServerConnection, Promise<void>>();
+  readonly #listeners = new Set<ServeListener>();
+  readonly #bindings = new Set<BindState>();
+  #shutdown: Promise<void> | undefined;
+  readonly #exitOnIdle: number | undefined;
+  /** `serve()` or `handle()` was called: exit-on-idle applies from now on. */
+  #serving = false;
+  #idleTimer: ReturnType<typeof setTimeout> | undefined;
+  #resolveClosed: () => void = () => undefined;
+  /** Resolves once a shutdown (by any trigger: {@link shutdown}, exit-on-idle) completed. Never rejects. */
+  readonly closed: Promise<void>;
+
+  /** Use {@link createServer}. */
+  constructor(options?: ServerOptions) {
+    this.#info = {
+      vendor: infoString(options?.vendor, "vendor"),
+      product: infoString(options?.product, "product"),
+      version: infoString(options?.version, "version"),
+      url: infoString(options?.url, "url"),
+    };
+    const onError = options?.onError ?? defaultOnError;
+    if (typeof onError !== "function") throw new TypeError("onError must be a function");
+    this.#onError = onError;
+    this.#ints = checkMode(options?.ints, "ints", ["number", "bigint"], "number");
+    this.#codec = options?.codec ?? jsonCodec;
+    this.#maxMessageSize = checkMaxMessageSize(options?.maxMessageSize);
+    this.#maxQueuedCalls = checkPositiveInt(options?.maxQueuedCalls, "maxQueuedCalls", DEFAULT_MAX_QUEUED_CALLS);
+    this.#maxQueuedFds = checkPositiveInt(options?.maxQueuedFds, "maxQueuedFds", DEFAULT_MAX_QUEUED_FDS);
+    this.#maxConnections = checkPositiveInt(options?.maxConnections, "maxConnections", DEFAULT_MAX_CONNECTIONS);
+    this.#maxConnectionsPerUid =
+      options?.maxConnectionsPerUid === undefined
+        ? undefined
+        : checkPositiveInt(options.maxConnectionsPerUid, "maxConnectionsPerUid", 1);
+    this.#allowFdInput = checkFlag(options?.allowFdPassingInput, "allowFdPassingInput");
+    this.#allowFdOutput = checkFlag(options?.allowFdPassingOutput, "allowFdPassingOutput");
+    const exitOnIdle = options?.exitOnIdle;
+    if (exitOnIdle !== undefined && (typeof exitOnIdle !== "number" || !Number.isFinite(exitOnIdle) || exitOnIdle < 0))
+      throw new RangeError("exitOnIdle must be a finite non-negative number of milliseconds");
+    this.#exitOnIdle = exitOnIdle === undefined ? undefined : checkTimeout(exitOnIdle, "exitOnIdle", 0);
+    this.closed = new Promise((resolve) => {
+      this.#resolveClosed = resolve;
+    });
+    const validateReplies = checkMode(options?.validateReplies, "validateReplies", ["off", "warn", "throw"], "warn");
+    const builtins = builtinInterfaces(
+      {
+        info: () => ({ ...this.#info }),
+        interfaceNames: () => [ORG_VARLINK_SERVICE, ...this.#interfaces.keys(), INTERNAL_ERROR_INTERFACE],
+        description: (name) => this.#find(name)?.idl,
+      },
+      { ints: this.#ints, codec: this.#codec },
+    );
+    this.#service = builtins.service;
+    this.#internal = builtins.internal;
+    const table: DispatchTable = {
+      lookup: (interfaceName, methodName) => {
+        const r = this.#find(interfaceName);
+        if (r === undefined) return { kind: "interface-not-found" };
+        const entry = r.entries.get(methodName);
+        return entry === undefined ? { kind: "method-not-found" } : { kind: "method", entry };
+      },
+      errorValidator: (errorName) => {
+        const parts = splitName(errorName);
+        const r = parts === null ? undefined : this.#find(parts.interface);
+        if (parts === null || r === undefined) return undefined;
+        return r.compiled.errors.get(parts.member) ?? null;
+      },
+    };
+    this.#host = {
+      table,
+      dispatchOptions: {
+        validateReplies,
+        onError: (error, info) => {
+          this.#report(error, info.reason, info.method);
+        },
+      },
+      report: (error, reason, method) => {
+        this.#report(error, reason, method);
+      },
+    };
+  }
+
+  /** Open connections. */
+  get connections(): number {
+    return this.#connections.size;
+  }
+
+  /**
+   * Registers a generated interface (codegen descriptor) with typed handlers. Missing handlers answer
+   * MethodNotImplemented. Allowed while serving (new calls see it).
+   *
+   * @throws {TypeError} for a built-in or already registered name, an unknown handler key, a bad handler value,
+   *   a descriptor that does not match its IDL, or an `ints` mismatch (only for an interface that uses `int`: one
+   *   without binds in either mode).
+   */
+  // NoInfer: D comes from the descriptor alone; inferring it from inline handlers too would widen their results'
+  // literals (`kind: "large"` → string) before the contextual type is known.
+  implement<D extends InterfaceDescriptor>(descriptor: D, handlers: NoInfer<Handlers<D>>): void {
+    const compiled = bindDescriptor(descriptor, this.#ints, { codec: this.#codec });
+    this.#register(compiled, descriptor.idl, handlers);
+  }
+
+  /**
+   * Registers an interface from IDL text (parsed, validated and compiled now; served verbatim by
+   * GetInterfaceDescription) with untyped handlers. Allowed while serving.
+   *
+   * @throws {IdlSyntaxError} for invalid IDL.
+   * @throws {TypeError} as for {@link implement}.
+   */
+  addInterface(idl: string, handlers?: UntypedHandlers): void {
+    if (typeof idl !== "string") throw new TypeError("addInterface expects IDL text");
+    const compiled = compileInterfaceText(idl, { ints: this.#ints, codec: this.#codec });
+    this.#register(compiled, idl, handlers);
+  }
+
+  /**
+   * Serves one connection; resolves when it is closed, never rejects. After {@link shutdown}, at `maxConnections`,
+   * or (with `maxConnectionsPerUid` set) at that many connections of the channel's peer UID, the channel is closed at
+   * once (`connection-limit`); with `maxConnectionsPerUid` set, a channel whose credentials cannot be read or name an
+   * invalid UID is refused too (`connection-refused`). On an fd-capable channel, fd input and output are set per
+   * `allowFdPassingInput`/`allowFdPassingOutput`.
+   */
+  async handle(channel: ByteChannel): Promise<void> {
+    if (this.#shutdown !== undefined) {
+      channel.close();
+      return;
+    }
+    this.#serving = true;
+    if (this.#connections.size >= this.#maxConnections) {
+      this.#report(new Error(`connection limit (${String(this.#maxConnections)}) reached`), "connection-limit");
+      channel.close();
+      return;
+    }
+    let peer: PeerCredentials | undefined;
+    let peerError: { value: unknown } | undefined;
+    try {
+      peer = channel.capabilities.peer?.();
+    } catch (e) {
+      peerError = { value: e };
+    }
+    // sd-varlink's per-UID accounting, only with SD_VARLINK_SERVER_ACCOUNT_UID (validate_connection/count_connection,
+    // sd-varlink.c:3492-3531): the total limit first, then the UID's; a connection over it is refused (closed), root
+    // included. Credentials that cannot be read, or an invalid UID, are refused as well (3494-3497, 3568-3570).
+    const max = this.#maxConnectionsPerUid;
+    let uid: number | undefined;
+    if (max !== undefined && (peerError !== undefined || peer !== undefined)) {
+      if (peerError !== undefined || !validUid(peer?.uid)) {
+        this.#report(
+          new Error("the peer's credentials could not be read or name an invalid UID: refused", {
+            cause: peerError?.value,
+          }),
+          "connection-refused",
+        );
+        channel.close();
+        return;
+      }
+      uid = peer.uid;
+    }
+    if (max !== undefined && uid !== undefined) {
+      const count = this.#byUid.get(uid) ?? 0;
+      if (count >= max) {
+        this.#report(
+          new Error(`per-UID connection limit (${String(max)}) reached for UID ${String(uid)}`),
+          "connection-limit",
+        );
+        channel.close();
+        return;
+      }
+      this.#byUid.set(uid, count + 1);
+    }
+    try {
+      await this.#serveChannel(channel, peer);
+    } finally {
+      if (uid !== undefined) {
+        const count = (this.#byUid.get(uid) ?? 1) - 1;
+        if (count <= 0) this.#byUid.delete(uid);
+        else this.#byUid.set(uid, count);
+      }
+    }
+  }
+
+  async #serveChannel(channel: ByteChannel, peer: PeerCredentials | undefined): Promise<void> {
+    const fdPassing = channel.capabilities.fdPassing;
+    let duplicateFd: ((fd: number) => FdHandle) | undefined;
+    try {
+      fdPassing?.setAcceptInput(this.#allowFdInput);
+      fdPassing?.setAllowOutput(this.#allowFdOutput);
+      if (fdPassing !== undefined && this.#allowFdOutput) duplicateFd = (fd) => fdPassing.duplicate(fd);
+    } catch (e) {
+      // The channel is broken already (e.g. closed under us): nothing to serve.
+      this.#report(e, "transport-error");
+      channel.close();
+      return;
+    }
+    let session: ServerSession;
+    try {
+      session = new ServerSession({
+        codec: this.#codec,
+        maxMessageSize: this.#maxMessageSize,
+        maxQueuedCalls: this.#maxQueuedCalls,
+        maxQueuedFds: this.#maxQueuedFds,
+      });
+    } catch (e) {
+      // Options were checked at construction; keep the "never rejects" promise anyway.
+      this.#report(e, "transport-error");
+      channel.close();
+      this.#updateIdle();
+      return;
+    }
+    const conn = new ServerConnection(channel, session, this.#host, { peer, duplicateFd });
+    this.#connections.add(conn);
+    this.#updateIdle();
+    const done = conn.run().catch((e: unknown) => {
+      this.#report(e, "transport-error");
+    });
+    this.#done.set(conn, done);
+    await done;
+    this.#connections.delete(conn);
+    this.#done.delete(conn);
+    this.#updateIdle();
+  }
+
+  /** Exit-on-idle: arms the timer while serving with no open connection, cancels it otherwise (and once shut down). */
+  #updateIdle(): void {
+    const ms = this.#exitOnIdle;
+    if (ms === undefined) return;
+    if (this.#shutdown !== undefined || this.#connections.size > 0) {
+      if (this.#idleTimer !== undefined) clearTimeout(this.#idleTimer);
+      this.#idleTimer = undefined;
+      return;
+    }
+    if (!this.#serving || this.#idleTimer !== undefined) return;
+    this.#idleTimer = setTimeout(() => {
+      // Confirmed one turn later: a connection the runtime is about to accept from a listener cancels it.
+      this.#idleTimer = setTimeout(() => {
+        this.#idleTimer = undefined;
+        if (this.#shutdown === undefined && this.#connections.size === 0) void this.shutdown();
+      }, 0);
+    }, ms);
+  }
+
+  /**
+   * Accepts channels from `listener` in the background (returns at once) and serves each with {@link handle}. An
+   * error from the iteration is reported as `accept-failed`, ends that loop and closes the listener (its errors
+   * swallowed). Several listeners may be served; {@link shutdown} closes them. While the server runs, the
+   * iterator is obtained synchronously: a listener that is already being iterated (served by this or another
+   * Server) makes `serve()` throw (TypeError for this Server's own listeners and for a Node listener) and is left
+   * untouched. After {@link shutdown}, `serve()` just closes the listener.
+   *
+   * Without `options` it returns nothing (the M4 signature, so existing fire-and-forget calls stay lint-clean). With
+   * `options` it returns a promise: without `options.registry` it is resolved at once and never rejects. With it, the
+   * listener's {@link ServeListener.bindRegistry} publishes the entries while accepting already runs; the promise
+   * resolves once they all exist and rejects if binding failed: then no entry is left, the listener stops being
+   * served and is closed (connections accepted meanwhile are served on). Await or handle it when using `registry`
+   * (an unhandled rejection ends a Node process).
+   *
+   * @throws {TypeError} if `listener` is already being served by this server (it is left alone), if it is a strict
+   *   listener set up with another `allowFdPassingInput` than this server's ({@link ServeListener.strictFdPassingInput};
+   *   left alone), or for invalid `options` (an unknown or unregistered interface, a built-in one, a bad
+   *   `directory`/`scope`).
+   * @throws {OperationNotSupportedError} if `registry` is requested and the listener has no `bindRegistry` (a TCP,
+   *   abstract or stdio listener); it is left alone.
+   * @throws whatever `listener[Symbol.asyncIterator]()` throws (a Node listener: TypeError when another Server
+   *   iterates it); the listener is not closed then.
+   */
+  serve(listener: ServeListener): void;
+  serve(listener: ServeListener, options: ServeOptions): Promise<void>;
+  serve(listener: ServeListener, options?: ServeOptions): Promise<void> | void {
+    if (this.#listeners.has(listener)) throw new TypeError("this listener is already being served");
+    const strict = listener.strictFdPassingInput;
+    if (strict !== undefined && strict !== this.#allowFdInput)
+      throw new TypeError(
+        `the strict listener was set up with allowFdPassingInput ${String(strict)}, the server has ` +
+          `${String(this.#allowFdInput)}: pass the server's allowFdPassingInput to listen()`,
+      );
+    const registry = this.#registryRequest(options);
+    if (registry !== undefined && typeof listener.bindRegistry !== "function")
+      throw new OperationNotSupportedError("this listener cannot be published in a registry (not a unix path socket)");
+    if (this.#shutdown !== undefined) {
+      void this.#closeListener(listener);
+      return Promise.resolve();
+    }
+    // Obtained synchronously: a listener that refuses a second iteration (served by another Server) throws here,
+    // and that must not close it under its first user.
+    const iterator = listener[Symbol.asyncIterator]();
+    this.#listeners.add(listener);
+    this.#serving = true;
+    this.#updateIdle();
+    let state: BindState | undefined;
+    let bound: Promise<void> = Promise.resolve();
+    if (registry !== undefined) {
+      const binding = (async () => listener.bindRegistry?.(registry.interfaces, registry.options))();
+      state = { ready: binding.catch(() => undefined), unbound: undefined };
+      this.#bindings.add(state);
+      bound = binding.then(
+        () => undefined,
+        async (e: unknown) => {
+          // All or nothing: bindRegistry rolled its entries back; stop serving the listener and release it.
+          try {
+            await iterator.return?.();
+          } catch {
+            // The binding error is the one to report.
+          }
+          await this.#closeListener(listener, false);
+          throw e;
+        },
+      );
+    }
+    const loop = async (): Promise<void> => {
+      try {
+        for (;;) {
+          const r = await iterator.next();
+          if (r.done === true) break;
+          const channel = r.value;
+          if (this.#shutdown !== undefined) channel.close();
+          else void this.handle(channel);
+        }
+      } catch (e) {
+        this.#report(e, "accept-failed");
+        // Release the address: nothing accepts on it any more, and shutdown() will not see it.
+        try {
+          await listener.close?.();
+        } catch {
+          // Already reported the cause; a failing close adds nothing.
+        }
+      } finally {
+        this.#listeners.delete(listener);
+        if (state !== undefined) await this.#unbind(state);
+      }
+    };
+    void loop();
+    return bound;
+  }
+
+  /** `serve()`'s registry option checked against the registered interfaces, or undefined if not requested. */
+  #registryRequest(
+    options: ServeOptions | undefined,
+  ): { interfaces: readonly string[]; options: RegistryBindOptions } | undefined {
+    if (options === undefined) return undefined;
+    if (typeof options !== "object" || (options as unknown) === null)
+      throw new TypeError("serve options must be an object");
+    const registry: unknown = options.registry;
+    if (registry === undefined) return undefined;
+    let requested: unknown = registry;
+    const bindOptions: RegistryBindOptions = {};
+    if (registry !== true && !Array.isArray(registry)) {
+      if (typeof registry !== "object" || registry === null)
+        throw new TypeError("registry must be true, a list of interface names or an object");
+      const { interfaces, directory, scope } = registry as {
+        interfaces?: unknown;
+        directory?: unknown;
+        scope?: unknown;
+      };
+      requested = interfaces ?? true;
+      if (directory !== undefined) {
+        if (typeof directory !== "string" || directory === "")
+          throw new TypeError("registry.directory must be a non-empty string");
+        bindOptions.directory = directory;
+      }
+      if (scope !== undefined) bindOptions.scope = checkMode(scope, "registry.scope", ["system", "user"], "system");
+    }
+    if (requested === true) return { interfaces: [...this.#interfaces.keys()], options: bindOptions };
+    if (!Array.isArray(requested)) throw new TypeError("registry interfaces must be true or a list of interface names");
+    const names: string[] = [];
+    for (const name of requested as unknown[]) {
+      if (typeof name !== "string") throw new TypeError("registry interfaces must be strings");
+      if (name === ORG_VARLINK_SERVICE || name === INTERNAL_ERROR_INTERFACE)
+        throw new TypeError(`interface ${name} is built in and is not published in a registry`);
+      if (!this.#interfaces.has(name)) throw new TypeError(`interface ${safeQuote(name)} is not registered`);
+      if (names.includes(name)) throw new TypeError(`interface ${name} is listed twice`);
+      names.push(name);
+    }
+    return { interfaces: names, options: bindOptions };
+  }
+
+  /** Removes a serve() call's registry entries once (after its binding settled); failures go to onError. */
+  #unbind(state: BindState): Promise<void> {
+    state.unbound ??= state.ready
+      .then((binding) => binding?.unbind())
+      .catch((e: unknown) => {
+        this.#report(e, "registry-failed");
+      })
+      .finally(() => {
+        this.#bindings.delete(state);
+      });
+    return state.unbound;
+  }
+
+  /**
+   * Stops the server (idempotent): removes the registry entries of served listeners (`serve(…, {registry})`;
+   * failures go to `onError` as `registry-failed`), closes the served listeners, then — graceful (default) — aborts every active
+   * call's signal (replies are still written), drops buffered calls and, once its active call finished, ends each
+   * connection (FIN after the last reply) and discards its input until the peer closes, for at most 2000 ms; at the
+   * `timeout` deadline (default 5000 ms; 0 = none), or at once when not graceful, the rest is closed hard. Resolves
+   * when every connection is closed. With `timeout: 0` it waits for every active handler to finish and for its
+   * replies to be written: a handler that ignores its signal, or a peer that stops reading while a reply is being
+   * written, holds it forever (use a deadline). A connection whose transport went to a handler (`ctx.upgrade()`)
+   * is no varlink connection any more: a graceful shutdown aborts that handler's signal (if it still runs) but
+   * neither waits for the upgraded channel nor closes it, also not at the deadline; `graceful: false` closes it too.
+   *
+   * @throws {RangeError|TypeError} for invalid options (synchronously; nothing is stopped then).
+   */
+  shutdown(options?: ShutdownOptions): Promise<void> {
+    if (this.#shutdown !== undefined) return this.#shutdown;
+    // Checked before anything is memoized: an invalid call throws and leaves the server running.
+    const graceful = options?.graceful ?? true;
+    if (typeof graceful !== "boolean") throw new TypeError("graceful must be a boolean");
+    const timeout = checkTimeout(options?.timeout, "timeout", 5000);
+    this.#shutdown = this.#stop(graceful, timeout).then(() => {
+      this.#resolveClosed();
+    });
+    this.#updateIdle();
+    return this.#shutdown;
+  }
+
+  async #stop(graceful: boolean, timeout: number): Promise<void> {
+    // Registry entries first: none may point at a socket we are about to close.
+    await Promise.all([...this.#bindings].map((s) => this.#unbind(s)));
+    await Promise.all([...this.#listeners].map((l) => this.#closeListener(l)));
+    const conns = [...this.#connections];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (!graceful) {
+      for (const c of conns) c.force();
+    } else {
+      for (const c of conns) c.drain();
+      // Upgraded connections belong to their handlers: not waited for, not closed at the deadline.
+      if (timeout > 0)
+        timer = setTimeout(() => {
+          for (const c of this.#connections) if (!c.upgraded) c.force();
+        }, timeout);
+    }
+    await Promise.all(
+      conns.map(async (c) => (graceful ? Promise.race([this.#done.get(c), c.released]) : this.#done.get(c))),
+    );
+    if (timer !== undefined) clearTimeout(timer);
+  }
+
+  async #closeListener(listener: ServeListener, report = true): Promise<void> {
+    try {
+      await listener.close?.();
+    } catch (e) {
+      if (report) this.#report(e, "accept-failed");
+    }
+  }
+
+  #find(name: string): RegisteredInterface | undefined {
+    if (name === ORG_VARLINK_SERVICE) return this.#service;
+    if (name === INTERNAL_ERROR_INTERFACE) return this.#internal;
+    return this.#interfaces.get(name);
+  }
+
+  #register(compiled: CompiledInterface, idl: string, handlers: unknown): void {
+    const name = compiled.name;
+    if (name === ORG_VARLINK_SERVICE || name === INTERNAL_ERROR_INTERFACE)
+      throw new TypeError(`interface ${name} is built in`);
+    if (this.#interfaces.has(name)) throw new TypeError(`interface ${name} is already registered`);
+    const entries = entriesOf(compiled, implementations(compiled, handlers));
+    this.#interfaces.set(name, { name, idl, compiled, entries });
+  }
+
+  #report(error: unknown, reason: ServerErrorReason, method?: string): void {
+    try {
+      this.#onError(error, method === undefined ? { reason } : { method, reason });
+    } catch {
+      // onError must not throw; if it does, the server carries on.
+    }
+  }
+}
+
+/** A server (DESIGN.md §5.4). @throws {RangeError|TypeError} for invalid options. */
+export function createServer(options?: ServerOptions): Server {
+  return new Server(options);
+}

@@ -1,0 +1,22 @@
+# A tiny note store (the varlink-js codegen example).
+interface org.example.notes
+
+# One note.
+type Note (
+  id: int,
+  text: string,
+  tags: []string
+)
+
+# Adds a note and returns its id.
+method Add(text: string, tags: ?[]string) -> (id: int)
+
+# Returns one note.
+method Get(id: int) -> (note: Note)
+
+# Lists the notes, one reply per note. An empty store sends a single reply without a note.
+# [Requires 'more' flag]
+method List() -> (note: ?Note)
+
+# There is no note with this id.
+error NoSuchNote (id: int)

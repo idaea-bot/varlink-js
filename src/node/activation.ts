@@ -1,0 +1,628 @@
+// Socket activation (DESIGN.md §5.8): listeners from LISTEN_FDS/LISTEN_FDNAMES, SYSTEMD_VARLINK_LISTEN, stdio.
+// Reference: sd-daemon.c (sd_listen_fds, sd_listen_fds_with_names), sd-varlink.c (sd_varlink_server_listen_name,
+// sd_varlink_server_listen_auto).
+import { fstatSync, lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { connect, Socket, type NetConnectOpts } from "node:net";
+import { formatAddress, type AddressSpec } from "../core/address/parse.ts";
+import { OperationNotSupportedError } from "../core/errors/local.ts";
+import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
+import type { ServeListener } from "../rpc/server.ts";
+import { checkMode } from "../rpc/util.ts";
+import { ACTIVATION_HINT_ENV, recordActivationFds } from "./activation-fds.ts";
+import { listen } from "./listen.ts";
+import { adoptFd, usableNative, type NativeAddon } from "./native.ts";
+import { fromNodeSocket } from "./socket.ts";
+import { fromNodeStreams } from "./spawn-channel.ts";
+
+export { inheritedActivationFds } from "./activation-fds.ts";
+
+/** Options for {@link listenFromEnv} (and {@link listenAuto}). */
+export interface ActivationOptions {
+  /** The `LISTEN_FDNAMES` name of the fds to use; default `"varlink"`. */
+  name?: string;
+  /**
+   * Delete `LISTEN_PID`, `LISTEN_PIDFDID`, `LISTEN_FDS` and `LISTEN_FDNAMES` from `process.env` (like
+   * `sd_listen_fds(1)`), whatever the outcome; default true.
+   */
+  unsetEnvironment?: boolean;
+  /**
+   * Whether an fd is a listening socket or an already-accepted connection (systemd `Accept=yes`, or a connected
+   * `exec:` socketpair). `"auto"` (default) asks `/proc` on Linux: our network namespace's socket tables, then pid
+   * 1's (where the service manager made the sockets of a `PrivateNetwork=yes` service). Where `/proc` says nothing
+   * about an fd (other systems, or an inode unknown in both, e.g. `/proc` mounted with `hidepid` or a container whose
+   * pid 1 does not own the socket's namespace) the fd is taken as connected if our own `exec:`'s hint is set (see
+   * {@link listenFromEnv}), else as listening: there, a connected fd passed by anyone but a varlink-js `exec:` (an
+   * `Accept=yes` socket, say) needs `"connected"`.
+   */
+  accept?: "auto" | "listening" | "connected";
+  /**
+   * M11: the optional `varlink-js-native` addon: unix sockets serve fd-capable connections with peer credentials
+   * (see `listen()`), and every fd of `LISTEN_FDS` is made close-on-exec, as `sd_listen_fds` does.
+   */
+  native?: NativeAddon;
+  /** M11, with `native`: strict fd input (see `ListenOptions.fdPassingInputStrict`); default false, as sd-varlink. */
+  fdPassingInputStrict?: boolean;
+  /** M11, strict mode only: the server's `allowFdPassingInput` (see `ListenOptions.allowFdPassingInput`). */
+  allowFdPassingInput?: boolean;
+}
+
+/** Options for {@link listenAuto}. */
+export interface ListenAutoOptions extends ActivationOptions {
+  /** `SYSTEMD_VARLINK_LISTEN` naming a unix path: the socket's mode (see `listen()`). */
+  mode?: number;
+}
+
+/** The variables `listenFromEnv` reads (and by default unsets). */
+const ACTIVATION_ENV = ["LISTEN_PID", "LISTEN_PIDFDID", "LISTEN_FDS", "LISTEN_FDNAMES", ACTIVATION_HINT_ENV];
+
+/** The first passed fd (SD_LISTEN_FDS_START). */
+const LISTEN_FDS_START = 3;
+
+/** More than this many fds in `LISTEN_FDS` is taken for garbage. */
+const MAX_LISTEN_FDS = 1024;
+
+/** What `/proc` says about a socket. */
+interface ProcSocket {
+  readonly listening: boolean;
+  /** The bound address of a unix socket, if it has one. */
+  readonly address?: string;
+}
+
+/** __SO_ACCEPTCON in the Flags column of /proc/net/unix. */
+const SO_ACCEPTCON = 0x10000;
+
+/** TCP_LISTEN in the st column of /proc/net/tcp{,6}. */
+const TCP_LISTEN = "0A";
+
+/** Where listenFromEnv looks up a socket: our network namespace, then pid 1's (the service manager's). */
+const PROC_BASES = ["/proc/self", "/proc/1"];
+
+function readProc(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function unixAddress(path: string): string | undefined {
+  // /proc shows an abstract name with a leading '@' (and its NULs as '@').
+  const spec: AddressSpec = path.startsWith("@")
+    ? { kind: "unix-abstract", name: path.slice(1) }
+    : { kind: "unix", path };
+  try {
+    return formatAddress(spec);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Sockets by inode, from `<base>/net/{unix,tcp,tcp6}` (`base` e.g. `/proc/self`; Linux; empty where unreadable).
+ * Only the sockets of that process's network namespace are listed (internal; exported for tests).
+ */
+export function procSockets(base: string): Map<string, ProcSocket> {
+  const sockets = new Map<string, ProcSocket>();
+  // Num RefCount Protocol Flags Type St Inode [Path]
+  const unixLine = /^\S+:\s+\S+\s+\S+\s+([0-9A-Fa-f]+)\s+\S+\s+\S+\s+(\d+)(?: (.*))?$/;
+  for (const line of (readProc(`${base}/net/unix`) ?? "").split("\n").slice(1)) {
+    const m = unixLine.exec(line);
+    if (m === null) continue;
+    const [, flags = "0", inode = "", path] = m;
+    const address = path === undefined || path === "" ? undefined : unixAddress(path);
+    sockets.set(inode, {
+      listening: (parseInt(flags, 16) & SO_ACCEPTCON) !== 0,
+      ...(address === undefined ? {} : { address }),
+    });
+  }
+  // sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode …
+  for (const table of [`${base}/net/tcp`, `${base}/net/tcp6`])
+    for (const line of (readProc(table) ?? "").split("\n").slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      const st = fields[3];
+      const inode = fields[9];
+      if (st === undefined || inode === undefined) continue;
+      sockets.set(inode, { listening: st.toUpperCase() === TCP_LISTEN });
+    }
+  return sockets;
+}
+
+/**
+ * What `/proc` says about socket inodes: our network namespace's tables, then (read once, on the first miss) pid 1's,
+ * where the service manager made the sockets of a `PrivateNetwork=yes` service (internal; exported for tests).
+ */
+export function procLookup(bases: readonly string[]): (inode: string) => ProcSocket | undefined {
+  const tables: Map<string, ProcSocket>[] = [];
+  return (inode) => {
+    for (let i = 0; i < bases.length; i++) {
+      const base = bases[i];
+      if (base === undefined) break;
+      tables[i] ??= procSockets(base);
+      const info = tables[i]?.get(inode);
+      if (info !== undefined) return info;
+    }
+    return undefined;
+  };
+}
+
+/** The socket inode of an fd (`socket:[ino]`), or undefined. */
+function socketInode(fd: number): string | undefined {
+  try {
+    return /^socket:\[(\d+)\]$/.exec(readlinkSync(`/proc/self/fd/${String(fd)}`))?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/** A listener that yields one channel (made on first `next()`), then ends. No `bindRegistry`: nothing to publish. */
+class OneShotListener implements Listener {
+  readonly address: string;
+  #take: (() => ByteChannel) | undefined;
+  readonly #discard: () => void;
+  #iterating = false;
+
+  constructor(address: string, take: () => ByteChannel, discard: () => void) {
+    this.address = address;
+    this.#take = take;
+    this.#discard = discard;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<ByteChannel> {
+    if (this.#iterating) throw new TypeError("the listener is already being iterated");
+    this.#iterating = true;
+    let finished = false;
+    const finish = (): IteratorResult<ByteChannel> => {
+      if (!finished) {
+        finished = true;
+        this.#iterating = false;
+      }
+      return { value: undefined, done: true };
+    };
+    return {
+      next: (): Promise<IteratorResult<ByteChannel>> => {
+        const take = this.#take;
+        if (finished || take === undefined) return Promise.resolve(finish());
+        this.#take = undefined;
+        try {
+          return Promise.resolve({ value: take(), done: false });
+        } catch (e) {
+          finish();
+          // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the error as is
+          return Promise.reject(e);
+        }
+      },
+      return: (): Promise<IteratorResult<ByteChannel>> => Promise.resolve(finish()),
+    };
+  }
+
+  close(): Promise<void> {
+    if (this.#take !== undefined) {
+      this.#take = undefined;
+      this.#discard();
+    }
+    return Promise.resolve();
+  }
+}
+
+/**
+ * Bun (as of 1.4.4): `new net.Socket({ fd })` on an inherited socket fd never reads or writes (it gets no handle,
+ * and the process exits as if nothing were pending), but `net.connect({ fd })` opens a real socket over it: reads,
+ * writes, `end()` sends a FIN, `destroy()` closes the fd, for blocking and `O_NONBLOCK` fds alike. Node and Deno
+ * reject `net.connect({ fd })` (no port or path), so only Bun takes that path, and only for a socket fd: that is
+ * all it was checked on, so a pipe or FIFO forced to `accept: "connected"` keeps `new Socket({ fd })` (Node's pipe
+ * handle path; on Bun that edge case is unchecked).
+ */
+const FD_NEEDS_CONNECT = process.versions.bun !== undefined;
+
+/** The channel over a connected activation fd (exported for tests); closing it closes the fd. */
+export function connectedChannel(fd: number): ByteChannel {
+  const socket =
+    FD_NEEDS_CONNECT && fstatSync(fd).isSocket()
+      ? connect({ fd, allowHalfOpen: true } as unknown as NetConnectOpts)
+      : new Socket({ fd, readable: true, writable: true, allowHalfOpen: true });
+  return fromNodeSocket(socket);
+}
+
+/** A connected activation fd: one channel over it (adopted by the addon when given and a unix socket). */
+function connectedListener(
+  fd: number,
+  address: string | undefined,
+  native: NativeAddon | undefined,
+  strict: boolean,
+): Listener {
+  const channel = (native === undefined ? undefined : adoptFd(native, fd, strict)) ?? connectedChannel(fd);
+  return new OneShotListener(
+    address ?? `fd:${String(fd)}`,
+    () => channel,
+    () => {
+      channel.close();
+    },
+  );
+}
+
+/** `it.return()`, its failure (a throw or a rejection from a user's listener) ignored. */
+function quietReturn(it: AsyncIterator<ByteChannel>): void {
+  try {
+    it.return?.().catch(() => undefined);
+  } catch {
+    // Nothing to report it to: the merged iteration is over either way.
+  }
+}
+
+/** Per-iteration state of a {@link mergeListeners} listener. */
+interface MergeState {
+  readonly queue: ByteChannel[];
+  readonly iterators: AsyncIterator<ByteChannel>[];
+  waiter: { resolve(r: IteratorResult<ByteChannel>): void; reject(e: unknown): void } | undefined;
+  error: { value: unknown } | undefined;
+  active: number;
+  finished: boolean;
+}
+
+/** The strict sources' common `strictFdPassingInput`, or undefined if none is strict; TypeError if they disagree. */
+function strictOfSources(sources: readonly Listener[]): boolean | undefined {
+  let value: boolean | undefined;
+  for (const s of sources as readonly ServeListener[]) {
+    const v = s.strictFdPassingInput;
+    if (v === undefined) continue;
+    if (value !== undefined && v !== value)
+      throw new TypeError(
+        "mergeListeners: the strict listeners were set up with different allowFdPassingInput values " +
+          "(no server can serve them all; see fdPassingInputStrict)",
+      );
+    value = v;
+  }
+  return value;
+}
+
+class MergedListener implements Listener {
+  readonly address: string;
+  declare readonly bindRegistry?: ServeListener["bindRegistry"];
+  declare readonly strictFdPassingInput?: boolean;
+  readonly #sources: readonly Listener[];
+  #state: MergeState | undefined;
+  #closing: Promise<void> | undefined;
+
+  constructor(sources: readonly Listener[], address: string) {
+    this.#sources = sources;
+    this.address = address;
+    // The registry names the first unix path socket among the sources (the others have no path to link to).
+    const bindable = (sources as readonly ServeListener[]).find((s) => typeof s.bindRegistry === "function");
+    if (bindable !== undefined)
+      this.bindRegistry = (interfaces, options) =>
+        bindable.bindRegistry?.(interfaces, options) ??
+        Promise.reject(new OperationNotSupportedError("the listener lost its bindRegistry"));
+    // A strict source's setting goes along, so serve() checks it (listenFromEnv gives every source the same options);
+    // strict sources that disagree could never all match one server: strictOfSources throws, so this constructor (and
+    // with it mergeListeners) does.
+    const strict = strictOfSources(sources);
+    if (strict !== undefined) this.strictFdPassingInput = strict;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<ByteChannel> {
+    if (this.#state !== undefined) throw new TypeError("the listener is already being iterated");
+    const iterators: AsyncIterator<ByteChannel>[] = [];
+    try {
+      for (const source of this.#sources) iterators.push(source[Symbol.asyncIterator]());
+    } catch (e) {
+      for (const it of iterators) quietReturn(it);
+      throw e;
+    }
+    const state: MergeState = {
+      queue: [],
+      iterators,
+      waiter: undefined,
+      error: undefined,
+      active: iterators.length,
+      finished: false,
+    };
+    this.#state = state;
+    for (const it of iterators) void this.#pump(state, it);
+    return {
+      next: (): Promise<IteratorResult<ByteChannel>> => {
+        if (state.finished) return Promise.resolve({ value: undefined, done: true });
+        if (state.waiter !== undefined) return Promise.reject(new TypeError("next() called concurrently"));
+        return new Promise((resolve, reject) => {
+          state.waiter = { resolve, reject };
+          this.#wake(state);
+        });
+      },
+      return: (): Promise<IteratorResult<ByteChannel>> => {
+        const waiter = state.waiter;
+        state.waiter = undefined;
+        this.#finish(state);
+        waiter?.resolve({ value: undefined, done: true });
+        return Promise.resolve({ value: undefined, done: true });
+      },
+    };
+  }
+
+  close(): Promise<void> {
+    // Every source is closed and the queue cleaned up even if one fails; then the first failure rejects.
+    this.#closing ??= Promise.allSettled(this.#sources.map(async (s) => s.close())).then((results) => {
+      const state = this.#state;
+      if (state !== undefined) {
+        for (const channel of state.queue.splice(0)) channel.close();
+        this.#wake(state);
+      }
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed !== undefined) throw failed.reason;
+    });
+    return this.#closing;
+  }
+
+  async #pump(state: MergeState, it: AsyncIterator<ByteChannel>): Promise<void> {
+    try {
+      for (;;) {
+        const r = await it.next();
+        if (r.done === true) break;
+        // Arrived after the iteration ended (or the listener closed): nobody will take it.
+        if (state.finished || this.#closing !== undefined) {
+          r.value.close();
+          continue;
+        }
+        state.queue.push(r.value);
+        this.#wake(state);
+      }
+    } catch (e) {
+      if (!state.finished) state.error ??= { value: e };
+    } finally {
+      state.active--;
+      this.#wake(state);
+    }
+  }
+
+  /** Settles the pending next(): a queued channel, then a source's error (once), then done when all ended. */
+  #wake(state: MergeState): void {
+    const waiter = state.waiter;
+    if (waiter === undefined) return;
+    const channel = state.queue.shift();
+    if (channel !== undefined) {
+      state.waiter = undefined;
+      waiter.resolve({ value: channel, done: false });
+      return;
+    }
+    const error = state.error;
+    if (error !== undefined) {
+      state.error = undefined;
+      state.waiter = undefined;
+      waiter.reject(error.value);
+      return;
+    }
+    if (state.active === 0 || this.#closing !== undefined) {
+      state.waiter = undefined;
+      this.#finish(state);
+      waiter.resolve({ value: undefined, done: true });
+    }
+  }
+
+  #finish(state: MergeState): void {
+    if (state.finished) return;
+    state.finished = true;
+    if (this.#state === state) this.#state = undefined;
+    for (const it of state.iterators) quietReturn(it);
+    for (const channel of state.queue.splice(0)) channel.close();
+  }
+}
+
+/**
+ * A `/proc` address only if it still names a socket (best effort): /proc/net/unix shows the path a socket was *bound*
+ * to, which may have been renamed or removed since (our own listen() and exec: listening mode bind under a temporary
+ * name), and a dangling address would be published by `serve(listener, {registry})`. A path that no longer exists
+ * (`ENOENT`/`ENOTDIR`) or is not a socket is dropped; one we cannot inspect (`EACCES`, …) is kept, since the
+ * service manager may have bound it where we cannot look. A relative bind path (relative to the binder's cwd) is
+ * dropped. That a socket is there does not prove it is ours (the sockfs inode in /proc cannot be compared with the
+ * file's). Abstract names and tcp are kept as they are.
+ */
+function existingAddress(address: string | undefined): string | undefined {
+  if (address === undefined || !address.startsWith("unix:") || address.startsWith("unix:@")) return address;
+  const path = address.slice("unix:".length);
+  if (!path.startsWith("/")) return undefined;
+  try {
+    return lstatSync(path).isSocket() ? address : undefined;
+  } catch (e) {
+    const code = (e as { code?: unknown }).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? undefined : address;
+  }
+}
+
+/**
+ * One {@link Listener} over several: iterating it yields the channels of all of them until all ended (an
+ * iteration error of one is delivered once to `next()`); `close()` closes all; `address` is the first one's. One
+ * iteration at a time (a second concurrent one is a `TypeError`); after `return()` it may be iterated again. It has
+ * `bindRegistry` (§5.4) if a source has one: the first such source's (a unix path socket). It carries the strict
+ * sources' `strictFdPassingInput` (M11), so `server.serve()` checks it.
+ *
+ * @throws {TypeError} for an empty list, or strict sources set up with different `allowFdPassingInput` values (the
+ *   listeners are left open).
+ */
+export function mergeListeners(listeners: readonly Listener[]): Listener {
+  const first = listeners[0];
+  if (first === undefined) throw new TypeError("mergeListeners needs at least one listener");
+  return new MergedListener([...listeners], first.address);
+}
+
+/**
+ * The socket-activation listener (DESIGN.md §5.8; sd_listen_fds_with_names + sd_varlink_server_listen_name), or
+ * `null` if we were not activated (`LISTEN_PID` absent or not our pid; `LISTEN_FDS` absent) or no fd has the name.
+ * `LISTEN_PIDFDID` is ignored: Node cannot read the inode id of its own pidfd. `LISTEN_FDS` must be a positive
+ * decimal ≤ 1024 and `LISTEN_FDNAMES`, if set, must have as many `:`-separated names (empty ones count). The fds
+ * (3, 4, …) named `options.name` (default `"varlink"`) are used; without `LISTEN_FDNAMES` a single fd is used too
+ * (sd-varlink would name it "unknown"). Each becomes a listener per `options.accept`: a listening socket via
+ * `listen({fd})` (address from `/proc` on Linux, else as `listen()` derives it), a connected one as a listener that
+ * yields that one connection, then ends. Several fds give one merged listener ({@link mergeListeners}). The
+ * variables (and `VARLINK_JS_ACTIVATION`, below) are unset unless `unsetEnvironment` is false, also when this throws
+ * (invalid options included) or returns `null`.
+ *
+ * `VARLINK_JS_ACTIVATION=connected:<pid>` is a varlink-js-private hint that a connected-mode `exec:` of varlink-js
+ * sets (the shell sets it with `LISTEN_PID`, same pid): with `accept: "auto"`, an fd `/proc` says nothing about (any
+ * system but Linux, or a socket unknown in our and pid 1's network namespace) is then taken as connected instead of
+ * listening. It counts only if it is exactly `connected:<LISTEN_PID>`: any other value (a stale copy naming another
+ * pid included), or the variable absent, changes nothing; it is never consulted in the other `accept` modes or where
+ * `/proc` knows the socket.
+ *
+ * The activation fds are not close-on-exec (systemd's `sd_listen_fds` sets `FD_CLOEXEC`; Node cannot without the
+ * native addon, M11), so a child process inherits fds 3 … 3 + `LISTEN_FDS` − 1, listening sockets included. Every
+ * fd seen in `LISTEN_FDS` is recorded, and varlink-js's own spawners (`exec:`, bridges, ssh) put `/dev/null` on
+ * those fd numbers in their children; a `child_process` spawn of your own does not: pass `/dev/null` (or
+ * `"ignore"` and an `stdio` array that covers those numbers) for them yourself.
+ *
+ * @throws {TypeError} (as a rejection) for invalid options or malformed `LISTEN_FDS`/`LISTEN_FDNAMES`.
+ */
+export async function listenFromEnv(options?: ActivationOptions): Promise<Listener | null> {
+  const env = process.env;
+  const pid = env.LISTEN_PID;
+  const count = env.LISTEN_FDS;
+  const names = env.LISTEN_FDNAMES;
+  const hint = env[ACTIVATION_HINT_ENV];
+  // Unset before anything can throw (only an explicit `false` keeps them; an invalid value throws below).
+  if (options?.unsetEnvironment !== false) for (const key of ACTIVATION_ENV) Reflect.deleteProperty(env, key);
+  const name = options?.name ?? "varlink";
+  if (typeof name !== "string") throw new TypeError("name must be a string");
+  const unset = options?.unsetEnvironment ?? true;
+  if (typeof unset !== "boolean") throw new TypeError("unsetEnvironment must be a boolean");
+  const accept = checkMode(options?.accept, "accept", ["auto", "listening", "connected"], "auto");
+  const native = usableNative(options?.native);
+  if (pid === undefined || !/^[0-9]+$/.test(pid) || Number(pid) !== process.pid) return null;
+  if (count === undefined) return null;
+  if (!/^[0-9]+$/.test(count) || Number(count) < 1 || Number(count) > MAX_LISTEN_FDS)
+    throw new TypeError(`LISTEN_FDS must be a decimal from 1 to ${String(MAX_LISTEN_FDS)}`);
+  const n = Number(count);
+  // All of them, whatever their names: none may leak into our children (spawn.ts).
+  recordActivationFds(LISTEN_FDS_START, n);
+  // With the addon, like sd_listen_fds: close-on-exec (best effort; the /dev/null cover stays as a second guard).
+  if (native !== undefined)
+    for (let i = 0; i < n; i++)
+      try {
+        native.setCloexec(LISTEN_FDS_START + i);
+      } catch {
+        // Not open (EBADF): nothing to protect.
+      }
+  const fdNames = names?.split(":");
+  if (fdNames !== undefined && fdNames.length !== n)
+    throw new TypeError(`LISTEN_FDNAMES has ${String(fdNames.length)} names for ${String(n)} fds (LISTEN_FDS)`);
+  const selected: number[] = [];
+  for (let i = 0; i < n; i++)
+    if (fdNames === undefined ? n === 1 : fdNames[i] === name) selected.push(LISTEN_FDS_START + i);
+  if (selected.length === 0) return null;
+  const linux = process.platform === "linux";
+  const lookup = procLookup(PROC_BASES);
+  // Our exec:'s hint, honoured only if set for this very process (a stale copy names another pid).
+  const hinted = hint === `connected:${pid}`;
+  const listeners: Listener[] = [];
+  try {
+    for (const fd of selected) {
+      const inode = linux ? socketInode(fd) : undefined;
+      const info = inode === undefined ? undefined : lookup(inode);
+      // /proc silent (not Linux, or an inode unknown in both namespaces): only our own exec:'s hint says "connected".
+      const connected = info === undefined ? hinted : !info.listening;
+      const mode = accept === "auto" ? (connected ? "connected" : "listening") : accept;
+      const address = existingAddress(info?.address);
+      const nativeOption =
+        native === undefined
+          ? {}
+          : {
+              native,
+              ...(options?.fdPassingInputStrict === undefined
+                ? {}
+                : { fdPassingInputStrict: options.fdPassingInputStrict }),
+              ...(options?.allowFdPassingInput === undefined
+                ? {}
+                : { allowFdPassingInput: options.allowFdPassingInput }),
+            };
+      if (mode === "connected")
+        listeners.push(connectedListener(fd, address, native, options?.fdPassingInputStrict === true));
+      else listeners.push(await listen({ fd }, address === undefined ? nativeOption : { address, ...nativeOption }));
+    }
+  } catch (e) {
+    await Promise.allSettled(listeners.map((l) => l.close()));
+    throw e;
+  }
+  const [only] = listeners;
+  return listeners.length === 1 && only !== undefined ? only : mergeListeners(listeners);
+}
+
+/** Ends `process.stdout` (on a socket: FIN; elsewhere harmless); never throws. */
+function endStdout(): void {
+  try {
+    process.stdout.end();
+  } catch {
+    // A stdout that cannot end has nothing to tell the peer either.
+  }
+}
+
+/**
+ * The stdio channel: Node never closes fds 0 and 1 (destroying `process.stdout` leaves the fd open), so `end()` and
+ * `close()` also end `process.stdout`, which on a socket (libuv's `"pipe"` stdio, ssh) sends FIN. After `close()`
+ * the FIN goes out only if no write is still pending: `close()` destroys the stream, and a destroyed stream skips
+ * the `_final` that would shut the socket down once the writes drained. The must-exit rule ({@link listenStdio})
+ * covers that case: the peer sees EOF when the process exits.
+ */
+function stdioChannel(): ByteChannel {
+  const inner = fromNodeStreams(process.stdin, process.stdout);
+  return {
+    capabilities: inner.capabilities,
+    closed: inner.closed,
+    read: () => inner.read(),
+    write: (chunk) => inner.write(chunk),
+    end: () => {
+      endStdout();
+      return inner.end();
+    },
+    close: (reason) => {
+      endStdout();
+      inner.close(reason);
+    },
+  };
+}
+
+/**
+ * A listener that yields one connection over `process.stdin`/`process.stdout` ({@link fromNodeStreams}), then ends
+ * (`SYSTEMD_VARLINK_LISTEN=-`, what `ssh-exec:` and bridges rely on). `address` is `stdio:`, which is not a dialable
+ * varlink address. Nothing else may write to stdout while it is served (use stderr for logs). The streams are
+ * touched only when the channel is taken; `close()` before that leaves them alone.
+ *
+ * **A stdio-served process must exit when this connection ends.** Node cannot close fds 0 and 1 (sd-varlink
+ * `dup`s them away; that needs the native addon): closing the channel ends `process.stdout`, which sends FIN on a
+ * socket stdout (what our spawners and ssh give a child) — after `close()` only if no write is still pending (the
+ * destroyed stream skips its `_final`) — but cannot close a pipe or a terminal, so the peer may see EOF only when
+ * the process exits. On Bun and Deno (as of 1.4.4 / 2.9.8) `process.stdout.end()` sends no FIN even on a socket, so
+ * there the peer sees EOF only at exit and the must-exit rule is required. Serve with `exitOnIdle` and
+ * `await server.closed; process.exit()`.
+ */
+export function listenStdio(): Listener {
+  return new OneShotListener("stdio:", stdioChannel, () => undefined);
+}
+
+/**
+ * Everything we were given to serve on, like `sd_varlink_server_listen_auto`: the fds from {@link listenFromEnv}
+ * plus, if `SYSTEMD_VARLINK_LISTEN` is set, `-` → {@link listenStdio}, anything else → `listen(value, { mode })`;
+ * merged into one listener, or `null` if there is nothing. `SYSTEMD_VARLINK_LISTEN` is not unset (sd-varlink
+ * parity; our spawners strip it from children). Typical activated service:
+ * `server.serve((await listenAuto()) ?? (await listen(fallback))); await server.closed; process.exit(0)` with
+ * `exitOnIdle` set: a stdio-served process must exit when its connection ends (see {@link listenStdio}).
+ *
+ * @throws as {@link listenFromEnv} and `listen()` (as a rejection; what was opened is closed again).
+ */
+export async function listenAuto(options?: ListenAutoOptions): Promise<Listener | null> {
+  const { mode, ...activation } = options ?? {};
+  const fromEnv = await listenFromEnv(activation);
+  const value = process.env.SYSTEMD_VARLINK_LISTEN;
+  if (value === undefined) return fromEnv;
+  let extra: Listener;
+  try {
+    const listenOptions = {
+      ...(mode === undefined ? {} : { mode }),
+      ...(activation.native === undefined ? {} : { native: activation.native }),
+      ...(activation.allowFdPassingInput === undefined ? {} : { allowFdPassingInput: activation.allowFdPassingInput }),
+      ...(activation.fdPassingInputStrict === undefined
+        ? {}
+        : { fdPassingInputStrict: activation.fdPassingInputStrict }),
+    };
+    extra = value === "-" ? listenStdio() : await listen(value, listenOptions);
+  } catch (e) {
+    await fromEnv?.close().catch(() => undefined);
+    throw e;
+  }
+  return fromEnv === null ? extra : mergeListeners([fromEnv, extra]);
+}

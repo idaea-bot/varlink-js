@@ -1,4 +1,9 @@
-dist/
 node_modules/
-.DS_Store/
-bun.lockb
+dist/
+build/
+pkg/
+coverage/
+*.tgz
+.DS_Store
+# examples/reference-server.ts default socket
+/org.example.reference.sock

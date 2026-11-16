@@ -1,0 +1,417 @@
+// varlink-js/testing (DESIGN.md §4.1, §4.10): pair() semantics and faulty() fault injection.
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+import { ConnectionClosedError } from "../../../src/core/errors/index.ts";
+import type { ByteChannel } from "../../../src/core/protocol/index.ts";
+import { faulty, pair } from "../../../src/testing/index.ts";
+import { concat, utf8 } from "./helpers.ts";
+
+const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+/** Settled state of a promise after the queued microtasks and one macrotask ran. */
+async function state(p: Promise<unknown>): Promise<"pending" | "resolved" | "rejected"> {
+  let s: "pending" | "resolved" | "rejected" = "pending";
+  p.then(
+    () => (s = "resolved"),
+    () => (s = "rejected"),
+  );
+  await tick();
+  return s;
+}
+
+/** Reads until EOF; returns the chunks as strings. */
+async function readAll(ch: ByteChannel): Promise<string[]> {
+  const out: string[] = [];
+  for (let c = await ch.read(); c !== null; c = await ch.read()) out.push(new TextDecoder().decode(c.bytes));
+  return out;
+}
+
+describe("pair()", () => {
+  test("bytes arrive in order, chunk by chunk, copied", async () => {
+    const [a, b] = pair();
+    const pending = b.read();
+    await a.write(utf8("zero")); // handed straight to the waiting read
+    assert.equal(new TextDecoder().decode((await pending)?.bytes), "zero");
+    const chunk = utf8("one");
+    await a.write(chunk);
+    chunk[0] = 0x78;
+    await a.write(utf8("two"));
+    await a.end();
+    assert.deepEqual(await readAll(b), ["one", "two"]);
+  });
+
+  test("works in both directions; capabilities is {}", async () => {
+    const [a, b] = pair();
+    await b.write(utf8("back"));
+    assert.equal(new TextDecoder().decode((await a.read())?.bytes), "back");
+    assert.deepEqual(a.capabilities, {});
+  });
+
+  test("backpressure: write() waits until the peer reads below highWaterMark", async () => {
+    const [a, b] = pair({ highWaterMark: 4 });
+    assert.equal(await state(a.write(utf8("1234"))), "resolved");
+    const w = a.write(utf8("5"));
+    assert.equal(await state(w), "pending");
+    await b.read();
+    assert.equal(await state(w), "resolved");
+  });
+
+  test("highWaterMark 0: every write waits for its read", async () => {
+    const [a, b] = pair({ highWaterMark: 0 });
+    const w = a.write(utf8("x"));
+    assert.equal(await state(w), "pending");
+    await b.read();
+    assert.equal(await state(w), "resolved");
+  });
+
+  test("end(): peer reads queued bytes then null; later writes reject; closed after both ends", async () => {
+    const [a, b] = pair();
+    await a.write(utf8("last"));
+    await a.end();
+    await assert.rejects(a.write(utf8("x")), ConnectionClosedError);
+    assert.deepEqual(await readAll(b), ["last"]);
+    assert.equal(await b.read(), null);
+    assert.equal(await state(a.closed), "pending"); // a has ended but not read EOF
+    await b.write(utf8("reply")); // half-closed: b can still write
+    await b.end();
+    assert.deepEqual(await readAll(a), ["reply"]);
+    assert.equal(await state(a.closed), "resolved");
+    assert.equal(await state(b.closed), "resolved");
+  });
+
+  test("close(): own pending read → null, pending writes reject, peer drains then null, peer writes reject", async () => {
+    const [a, b] = pair({ highWaterMark: 0 });
+    const read = a.read();
+    const blocked = b.write(utf8("to a"));
+    // b's write was handed to a's pending read directly.
+    assert.equal(new TextDecoder().decode((await read)?.bytes), "to a");
+    assert.equal(await state(blocked), "resolved");
+    const queued = a.write(utf8("queued for b"));
+    const pendingRead = a.read();
+    const reason = new Error("bye");
+    a.close(reason);
+    assert.equal(await pendingRead, null);
+    const rejected = await queued.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(rejected instanceof ConnectionClosedError);
+    assert.equal(rejected.cause, reason);
+    assert.equal(await a.read(), null);
+    await assert.rejects(a.write(utf8("x")), ConnectionClosedError);
+    assert.deepEqual(await readAll(b), ["queued for b"]);
+    await assert.rejects(b.write(utf8("x")), ConnectionClosedError);
+    assert.equal(await state(a.closed), "resolved");
+    assert.equal(await state(b.closed), "pending");
+    b.close();
+    b.close(); // idempotent
+    assert.equal(await state(b.closed), "resolved");
+  });
+
+  test("the peer's pending write rejects when this side closes", async () => {
+    const [a, b] = pair({ highWaterMark: 0 });
+    const w = b.write(utf8("never read"));
+    a.close();
+    await assert.rejects(w, ConnectionClosedError);
+  });
+
+  test("concurrent read() is a TypeError", async () => {
+    const [a] = pair();
+    void a.read();
+    await assert.rejects(a.read(), TypeError);
+    a.close();
+  });
+
+  test("highWaterMark must be a non-negative integer", () => {
+    assert.throws(() => pair({ highWaterMark: -1 }), RangeError);
+  });
+});
+
+describe("faulty()", () => {
+  async function received(plan: Parameters<typeof faulty>[1], chunks: string[]): Promise<number[][]> {
+    const [a, b] = pair();
+    const fb = faulty(b, plan);
+    for (const c of chunks) await a.write(utf8(c));
+    await a.end();
+    const out: number[][] = [];
+    for (let c = await fb.read(); c !== null; c = await fb.read()) out.push([...c.bytes]);
+    return out;
+  }
+
+  test("splitReads every-byte, max size, function", async () => {
+    assert.deepEqual(await received({ splitReads: "every-byte" }, ["abc"]), [[97], [98], [99]]);
+    assert.deepEqual(await received({ splitReads: 2 }, ["abcde"]), [[97, 98], [99, 100], [101]]);
+    assert.deepEqual(await received({ splitReads: () => [3, 1, 1, 99, 0] }, ["abcde"]), [[97], [98, 99], [100, 101]]);
+  });
+
+  test("splitWrites splits what this side sends", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { splitWrites: "every-byte" });
+    await fa.write(utf8("xyz"));
+    await fa.end();
+    assert.deepEqual(await readAll(b), ["x", "y", "z"]);
+  });
+
+  test("resetAfterReadBytes: delivers up to the limit, then rejects and closes the inner channel", async () => {
+    const [a, b] = pair();
+    const fb = faulty(b, { resetAfterReadBytes: 5 });
+    await a.write(utf8("abc"));
+    await a.write(utf8("defgh"));
+    assert.equal(new TextDecoder().decode((await fb.read())?.bytes), "abc");
+    assert.equal(new TextDecoder().decode((await fb.read())?.bytes), "de");
+    await assert.rejects(
+      fb.read(),
+      (e: unknown) => e instanceof ConnectionClosedError && e.message === "connection reset (faulty)",
+    );
+    await fb.closed;
+    await assert.rejects(a.write(utf8("x")), ConnectionClosedError); // the peer sees the close
+  });
+
+  test("resetAfterWriteBytes: bytes beyond the limit are not written", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { resetAfterWriteBytes: 4 });
+    await fa.write(utf8("ab"));
+    await assert.rejects(fa.write(utf8("cdef")), ConnectionClosedError);
+    assert.deepEqual(await readAll(b), ["ab", "cd"]);
+  });
+
+  test("after a write reset every later write rejects, also a zero-length one", async () => {
+    const [a] = pair();
+    let innerWrites = 0;
+    // An inner channel that would accept writes even after close(): the rejection must come from faulty().
+    const inner: ByteChannel = {
+      read: () => a.read(),
+      end: () => a.end(),
+      close: (reason?: unknown) => {
+        a.close(reason);
+      },
+      closed: a.closed,
+      capabilities: a.capabilities,
+      write: () => {
+        innerWrites++;
+        return Promise.resolve();
+      },
+    };
+    const fa = faulty(inner, { resetAfterWriteBytes: 2 });
+    await assert.rejects(fa.write(utf8("abc")), ConnectionClosedError);
+    assert.equal(innerWrites, 1);
+    await assert.rejects(fa.write(new Uint8Array(0)), ConnectionClosedError);
+    await assert.rejects(fa.write(utf8("x")), ConnectionClosedError);
+    assert.equal(innerWrites, 1);
+  });
+
+  test("concurrent writes are serialized: split every byte, they never interleave", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { splitWrites: "every-byte" });
+    const w1 = fa.write(utf8("abc"));
+    const w2 = fa.write(utf8("xyz"));
+    await Promise.all([w1, w2]);
+    await fa.end();
+    assert.deepEqual(await readAll(b), ["a", "b", "c", "x", "y", "z"]);
+  });
+
+  test("concurrent writes are serialized: a delay resolving out of order does not reorder them", async () => {
+    const [a, b] = pair();
+    let calls = 0;
+    let release: () => void = () => undefined;
+    // The first delay resolves last: without serialization the second write would overtake the first.
+    const delay = (): Promise<void> => {
+      calls++;
+      return calls === 1
+        ? new Promise((r) => {
+            release = r;
+          })
+        : Promise.resolve();
+    };
+    const fa = faulty(a, { delay });
+    const w1 = fa.write(utf8("first"));
+    const w2 = fa.write(utf8("second"));
+    await tick();
+    assert.equal(calls, 1); // the second write has not started: the first one's delay is still pending
+    release();
+    await Promise.all([w1, w2]);
+    assert.equal(calls, 2);
+    await fa.end();
+    assert.deepEqual(await readAll(b), ["first", "second"]);
+  });
+
+  test("a failed write does not block the writes queued behind it", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { splitWrites: 1 });
+    b.close(); // a's writes now reject
+    const w1 = fa.write(utf8("ab"));
+    const w2 = fa.write(utf8("cd"));
+    await assert.rejects(w1, ConnectionClosedError);
+    await assert.rejects(w2, ConnectionClosedError);
+  });
+
+  test("delay is awaited before every read and write", async () => {
+    const [a, b] = pair();
+    let calls = 0;
+    const delay = (): Promise<void> => {
+      calls++;
+      return new Promise((r) => setTimeout(r, 1));
+    };
+    const fa = faulty(a, { delay });
+    const fb = faulty(b, { delay });
+    await fa.write(utf8("hi"));
+    await fb.read();
+    assert.equal(calls, 2);
+  });
+
+  test("closed, end, close and capabilities delegate", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, {});
+    assert.equal(fa.capabilities, a.capabilities);
+    fa.close();
+    await fa.closed;
+    await assert.rejects(b.write(utf8("x")), ConnectionClosedError);
+  });
+
+  test("read() after close() is null: split pieces not yet delivered are dropped", async () => {
+    const [a, b] = pair();
+    const fb = faulty(b, { splitReads: "every-byte" });
+    await a.write(utf8("abc"));
+    assert.deepEqual([...((await fb.read())?.bytes ?? [])], [97]);
+    fb.close();
+    assert.equal(await fb.read(), null);
+    assert.equal(await fb.read(), null);
+  });
+
+  test("a read waiting for its delay gives null when close() comes meanwhile", async () => {
+    const [a, b] = pair();
+    let calls = 0;
+    let release: () => void = () => undefined;
+    // The first read's delay is immediate, the second one waits for release().
+    const delay = (): Promise<void> =>
+      ++calls === 1
+        ? Promise.resolve()
+        : new Promise((r) => {
+            release = r;
+          });
+    const fb = faulty(b, { splitReads: "every-byte", delay });
+    await a.write(utf8("data"));
+    assert.deepEqual([...((await fb.read())?.bytes ?? [])], [100]);
+    const read = fb.read(); // "a" is pending in the split pieces
+    await tick();
+    fb.close();
+    release();
+    assert.equal(await read, null);
+  });
+
+  test("end() waits for the queued writes: a delayed write still arrives before EOF", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { delay: () => new Promise((r) => setTimeout(r, 1)) });
+    const w = fa.write(utf8("oneway call"));
+    await fa.end();
+    await w;
+    assert.deepEqual(await readAll(b), ["oneway call"]);
+  });
+
+  test("end() still ends the channel when a queued write failed", async () => {
+    const [a] = pair();
+    const events: string[] = [];
+    const inner: ByteChannel = {
+      read: () => a.read(),
+      end: () => {
+        events.push("end");
+        return Promise.resolve();
+      },
+      close: (reason?: unknown) => {
+        a.close(reason);
+      },
+      closed: a.closed,
+      capabilities: a.capabilities,
+      write: () => {
+        events.push("write");
+        return Promise.reject(new Error("write failed"));
+      },
+    };
+    const fa = faulty(inner, { delay: () => new Promise((r) => setTimeout(r, 1)) });
+    const w = fa.write(utf8("x"));
+    await fa.end();
+    await assert.rejects(w, /write failed/);
+    assert.deepEqual(events, ["write", "end"]);
+  });
+
+  test("close() is immediate: queued writes reject and nothing more reaches the peer", async () => {
+    const [a, b] = pair();
+    const fa = faulty(a, { delay: () => new Promise((r) => setTimeout(r, 1)) });
+    const reason = new Error("bye");
+    const w = fa.write(utf8("queued"));
+    fa.close(reason);
+    const rejected = await w.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    assert.ok(rejected instanceof ConnectionClosedError);
+    assert.equal(rejected.cause, reason);
+    assert.deepEqual(await readAll(b), []);
+  });
+
+  test("writes after close() reject, also a zero-length one", async () => {
+    const [a] = pair();
+    let innerWrites = 0;
+    // An inner channel that would accept writes even after close(): the rejection must come from faulty().
+    const inner: ByteChannel = {
+      read: () => a.read(),
+      end: () => a.end(),
+      close: (reason?: unknown) => {
+        a.close(reason);
+      },
+      closed: a.closed,
+      capabilities: a.capabilities,
+      write: () => {
+        innerWrites++;
+        return Promise.resolve();
+      },
+    };
+    const fa = faulty(inner, {});
+    fa.close();
+    await assert.rejects(fa.write(new Uint8Array(0)), ConnectionClosedError);
+    await assert.rejects(fa.write(utf8("x")), ConnectionClosedError);
+    assert.equal(innerWrites, 0);
+  });
+
+  test("close() after the inner read resolved but before read() continues: null, no pieces kept", async () => {
+    const [a] = pair();
+    let innerReads = 0;
+    // An inner channel whose read has data at once and would keep giving it after close().
+    const inner: ByteChannel = {
+      read: () => {
+        innerReads++;
+        return Promise.resolve({ bytes: utf8("abc") });
+      },
+      end: () => a.end(),
+      close: (reason?: unknown) => {
+        a.close(reason);
+      },
+      closed: a.closed,
+      capabilities: a.capabilities,
+      write: () => Promise.resolve(),
+    };
+    const fb = faulty(inner, { splitReads: "every-byte" });
+    const read = fb.read(); // the inner read has resolved; the continuation has not run yet
+    fb.close();
+    assert.equal(await read, null);
+    assert.equal(await fb.read(), null);
+    assert.equal(innerReads, 1);
+  });
+
+  test("bad plans are RangeErrors", () => {
+    const [a] = pair();
+    assert.throws(() => faulty(a, { splitReads: 0 }), RangeError);
+    assert.throws(() => faulty(a, { splitWrites: 1.5 }), RangeError);
+    assert.throws(() => faulty(a, { resetAfterReadBytes: -1 }), RangeError);
+  });
+
+  test("a message split at every byte still frames correctly end to end", async () => {
+    const [a, b] = pair();
+    const fb = faulty(b, { splitReads: "every-byte" });
+    await a.write(concat([utf8('{"a":1}'), new Uint8Array([0])]));
+    await a.end();
+    const bytes: number[] = [];
+    for (let c = await fb.read(); c !== null; c = await fb.read()) bytes.push(...c.bytes);
+    assert.equal(bytes.length, 8);
+  });
+});

@@ -1,0 +1,270 @@
+// `validate-idl`, `format` and `codegen` (DESIGN.md §4.14): the IDL tools over files or stdin (`-`).
+import { randomBytes } from "node:crypto";
+import { chmod, chown, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { generate, generateFromService, type GeneratedFile, type GenerateOptions } from "../codegen/index.ts";
+import { formatInterface, IdlSyntaxError, isInterfaceName, parseInterface, type Interface } from "../core/idl/index.ts";
+import { callFailure, callOrFail, expectArgs, failureReason, withTarget, type Context } from "./context.ts";
+import { CliError, decodeUtf8, describeError, readAll, UsageError } from "./io.ts";
+
+const GET_INTERFACE_DESCRIPTION = "org.varlink.service.GetInterfaceDescription";
+const STDIN_NAME = "<stdin>";
+
+interface Input {
+  /** For messages: the path, or `<stdin>`. */
+  readonly name: string;
+  readonly text: string;
+}
+
+/**
+ * Stops a local command once io.signal aborted (throws its reason; run() maps it to 130/143). run() returns at the
+ * first signal already; this keeps the rest of a multi-file `format -i` or `codegen -o` from going on unobserved.
+ */
+function stopIfSignalled(ctx: Context): void {
+  ctx.io.signal?.throwIfAborted();
+}
+
+/** Reads FILE, or stdin for `-`. @throws {CliError} on a read error or invalid UTF-8. */
+async function readInput(ctx: Context, file: string): Promise<Input> {
+  stopIfSignalled(ctx);
+  const name = file === "-" ? STDIN_NAME : file;
+  let bytes: Uint8Array;
+  try {
+    bytes = file === "-" ? await readAll(ctx.io.stdin, ctx.io.signal) : await readFile(file);
+  } catch (e) {
+    if (ctx.io.signal?.aborted === true) throw e;
+    throw new CliError(
+      file === "-"
+        ? `Failed to read interface description from stdin: ${describeError(e)}`
+        : `Failed to read interface description file '${file}': ${describeError(e)}`,
+    );
+  }
+  try {
+    return { name, text: decodeUtf8(bytes) };
+  } catch {
+    throw new CliError(`${name}: not valid UTF-8`);
+  }
+}
+
+/** `NAME:LINE:COL: reason` (or `NAME: reason` without a position) for an IDL error. */
+function idlFailure(name: string, e: IdlSyntaxError): CliError {
+  const at = e.position === undefined ? "" : `:${String(e.position.line)}:${String(e.position.column)}`;
+  return new CliError(`${name}${at}: ${e.reason}`);
+}
+
+/** Parses and validates. @throws {CliError} as {@link idlFailure}. */
+function parseOrFail(input: Input): Interface {
+  try {
+    return parseInterface(input.text);
+  } catch (e) {
+    if (e instanceof IdlSyntaxError) throw idlFailure(input.name, e);
+    throw e;
+  }
+}
+
+/** Checks that stdin (`-`) is named at most once. */
+function checkStdinOnce(files: readonly string[]): void {
+  if (files.filter((f) => f === "-").length > 1) throw new UsageError("Standard input ('-') can only be read once.");
+}
+
+/** `validate-idl [FILE]`: parse + validate; print the canonical formatting unless `-q`. */
+export async function validateIdl(ctx: Context): Promise<number> {
+  expectArgs(ctx, 0, 1);
+  const iface = parseOrFail(await readInput(ctx, ctx.cli.args[0] ?? "-"));
+  if (!ctx.cli.quiet) await ctx.out(formatInterface(iface));
+  return 0;
+}
+
+/** Errors creating the temp file that mean "cannot make one here" (not "cannot write at all"): write in place. */
+const NO_TEMP_FILE = new Set(["EACCES", "EPERM", "EROFS", "ENAMETOOLONG"]);
+
+/**
+ * Replaces `file` with `text` atomically: a uniquely named temp file in the same directory (the original's mode, and
+ * owner where we may set it), renamed over it, so a failure (ENOSPC, a crash) leaves the original whole. The temp file
+ * is removed on failure. Written in place instead (not atomic) when the file has other hard links (a rename would
+ * split them) or the temp file cannot be created (a writable file in a read-only directory).
+ */
+async function replaceFile(file: string, text: string): Promise<void> {
+  // Through a symlink: the file it points to is replaced, not the link.
+  const target = await realpath(file);
+  const st = await stat(target);
+  if (st.nlink > 1) {
+    await writeFile(target, text);
+    return;
+  }
+  const mode = st.mode & 0o7777;
+  // Short, so a long-but-valid name still leaves room: `.<first 32 code points>.<8 hex>.tmp`.
+  const prefix = Array.from(basename(target)).slice(0, 32).join("");
+  const temp = join(dirname(target), `.${prefix}.${randomBytes(4).toString("hex")}.tmp`);
+  try {
+    await writeFile(temp, text, { mode, flag: "wx" });
+  } catch (e) {
+    const code = String((e as NodeJS.ErrnoException).code);
+    // Created but not written (ENOSPC): remove it. EEXIST: someone else's file, left alone.
+    if (code !== "EEXIST") await rm(temp, { force: true }).catch(() => undefined);
+    if (!NO_TEMP_FILE.has(code)) throw e;
+    await writeFile(target, text);
+    return;
+  }
+  try {
+    // Best effort: keep the owner (only root or the owner of both may). Any error is ignored (EPERM for a
+    // non-owner, EINVAL for an owner unmapped in a user namespace, others on network/FUSE filesystems).
+    await chown(temp, st.uid, st.gid).catch(() => undefined);
+    // writeFile's mode is filtered by the umask; set it exactly (after chown, which may clear setuid/setgid).
+    await chmod(temp, mode);
+    await rename(temp, target);
+  } catch (e) {
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw e;
+  }
+}
+
+/** `format [FILE…]`: print the canonical formatting; `--check` names the files that differ; `-i` rewrites them. */
+export async function format(ctx: Context): Promise<number> {
+  const files = ctx.cli.args.length === 0 ? ["-"] : ctx.cli.args;
+  checkStdinOnce(files);
+  if (ctx.cli.inPlace && files.includes("-")) throw new UsageError("--in-place cannot rewrite standard input.");
+  let status = 0;
+  let printed = false;
+  for (const file of files) {
+    let input: Input;
+    let formatted: string;
+    try {
+      input = await readInput(ctx, file);
+      formatted = formatInterface(parseOrFail(input));
+    } catch (e) {
+      if (!(e instanceof CliError)) throw e;
+      await ctx.err(e.message);
+      status = 1;
+      continue;
+    }
+    if (ctx.cli.check) {
+      if (formatted !== input.text) {
+        await ctx.err(`${input.name}: not canonically formatted`);
+        status = 1;
+      }
+    } else if (ctx.cli.inPlace) {
+      if (formatted !== input.text) {
+        stopIfSignalled(ctx);
+        try {
+          await replaceFile(file, formatted);
+        } catch (e) {
+          await ctx.err(`Failed to write '${file}': ${describeError(e)}`);
+          status = 1;
+        }
+      }
+    } else {
+      // Several files: separated by a blank line, like `introspect`.
+      if (printed) await ctx.out("\n");
+      printed = true;
+      await ctx.out(formatted);
+    }
+  }
+  return status;
+}
+
+function generateOrFail(name: string, idl: string, options: GenerateOptions): GeneratedFile {
+  try {
+    return generate(idl, options);
+  } catch (e) {
+    if (e instanceof IdlSyntaxError) throw idlFailure(name, e);
+    if (e instanceof TypeError) throw new CliError(`codegen: ${e.message}`);
+    throw e;
+  }
+}
+
+/** Generated files from a running service (`--address`). */
+async function fromService(
+  ctx: Context,
+  address: string,
+  names: readonly string[],
+  options: GenerateOptions,
+): Promise<GeneratedFile[]> {
+  for (const name of names)
+    if (!isInterfaceName(name)) throw new CliError(`Not a valid Varlink interface name: '${name}'`);
+  return withTarget(ctx, address, async (target, dl) => {
+    const files: GeneratedFile[] = [];
+    for (const name of names) {
+      const conn = target.connection;
+      let file: GeneratedFile;
+      if (conn !== undefined) {
+        try {
+          file = await generateFromService(conn, name, { ...options, signal: dl.signal });
+        } catch (e) {
+          if (e instanceof IdlSyntaxError) throw idlFailure(`the description of ${name}`, e);
+          if (e instanceof TypeError) throw new CliError(`codegen: ${e.message}`);
+          throw callFailure(GET_INTERFACE_DESCRIPTION, e, dl);
+        }
+      } else {
+        let service: string | undefined;
+        try {
+          service = await target.introspectionService(name);
+        } catch (e) {
+          throw new CliError(`Failed to reach the service: ${failureReason(e, dl)}`);
+        }
+        const reply = await callOrFail(target, dl, GET_INTERFACE_DESCRIPTION, { interface: name }, service);
+        const description = reply["description"];
+        if (typeof description !== "string")
+          throw new CliError(`Invalid ${GET_INTERFACE_DESCRIPTION}() reply: 'description' is not a string.`);
+        file = generateOrFail(`the description of ${name}`, description, options);
+        if (file.interfaceName !== name)
+          throw new CliError(`codegen: the description of ${name} declares interface ${file.interfaceName}`);
+      }
+      files.push(file);
+    }
+    return files;
+  });
+}
+
+/** `codegen FILE… [-o DIR]` and `codegen --address ADDRESS INTERFACE… [-o DIR]`. */
+export async function codegen(ctx: Context): Promise<number> {
+  const options: GenerateOptions = { ints: ctx.cli.ints ?? "number", importPath: ctx.cli.importPath ?? "varlink-js" };
+  const out = ctx.cli.output;
+  expectArgs(ctx, 1, Infinity);
+  if (out === undefined && ctx.cli.args.length > 1)
+    throw new UsageError("Without -o DIR, codegen takes one input (the code goes to stdout).");
+  let files: GeneratedFile[];
+  if (ctx.cli.address !== undefined) {
+    files = await fromService(ctx, ctx.cli.address, ctx.cli.args, options);
+  } else {
+    checkStdinOnce(ctx.cli.args);
+    files = [];
+    for (const file of ctx.cli.args) {
+      const input = await readInput(ctx, file);
+      files.push(generateOrFail(input.name, input.text, options));
+    }
+  }
+  // Lowercased: on a case-insensitive file system (macOS, Windows) `a.B.ts` and `a.b.ts` are one file. Checked before
+  // anything is written.
+  const seen = new Map<string, string>();
+  for (const f of files) {
+    const other = seen.get(f.fileName.toLowerCase());
+    if (other === f.interfaceName) throw new CliError(`codegen: interface ${f.interfaceName} is given more than once.`);
+    if (other !== undefined)
+      throw new CliError(
+        `codegen: interfaces ${other} and ${f.interfaceName} would write the same file (case-insensitively).`,
+      );
+    seen.set(f.fileName.toLowerCase(), f.interfaceName);
+  }
+  if (out === undefined) {
+    for (const f of files) await ctx.out(f.code);
+    return 0;
+  }
+  stopIfSignalled(ctx);
+  try {
+    await mkdir(out, { recursive: true });
+  } catch (e) {
+    throw new CliError(`Failed to create '${out}': ${describeError(e)}`);
+  }
+  for (const f of files) {
+    stopIfSignalled(ctx);
+    const path = join(out, f.fileName);
+    try {
+      await writeFile(path, f.code);
+    } catch (e) {
+      throw new CliError(`Failed to write '${path}': ${describeError(e)}`);
+    }
+    if (!ctx.cli.quiet) await ctx.err(path);
+  }
+  return 0;
+}

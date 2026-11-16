@@ -1,0 +1,66 @@
+interface org.example.complex
+
+type Enum (enum, b, c)
+
+type Type (type, b, c)
+
+type TypeEnum (type, b, c)
+
+type Interface (interface, b, c)
+
+type ReservedEnum (self, Self, crate, super)
+
+type Reserved (
+  self: ?string,
+  Self: ?int,
+  crate: string,
+  super: bool
+)
+
+type TypeFoo (
+  bool: bool,
+  int: int,
+  float: float,
+  string: string,
+  enum: ?[string]?(foo, bar, baz),
+  type: ?TypeEnum,
+  anon: (
+    foo: bool,
+    bar: int,
+    baz: [](a: int, b: int)
+  ),
+  object: object,
+  stringset: [string]()
+)
+
+method Foo(
+  enum: (b: bool, c: int),
+  foo: TypeFoo,
+  interface: Interface
+) -> (
+  a: [](b: bool, c: int),
+  foo: TypeFoo,
+  interface: Interface
+)
+
+method Bar() -> ()
+
+method Baz(
+  self: ?Reserved,
+  type: ReservedEnum
+) -> (
+  self: ?Reserved
+)
+
+error ErrorFoo (
+  enum: (
+    b: bool,
+    c: int,
+    interface: Interface
+  ),
+  foo: TypeFoo,
+  bar: (type, enum, int, bool, string, if, let),
+  interface: Interface
+)
+
+error ErrorBar ()

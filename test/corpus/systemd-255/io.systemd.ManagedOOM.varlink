@@ -1,0 +1,14 @@
+interface io.systemd.ManagedOOM
+
+type ControlGroup(
+	mode: string,
+	path: string,
+	property: string,
+	limit: ?int
+)
+
+method SubscribeManagedOOMCGroups() -> (
+	cgroups: []ControlGroup
+)
+
+error SubscriptionTaken()
