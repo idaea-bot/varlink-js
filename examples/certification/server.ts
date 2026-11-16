@@ -1,5 +1,7 @@
 // The org.varlink.certification server: `node examples/certification/server.ts --varlink=<address>`.
 // Prints `Listening on <address>` once listening (tcp: the real port); SIGINT/SIGTERM shut it down gracefully.
+// Repo-internal: ./certification.ts re-exports src/cli/certification.ts, which is not a package export (it runs
+// from a checkout of this repository, not against the published `varlink-js` package).
 import { parseArgs } from "node:util";
 import { listen } from "../../src/node/index.ts";
 import { createCertificationServer, describeError } from "./certification.ts";

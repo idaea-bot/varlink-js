@@ -16,9 +16,12 @@ import {
   ORG_VARLINK_SERVICE_IDL,
   ProtocolError,
   VarlinkError,
+  type ByteChannel,
   type CallContext,
+  type FdHandle,
   type InterfaceDescriptor,
   type MethodDescriptor,
+  type ReadChunk,
 } from "../../../src/index.ts";
 import { IdlSyntaxError } from "../../../src/idl/index.ts";
 import {
@@ -29,7 +32,18 @@ import {
   type ServerOptions,
 } from "../../../src/rpc/index.ts";
 import { faulty, pair } from "../../../src/testing/index.ts";
-import { concat, controllable, isPending, MemoryListener, MessageReader, msg, settle, sleep, utf8 } from "./helpers.ts";
+import {
+  concat,
+  controllable,
+  isPending,
+  MemoryListener,
+  MessageReader,
+  msg,
+  settle,
+  sleep,
+  texts,
+  utf8,
+} from "./helpers.ts";
 
 const IDL = `# A test interface. Comments are served verbatim.
 interface org.example.s
@@ -429,6 +443,79 @@ describe("Server: connection errors and limits", () => {
     assert.deepEqual(await replies, [{}, { text: "1" }, { text: "2" }, { text: "3" }]);
     await a.end();
     await handled;
+  });
+
+  test("maxQueuedFds: reading stops while buffered calls hold that many fds (fd-carrying channel)", async () => {
+    const { server } = makeServer({ maxQueuedFds: 1, allowFdPassingInput: true });
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    server.addInterface(IDL, { Wait: () => gate.then(() => ({})), Echo: (p) => p });
+    let closedFds = 0;
+    const fd = (n: number): FdHandle => ({
+      fd: n,
+      close: () => {
+        closedFds++;
+      },
+    });
+    // One message per read, each with one fd (as the native channel reads with fd input on).
+    const chunks: (ReadChunk | null)[] = [
+      { bytes: msg({ method: "org.example.s.Wait" }), fds: [fd(10)] },
+      { bytes: msg({ method: "org.example.s.Echo", parameters: { text: "1" } }), fds: [fd(11)] },
+      { bytes: msg({ method: "org.example.s.Echo", parameters: { text: "2" } }), fds: [fd(12)] },
+      null,
+    ];
+    let reads = 0;
+    const written: Uint8Array[] = [];
+    let accept: boolean | undefined;
+    let resolveClosed: () => void = () => undefined;
+    const closed = new Promise<void>((r) => {
+      resolveClosed = r;
+    });
+    const channel: ByteChannel = {
+      read: () => {
+        reads++;
+        return Promise.resolve(chunks.shift() ?? null);
+      },
+      write: (chunk) => {
+        written.push(chunk);
+        return Promise.resolve();
+      },
+      end: () => {
+        resolveClosed();
+        return Promise.resolve();
+      },
+      close: () => {
+        resolveClosed();
+      },
+      closed,
+      capabilities: {
+        fdPassing: {
+          setAcceptInput: (on) => {
+            accept = on;
+          },
+          setAllowOutput: () => undefined,
+          duplicate: () => {
+            throw new Error("not used");
+          },
+        },
+      },
+    };
+    const handled = server.handle(channel);
+    await settle();
+    assert.equal(accept, true);
+    // Wait (fd 10) is dispatched and blocked; Echo 1 (fd 11) is buffered and reaches the bound: no third read.
+    assert.equal(reads, 2);
+    release();
+    await handled;
+    assert.equal(reads, 4);
+    assert.deepEqual(
+      texts(concat(written)).map((t) => (JSON.parse(t) as { parameters?: unknown }).parameters),
+      [{}, { text: "1" }, { text: "2" }],
+    );
+    // Nobody claimed the fds: each is closed when its call is done.
+    assert.equal(closedFds, 3);
   });
 
   test("a full call queue: taking a call wakes the reader, so a failing read (reset) aborts the handler", async () => {

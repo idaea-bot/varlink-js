@@ -209,7 +209,8 @@ describe("encodeCall", () => {
       { method: M, ext: { noDot: 1 } },
       { method: M, ext: [] },
       { method: M, parameters: { n: Number.NaN } },
-      { method: M, ext: { "a.b": Infinity } },
+      // A plain-object value passes the ext checks: the codec rejects the non-finite number inside it.
+      { method: M, ext: { "a.b": { x: Infinity } } },
     ];
     for (const init of bad) assert.throws(() => encodeCall(init as CallInit, jsonCodec), TypeError);
   });

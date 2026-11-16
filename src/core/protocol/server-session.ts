@@ -106,8 +106,10 @@ export class ServerSession {
    * most about 2 × maxMessageSize + one read chunk; as the framer's buffer doubles, its capacity is about
    * 4 × maxMessageSize in the worst case while reading, and drops back once the messages are consumed.
    * Likewise for fds (M11): false while at least one complete message is buffered and the buffered, not yet
-   * dispatched calls hold maxQueuedFds received fds or more (fds a call event handed out no longer count). So a
-   * connection holds at most maxQueuedFds - 1 + one read's fds (the kernel caps one message at 253, SCM_MAX_FD).
+   * dispatched calls hold maxQueuedFds received fds or more (fds a call event handed out no longer count). So the
+   * framer holds at most maxQueuedFds - 1 + one read's fds (the kernel caps one message at 253, SCM_MAX_FD), plus
+   * the fds of the call being handled (outside the framer): at the default about 252 + 253 + 253 = 758 per
+   * connection in the worst case (sd-varlink, reading one message at a time, holds 253).
    */
   get wantsInput(): boolean {
     const complete = this.#framer.completeMessages;

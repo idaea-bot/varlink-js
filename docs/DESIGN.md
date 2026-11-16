@@ -1764,9 +1764,10 @@ other error replies' fds are closed.
 The framer counts the fds it holds for messages not yet returned (`queuedFds`); `ServerSession.wantsInput` is false
 while a complete call is buffered and that count reaches `maxQueuedFds` (server option, default 253 = SCM_MAX_FD), so
 the reader parks until the dispatcher takes calls (their fds then belong to the handler and no longer count). A
-partial message keeps reading, so one message carrying more than the bound is still accepted. This caps the fds a
-connection pins while its handler is busy at about the bound plus one message's (sd-varlink, reading one message at a
-time, holds at most 253), instead of `maxQueuedCalls` × 253.
+partial message keeps reading, so one message carrying more than the bound is still accepted. So the framer holds at
+most `maxQueuedFds` − 1 + one read's fds (at most 253), plus the fds of the call being handled (`ctx.fds`, outside the
+framer): at the default about 252 + 253 + 253 = 758 per connection in the worst case (sd-varlink, reading one message
+at a time, holds at most 253), instead of `maxQueuedCalls` × 253.
 Dispatch gives handlers `ctx.fds`, `ctx.takeFd(i, parameter = "fds")`, `ctx.pushFds(...fds)` and `ctx.peer` (§5.4),
 closes unclaimed received fds and unsent pushed duplicates when the call finished, and passes a reply's pushed fds
 to `send(bytes, fds)`. The `UpgradedChannel` is bytes only: it switches fd input off, closes fds that still come,
@@ -2086,9 +2087,10 @@ fds the kernel truncated (MSG_CTRUNC) are dropped and reported to `onError` as `
 Received fds are bounded per connection by `maxQueuedFds` (default 253, SCM_MAX_FD): while the calls buffered but not
 yet dispatched to a handler hold that many fds (with a complete call buffered), the connection stops reading
 (backpressure, as for `maxQueuedCalls`) and resumes once they are dispatched; fds a handler received (`ctx.fds`) no
-longer count. One message carrying more than the bound is still accepted (the kernel caps it at 253). Without the
-bound, 64 pipelined calls × 253 fds could pin about 16 000 fds per connection; sd-varlink reads one message at a time
-and holds at most 253. No
+longer count. One message carrying more than the bound is still accepted (the kernel caps it at 253). So the framer
+holds at most `maxQueuedFds` − 1 + one read's fds, plus the fds of the call being handled: at the default about
+252 + 253 + 253 = 758 per connection in the worst case. Without the bound, 64 pipelined calls × 253 fds could pin
+about 16 000 fds per connection; sd-varlink reads one message at a time and holds at most 253. No
 per-method or per-connection switch (sd's `sd_varlink_set_allow_fd_passing_*` from a connect callback): input must be
 decided before the call's bytes are read, and we have no connect callback.
 

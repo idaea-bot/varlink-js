@@ -78,7 +78,8 @@ codegen:
 ADDRESS: unix:/path, /path, ./path, unix:@abstract (Linux), tcp:host:port, exec:/path (spawn a service on a
 socket), ssh-unix:host:/path (alias ssh:), ssh-exec:host:command, ws(s)://…, http(s)://… (HTTP bridge).
 bridge takes unix:, unix:@ and tcp: only.
-Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM ('certify server': 0, it stops
+Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM; 'call --exec' returns the command's
+exit status (128 + the signal number if a signal ended it); 'certify server': 0 after a signal (it stops
 gracefully).
 `;
 

@@ -22,6 +22,11 @@ describe("help and version", () => {
       assert.equal(r.stdout, USAGE);
       assert.equal(r.stderr, "");
     }
+    // The exit statuses match the README, including call --exec's.
+    assert.match(
+      USAGE,
+      /'call --exec' returns the command's\nexit status \(128 \+ the signal number if a signal ended it\)/,
+    );
   });
 
   test("--version, -V: the package version", async () => {

@@ -361,7 +361,7 @@ subpaths above.
 |---|---|---|---|
 | Largest message (client, server, HTTP client) | 16 MiB | `maxMessageSize` | `test/docs/defaults.test.ts`, `test/unit/protocol/framer.test.ts` |
 | Complete calls buffered per server connection (then reading stops) | 64 | `maxQueuedCalls` (server) | `test/docs/defaults.test.ts`, `test/unit/protocol/server-session.test.ts` |
-| Received fds held by buffered, not yet dispatched calls per server connection (then reading stops; one message carrying more is still accepted) | 253 (`SCM_MAX_FD`) | `maxQueuedFds` (server, with `allowFdPassingInput`) | `test/unit/protocol/server-session.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
+| Received fds held by buffered, not yet dispatched calls per server connection (then reading stops; one message carrying more is still accepted). The framer holds at most `maxQueuedFds` − 1 + one read's fds, plus the fds of the call being handled: about 758 per connection in the worst case at the default (sd-varlink holds 253) | 253 (`SCM_MAX_FD`) | `maxQueuedFds` (server, with `allowFdPassingInput`) | `test/unit/protocol/server-session.test.ts`, `test/unit/rpc/server.test.ts`; `test/docs/defaults.test.ts` checks the constant's value only |
 | Open server connections (more are closed at once) | 4096 | `maxConnections` (server) | `test/docs/defaults.test.ts` |
 | Connections per UID | off (opt-in, as sd-varlink's `SD_VARLINK_SERVER_ACCOUNT_UID`; needs the native addon) | `maxConnectionsPerUid` (server) | `test/unit/rpc/server-peer.test.ts` |
 | Call timeout (clock starts at the head of the reply queue) | 45 s, 0 = none | `timeout` (connection, or per call) | `test/docs/defaults.test.ts`, `test/unit/rpc/connection.test.ts` |

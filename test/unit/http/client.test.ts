@@ -831,14 +831,20 @@ method Small() -> (n: int)
 method Big() -> (n: int)
 
 method Extra() -> (text: string)
+
+# [Supports 'more' flag]
+method Count(n: int) -> (i: int)
 `;
   const descriptor = (ints: "number" | "bigint"): InterfaceDescriptor => ({
     name: TYPED,
     idl: TYPED_IDL,
     ints,
-    methods: Object.fromEntries(
-      ["Small", "Big", "Extra"].map((name) => [name, { interface: TYPED, name, method: `${TYPED}.${name}` }]),
-    ),
+    methods: {
+      ...Object.fromEntries(
+        ["Small", "Big", "Extra"].map((name) => [name, { interface: TYPED, name, method: `${TYPED}.${name}` }]),
+      ),
+      Count: { interface: TYPED, name: "Count", method: `${TYPED}.Count`, more: "supports" },
+    },
     errors: {},
   });
   let server: ReturnType<typeof createServer>;
@@ -856,6 +862,11 @@ method Extra() -> (text: string)
       Small: () => ({ n: 5 }),
       Big: () => ({ n: 2n ** 60n + 1n }),
       Extra: () => ({ text: "t", extra: true }),
+      // eslint-disable-next-line @typescript-eslint/require-await -- a streaming handler without awaits
+      Count: async function* (p: { n: number }) {
+        for (let i = 0; i < p.n - 1; i++) yield { i };
+        return { i: p.n - 1 };
+      },
     });
     typedBridge = await startBridge({ backend: open, services: [TYPED] });
   });
@@ -885,6 +896,17 @@ method Extra() -> (text: string)
       assert.equal(r.status, "fulfilled");
       assert.deepEqual(r.value, { n: 5n });
     }
+  });
+
+  test('ints: "bigint": stream() records (json-seq) come back with bigint ints', async () => {
+    const desc = descriptor("bigint");
+    const method = desc.methods.Count as MethodDescriptor<{ n: bigint }, { i: bigint }>;
+    const client = createHttpClient(typedBridge.base, { ints: "bigint", interfaces: [desc] });
+    const records: unknown[] = [];
+    for await (const r of client.stream(method, { n: 3n })) records.push(r);
+    assert.deepEqual(records, [{ i: 0n }, { i: 1n }, { i: 2n }]);
+    assert.equal(typedBridge.requests.at(-1)?.query, "?more=true");
+    assert.equal(typedBridge.requests.at(-1)?.headers.accept, "application/json-seq, application/json;q=0.9");
   });
 
   test('ints: "number": an unsafe int is rejected', async () => {
