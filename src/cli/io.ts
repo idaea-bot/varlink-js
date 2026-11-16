@@ -1,6 +1,7 @@
 // The CLI's I/O seam (DESIGN.md §4.14): run() sees only a CliIo, never `process`, so it runs in-process under Node,
 // Bun and Deno (tests pass a fake one; main.ts passes nodeIo()). Plus the small helpers every command shares.
-import { DEFAULT_MAX_MESSAGE_SIZE } from "../core/protocol/index.ts";
+import { DEFAULT_MAX_MESSAGE_SIZE, type FdHandle } from "../core/protocol/index.ts";
+import type { NativeAddon } from "../node/native.ts";
 
 /** Standard input: chunks of bytes. */
 export interface CliInput extends AsyncIterable<Uint8Array> {
@@ -29,6 +30,33 @@ export interface CliIo {
   readonly stderr: CliOutput;
   readonly env: Readonly<Record<string, string | undefined>>;
   /** Aborted on SIGINT/SIGTERM, with the signal's name (`"SIGINT"`/`"SIGTERM"`) as the reason. */
+  readonly signal?: AbortSignal | undefined;
+  /**
+   * M11: loads the optional varlink-js-native addon (`call --push-fd=`/`--exec`); resolves undefined when it is not
+   * installed or cannot load here. Absent: no addon.
+   */
+  readonly loadNative?: (() => Promise<NativeAddon | undefined>) | undefined;
+  /**
+   * M11: duplicates an fd of this process (`--push-fd=N`, varlinkctl dups it too), or opens a path read-only
+   * (`--push-fd=/…`). Absent: `--push-fd=` is refused. Rejects with the system error.
+   */
+  readonly openPushFd?: ((spec: { fd: number } | { path: string }, native: NativeAddon) => FdHandle) | undefined;
+  /**
+   * M11: `call --exec`: runs `command` (see {@link ExecInput}) and resolves with its exit status (128 + the signal's
+   * number if a signal ended it). Absent: `--exec` is refused.
+   */
+  readonly exec?: ((command: readonly string[], input: ExecInput) => Promise<number>) | undefined;
+}
+
+/** What `call --exec` hands to the command (varlinkctl.c:1122-1170 at 6bd4689f). */
+export interface ExecInput {
+  /** The formatted reply: the command's stdin (a sealed memfd on Linux with the addon, else a pipe). */
+  readonly reply: Uint8Array;
+  /** The fds received with the reply: the command's fds 3, 4, … (`LISTEN_FDS`, `LISTEN_PID`). */
+  readonly fds: readonly FdHandle[];
+  readonly native: NativeAddon | undefined;
+  readonly env: Readonly<Record<string, string | undefined>>;
+  /** SIGINT/SIGTERM while the command runs: passed on to it. */
   readonly signal?: AbortSignal | undefined;
 }
 

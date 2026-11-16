@@ -1,7 +1,8 @@
 // Sans-IO client side of a connection (DESIGN.md §4.5, §4.10): pipelined calls matched FIFO to replies.
 import { ConnectionClosedError, ProtocolError, UpgradePendingError } from "../errors/local.ts";
 import { jsonCodec, type Codec } from "../types/codec.ts";
-import { Framer, frameMessage } from "./framer.ts";
+import type { FdHandle } from "./channel.ts";
+import { closeFds, Framer, frameMessage } from "./framer.ts";
 import { decodeReply, encodeCall, type CallInit, type Reply } from "./messages.ts";
 
 /** Options for {@link ClientSession}. */
@@ -20,8 +21,18 @@ export type ClientEvent =
       parameters: Record<string, unknown>;
       continues: boolean;
       ext: Record<string, unknown>;
+      /** fds that came with this reply (M11): owned by whoever handles the event (close them or hand them on). */
+      fds?: FdHandle[];
     }
-  | { type: "error"; id: number; error: string; parameters: Record<string, unknown>; ext: Record<string, unknown> }
+  | {
+      type: "error";
+      id: number;
+      error: string;
+      parameters: Record<string, unknown>;
+      ext: Record<string, unknown>;
+      /** fds that came with the error reply (M11): owned by whoever handles the event. */
+      fds?: FdHandle[];
+    }
   | { type: "upgraded"; id: number; parameters: Record<string, unknown>; ext: Record<string, unknown> }
   | { type: "failed"; id: number; error: ConnectionClosedError }
   | {
@@ -97,38 +108,75 @@ export class ClientSession {
     return { id, bytes };
   }
 
-  /** Bytes read from the peer. Returns the events they complete, in order. */
-  receive(bytes: Uint8Array): ClientEvent[] {
-    if (this.#state === "closed") return [];
+  /**
+   * Bytes read from the peer. Returns the events they complete, in order. `fds` are the chunk's (M11,
+   * {@link Framer.push}): a reply's fds come with its `reply` or `error` event; fds of an upgrade confirmation, and fds
+   * after the session closed or upgraded, are closed.
+   */
+  receive(bytes: Uint8Array, fds?: readonly FdHandle[]): ClientEvent[] {
+    if (this.#state === "closed") {
+      closeFds(fds);
+      return [];
+    }
     if (this.#remainder !== null) {
+      // Upgraded: the stream is bytes only.
+      closeFds(fds);
       if (bytes.length > 0) this.#remainder.push(bytes.slice());
       return [];
     }
-    this.#framer.push(bytes);
+    this.#framer.push(bytes, fds);
     const events: ClientEvent[] = [];
     for (;;) {
       let text: string | null;
       let reply: Reply;
+      let replyFds: FdHandle[];
       try {
         text = this.#framer.next();
         if (text === null) return events;
-        reply = decodeReply(this.#codec.decode(text));
+        replyFds = this.#framer.takeFds();
+        try {
+          reply = decodeReply(this.#codec.decode(text));
+        } catch (e) {
+          closeFds(replyFds);
+          throw e;
+        }
       } catch (e) {
         return this.#closeWith(events, asProtocolError(e));
       }
       const head = this.#queue[0];
-      if (head === undefined) return this.#closeWith(events, new ProtocolError("reply without a pending call"));
-      if (reply.continues && head.kind !== "more")
+      if (head === undefined) {
+        closeFds(replyFds);
+        return this.#closeWith(events, new ProtocolError("reply without a pending call"));
+      }
+      if (reply.continues && head.kind !== "more") {
+        closeFds(replyFds);
         return this.#closeWith(events, new ProtocolError('"continues" reply to a call without "more"'));
+      }
+      const withFds = replyFds.length > 0 ? { fds: replyFds } : {};
       if (reply.continues) {
-        events.push({ type: "reply", id: head.id, parameters: reply.parameters, continues: true, ext: reply.ext });
+        events.push({
+          type: "reply",
+          id: head.id,
+          parameters: reply.parameters,
+          continues: true,
+          ext: reply.ext,
+          ...withFds,
+        });
         continue;
       }
       this.#queue.shift();
       if (head.kind === "upgrade") this.#upgradePending = false;
       if (reply.error !== undefined) {
-        events.push({ type: "error", id: head.id, error: reply.error, parameters: reply.parameters, ext: reply.ext });
+        events.push({
+          type: "error",
+          id: head.id,
+          error: reply.error,
+          parameters: reply.parameters,
+          ext: reply.ext,
+          ...withFds,
+        });
       } else if (head.kind === "upgrade") {
+        closeFds(replyFds);
         let rest: Uint8Array;
         try {
           rest = this.#framer.takeRemainder();
@@ -140,7 +188,14 @@ export class ClientSession {
         events.push({ type: "upgraded", id: head.id, parameters: reply.parameters, ext: reply.ext });
         return events;
       } else {
-        events.push({ type: "reply", id: head.id, parameters: reply.parameters, continues: false, ext: reply.ext });
+        events.push({
+          type: "reply",
+          id: head.id,
+          parameters: reply.parameters,
+          continues: false,
+          ext: reply.ext,
+          ...withFds,
+        });
       }
     }
   }
@@ -177,6 +232,7 @@ export class ClientSession {
 
   #close(events: ClientEvent[], failure: ConnectionClosedError, error: ProtocolError | undefined): ClientEvent[] {
     this.#state = "closed";
+    this.#framer.discardFds();
     this.#upgradePending = false;
     for (const entry of this.#queue.splice(0)) events.push({ type: "failed", id: entry.id, error: failure });
     events.push(error === undefined ? { type: "closed" } : { type: "closed", error });

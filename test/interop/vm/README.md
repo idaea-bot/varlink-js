@@ -31,3 +31,10 @@ VARLINK_SSH_EXEC=/usr/lib/systemd/systemd-pcrextend npm test` (pcrextend needs r
 
 VM → localhost: `VARLINK_SSH_HOST=localhost VARLINK_SSH_EXEC="$(command -v node) $PWD/test/interop/vm/fixture-server.ts"
 npm test` (the fixture serves one stdio connection and exits).
+
+## fd passing (M11)
+
+`fds.sh` (a shell script, not part of `npm test`): `npm --prefix native run build`, then
+`VARLINKCTL=~/vl262/varlinkctl test/interop/vm/fds.sh` (varlinkctl ≥ 257 for `--push-fd=`/`--exec`; helper server
+`fds-server.ts`). One PASS/FAIL/INFO line per case, exit 1 on a failure; the last run is
+`results-fds-systemd-262.log`.

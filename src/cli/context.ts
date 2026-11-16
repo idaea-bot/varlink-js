@@ -13,6 +13,7 @@ import {
   type CliIo,
   type Deadline,
 } from "./io.ts";
+import type { NativeAddon } from "../node/native.ts";
 import { hasNonFinite, type JsonStyle } from "./json.ts";
 import { openTarget, type Target } from "./target.ts";
 
@@ -72,10 +73,15 @@ export function parseAddressArg(text: string): AddressSpec {
   }
 }
 
-/** Connects to `address`. @throws {CliError} `Failed to connect to ADDRESS: …`. */
-export async function connectTarget(address: string, spec: AddressSpec, dl: Deadline): Promise<Target> {
+/** Connects to `address` (`native`: M11, see openTarget). @throws {CliError} `Failed to connect to ADDRESS: …`. */
+export async function connectTarget(
+  address: string,
+  spec: AddressSpec,
+  dl: Deadline,
+  native?: NativeAddon,
+): Promise<Target> {
   try {
-    return await openTarget(spec, dl.signal);
+    return await openTarget(spec, dl.signal, native);
   } catch (e) {
     throw new CliError(`Failed to connect to ${address}: ${failureReason(e, dl)}`);
   }
@@ -130,11 +136,12 @@ export async function withTarget<T>(
   ctx: Context,
   address: string,
   fn: (target: Target, dl: Deadline) => Promise<T>,
+  native?: NativeAddon,
 ): Promise<T> {
   const spec = parseAddressArg(address);
   const dl = deadline(ctx);
   try {
-    const target = await connectTarget(address, spec, dl);
+    const target = await connectTarget(address, spec, dl, native);
     try {
       return await fn(target, dl);
     } finally {

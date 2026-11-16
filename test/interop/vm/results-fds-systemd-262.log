@@ -1,0 +1,14 @@
+varlinkctl: systemd 262 (262.2)
+system varlinkctl: systemd 255 (255.4-1ubuntu8.18)
+node: v24.22.3, kernel: 6.8.0-147-generic
+PASS a varlinkctl call --push-fd=3 -> varlink-js server (the server read the file through the fd)
+PASS a2 varlinkctl call --push-fd=/path -> varlink-js server
+PASS b varlinkctl --exec call -> varlink-js server (reply on stdin, fds 3 and 4, LISTEN_FDS/LISTEN_PID)
+PASS c varlink-js call --push-fd=3 -> varlink-js server
+PASS c2 varlink-js call --exec -> varlink-js server (same contract as varlinkctl's)
+INFO c2 parity: varlink-js --exec and varlinkctl --exec gave the command the same input
+PASS e varlinkctl call (no fd input) -> a reply with fds: the reply arrives, the fds are dropped
+PASS f1 varlinkctl call --push-fd=3 -> varlink-js server without fd input (default): the call runs, the fd is dropped
+INFO f2 varlinkctl call --push-fd=3 -> strict server without fd input: exit 0, stdout '{"n":0}', stderr ''
+INFO d looked at 3 sockets, 2 answered (as oss); interfaces: io.systemd io.systemd.ManagedOOM io.systemd.UserDatabase org.varlink.service
+INFO d no systemd service on this machine declares fd-carrying fields (sockets under /run/systemd, the userdb dir and the registry)

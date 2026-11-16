@@ -4,6 +4,7 @@ import type { Interface } from "../core/idl/ast.ts";
 import type { ValidateReplies } from "../core/protocol/dispatch.ts";
 import { compileInterface } from "../core/types/compile.ts";
 import {
+  collectSink,
   connectionInternals,
   type CallOptions,
   type CallSpec,
@@ -79,14 +80,8 @@ export async function createProxy(conn: Connection, name: string, options?: Prox
       collect: {
         value: (parameters?: Record<string, unknown>, opts?: CollectOptions) =>
           new Promise<Record<string, unknown>[]>((resolve, reject) => {
-            const replies: Record<string, unknown>[] = [];
-            internals.start("more", method, parameters, opts, spec, {
-              value: (v, final) => {
-                replies.push(v);
-                if (final) resolve(replies);
-              },
-              fail: reject,
-            });
+            // As conn.collect(): a failed collection closes the collected replies' fds (acceptFds).
+            internals.start("more", method, parameters, opts, spec, collectSink(resolve, reject));
           }),
       },
       oneway: {

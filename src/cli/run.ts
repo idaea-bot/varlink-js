@@ -61,6 +61,11 @@ call:
      --upgrade                 Request a protocol upgrade; then pipe raw bytes between stdin/stdout and the
                                service (PARAMETERS from argv only; --timeout covers the call, not the stream)
      --graceful=ERROR          Treat the error reply ERROR as success (repeatable)
+     --push-fd=FD              Pass fd FD (a number, e.g. 3 with '3<file'; or a /path or ./path to open
+                               read-only) along with the call (repeatable; unix sockets, needs the optional
+                               varlink-js-native addon)
+     --exec                    Invoke the method and pass the reply (stdin) and its fds (3, 4, …; LISTEN_FDS)
+                               to a command: call --exec ADDRESS METHOD PARAMETERS -- CMDLINE…
 format:
      --check                   Print nothing; fail and name the files that are not canonical
   -i --in-place                Rewrite the files

@@ -1,6 +1,7 @@
 // The upgraded channel of a protocol upgrade (DESIGN.md §4.2, §5.6): the connection's transport, handed over after
 // the confirming reply, which first yields the bytes the framer had already read past the varlink part.
 import type { ByteChannel, FdHandle, ReadChunk } from "../core/protocol/channel.ts";
+import { closeFds } from "../core/protocol/framer.ts";
 
 /** What `conn.upgrade()` resolves with. */
 export interface UpgradeResult<T = Record<string, unknown>> {
@@ -22,13 +23,24 @@ export interface UpgradeTail {
   readonly ended?: { readonly error?: unknown } | undefined;
 }
 
+/** A chunk without fds (the upgraded stream is bytes only): any that came are closed. */
+function bytesOnly(chunk: ReadChunk | null): ReadChunk | null {
+  if (chunk === null || (chunk.fds === undefined && chunk.fdError === undefined)) return chunk;
+  closeFds(chunk.fds);
+  return { bytes: chunk.bytes };
+}
+
 /**
  * The §4.1 contract over `inner`: reads give `head` first (if not empty), then `tail.pending`'s outcome or
- * `tail.ended`, then the transport's own reads; writes, `end()` (half-close), `close()`, `closed` and
- * `capabilities` are the transport's, so its backpressure applies and nothing is buffered beyond `head`.
+ * `tail.ended`, then the transport's own reads; writes, `end()` (half-close), `close()` and `closed` are the
+ * transport's, so its backpressure applies and nothing is buffered beyond `head`. The upgraded stream is bytes only
+ * (M11): fd input is switched off on the transport, fds that still arrive are closed, writes with fds reject, and
+ * `capabilities` keeps only `peer` (the transport's own object where it has no fd passing). Constructing it calls the transport's `capabilities.upgraded` hook (the native channel removes its
+ * `user.varlink` xattr, as sd-varlink.c:1524-1527 does).
  */
 export class UpgradedChannel implements ByteChannel {
   readonly #inner: ByteChannel;
+  readonly capabilities: ByteChannel["capabilities"];
   #head: Uint8Array | undefined;
   #pending: Promise<ReadChunk | null> | undefined;
   #ended: { readonly error?: unknown } | undefined;
@@ -39,10 +51,16 @@ export class UpgradedChannel implements ByteChannel {
     this.#head = head.length > 0 ? head : undefined;
     this.#pending = tail?.pending;
     this.#ended = tail?.ended;
-  }
-
-  get capabilities(): ByteChannel["capabilities"] {
-    return this.#inner.capabilities;
+    const caps = inner.capabilities;
+    try {
+      caps.fdPassing?.setAcceptInput(false);
+      caps.upgraded?.();
+    } catch {
+      // Best effort (the transport may be closed already).
+    }
+    // Nothing to take away (every transport but the native one): the transport's own object.
+    if (caps.fdPassing === undefined && caps.upgraded === undefined) this.capabilities = caps;
+    else this.capabilities = caps.peer === undefined ? {} : { peer: caps.peer };
   }
 
   get closed(): Promise<void> {
@@ -61,7 +79,11 @@ export class UpgradedChannel implements ByteChannel {
       this.#pending = undefined;
       // A close() meanwhile turns the outcome into the end of the stream, as for the transport's own reads.
       return pending.then(
-        (chunk) => (this.#closed ? null : chunk),
+        (chunk) => {
+          if (!this.#closed) return bytesOnly(chunk);
+          closeFds(chunk?.fds);
+          return null;
+        },
         (e: unknown) => {
           if (this.#closed) return null;
           throw e;
@@ -78,11 +100,13 @@ export class UpgradedChannel implements ByteChannel {
       }
       return Promise.resolve(null);
     }
-    return this.#inner.read();
+    return this.#inner.read().then(bytesOnly);
   }
 
   write(chunk: Uint8Array, fds?: readonly FdHandle[]): Promise<void> {
-    return fds === undefined ? this.#inner.write(chunk) : this.#inner.write(chunk, fds);
+    if (fds !== undefined && fds.length > 0)
+      return Promise.reject(new TypeError("an upgraded channel carries bytes only (no fds)"));
+    return this.#inner.write(chunk);
   }
 
   end(): Promise<void> {

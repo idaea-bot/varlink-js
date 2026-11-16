@@ -10,6 +10,7 @@ import type { ServeListener } from "../rpc/server.ts";
 import { checkMode } from "../rpc/util.ts";
 import { ACTIVATION_HINT_ENV, recordActivationFds } from "./activation-fds.ts";
 import { listen } from "./listen.ts";
+import { adoptFd, usableNative, type NativeAddon } from "./native.ts";
 import { fromNodeSocket } from "./socket.ts";
 import { fromNodeStreams } from "./spawn-channel.ts";
 
@@ -34,6 +35,15 @@ export interface ActivationOptions {
    * `Accept=yes` socket, say) needs `"connected"`.
    */
   accept?: "auto" | "listening" | "connected";
+  /**
+   * M11: the optional `varlink-js-native` addon: unix sockets serve fd-capable connections with peer credentials
+   * (see `listen()`), and every fd of `LISTEN_FDS` is made close-on-exec, as `sd_listen_fds` does.
+   */
+  native?: NativeAddon;
+  /** M11, with `native`: strict fd input (see `ListenOptions.fdPassingInputStrict`); default false, as sd-varlink. */
+  fdPassingInputStrict?: boolean;
+  /** M11, strict mode only: the server's `allowFdPassingInput` (see `ListenOptions.allowFdPassingInput`). */
+  allowFdPassingInput?: boolean;
 }
 
 /** Options for {@link listenAuto}. */
@@ -213,9 +223,14 @@ export function connectedChannel(fd: number): ByteChannel {
   return fromNodeSocket(socket);
 }
 
-/** A connected activation fd: one channel over it. */
-function connectedListener(fd: number, address: string | undefined): Listener {
-  const channel = connectedChannel(fd);
+/** A connected activation fd: one channel over it (adopted by the addon when given and a unix socket). */
+function connectedListener(
+  fd: number,
+  address: string | undefined,
+  native: NativeAddon | undefined,
+  strict: boolean,
+): Listener {
+  const channel = (native === undefined ? undefined : adoptFd(native, fd, strict)) ?? connectedChannel(fd);
   return new OneShotListener(
     address ?? `fd:${String(fd)}`,
     () => channel,
@@ -244,9 +259,26 @@ interface MergeState {
   finished: boolean;
 }
 
+/** The strict sources' common `strictFdPassingInput`, or undefined if none is strict; TypeError if they disagree. */
+function strictOfSources(sources: readonly Listener[]): boolean | undefined {
+  let value: boolean | undefined;
+  for (const s of sources as readonly ServeListener[]) {
+    const v = s.strictFdPassingInput;
+    if (v === undefined) continue;
+    if (value !== undefined && v !== value)
+      throw new TypeError(
+        "mergeListeners: the strict listeners were set up with different allowFdPassingInput values " +
+          "(no server can serve them all; see fdPassingInputStrict)",
+      );
+    value = v;
+  }
+  return value;
+}
+
 class MergedListener implements Listener {
   readonly address: string;
   declare readonly bindRegistry?: ServeListener["bindRegistry"];
+  declare readonly strictFdPassingInput?: boolean;
   readonly #sources: readonly Listener[];
   #state: MergeState | undefined;
   #closing: Promise<void> | undefined;
@@ -260,6 +292,11 @@ class MergedListener implements Listener {
       this.bindRegistry = (interfaces, options) =>
         bindable.bindRegistry?.(interfaces, options) ??
         Promise.reject(new OperationNotSupportedError("the listener lost its bindRegistry"));
+    // A strict source's setting goes along, so serve() checks it (listenFromEnv gives every source the same options);
+    // strict sources that disagree could never all match one server: strictOfSources throws, so this constructor (and
+    // with it mergeListeners) does.
+    const strict = strictOfSources(sources);
+    if (strict !== undefined) this.strictFdPassingInput = strict;
   }
 
   [Symbol.asyncIterator](): AsyncIterator<ByteChannel> {
@@ -393,9 +430,11 @@ function existingAddress(address: string | undefined): string | undefined {
  * One {@link Listener} over several: iterating it yields the channels of all of them until all ended (an
  * iteration error of one is delivered once to `next()`); `close()` closes all; `address` is the first one's. One
  * iteration at a time (a second concurrent one is a `TypeError`); after `return()` it may be iterated again. It has
- * `bindRegistry` (§5.4) if a source has one: the first such source's (a unix path socket).
+ * `bindRegistry` (§5.4) if a source has one: the first such source's (a unix path socket). It carries the strict
+ * sources' `strictFdPassingInput` (M11), so `server.serve()` checks it.
  *
- * @throws {TypeError} for an empty list.
+ * @throws {TypeError} for an empty list, or strict sources set up with different `allowFdPassingInput` values (the
+ *   listeners are left open).
  */
 export function mergeListeners(listeners: readonly Listener[]): Listener {
   const first = listeners[0];
@@ -443,6 +482,7 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
   const unset = options?.unsetEnvironment ?? true;
   if (typeof unset !== "boolean") throw new TypeError("unsetEnvironment must be a boolean");
   const accept = checkMode(options?.accept, "accept", ["auto", "listening", "connected"], "auto");
+  const native = usableNative(options?.native);
   if (pid === undefined || !/^[0-9]+$/.test(pid) || Number(pid) !== process.pid) return null;
   if (count === undefined) return null;
   if (!/^[0-9]+$/.test(count) || Number(count) < 1 || Number(count) > MAX_LISTEN_FDS)
@@ -450,6 +490,14 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
   const n = Number(count);
   // All of them, whatever their names: none may leak into our children (spawn.ts).
   recordActivationFds(LISTEN_FDS_START, n);
+  // With the addon, like sd_listen_fds: close-on-exec (best effort; the /dev/null cover stays as a second guard).
+  if (native !== undefined)
+    for (let i = 0; i < n; i++)
+      try {
+        native.setCloexec(LISTEN_FDS_START + i);
+      } catch {
+        // Not open (EBADF): nothing to protect.
+      }
   const fdNames = names?.split(":");
   if (fdNames !== undefined && fdNames.length !== n)
     throw new TypeError(`LISTEN_FDNAMES has ${String(fdNames.length)} names for ${String(n)} fds (LISTEN_FDS)`);
@@ -470,8 +518,21 @@ export async function listenFromEnv(options?: ActivationOptions): Promise<Listen
       const connected = info === undefined ? hinted : !info.listening;
       const mode = accept === "auto" ? (connected ? "connected" : "listening") : accept;
       const address = existingAddress(info?.address);
-      if (mode === "connected") listeners.push(connectedListener(fd, address));
-      else listeners.push(await listen({ fd }, address === undefined ? {} : { address }));
+      const nativeOption =
+        native === undefined
+          ? {}
+          : {
+              native,
+              ...(options?.fdPassingInputStrict === undefined
+                ? {}
+                : { fdPassingInputStrict: options.fdPassingInputStrict }),
+              ...(options?.allowFdPassingInput === undefined
+                ? {}
+                : { allowFdPassingInput: options.allowFdPassingInput }),
+            };
+      if (mode === "connected")
+        listeners.push(connectedListener(fd, address, native, options?.fdPassingInputStrict === true));
+      else listeners.push(await listen({ fd }, address === undefined ? nativeOption : { address, ...nativeOption }));
     }
   } catch (e) {
     await Promise.allSettled(listeners.map((l) => l.close()));
@@ -550,7 +611,15 @@ export async function listenAuto(options?: ListenAutoOptions): Promise<Listener 
   if (value === undefined) return fromEnv;
   let extra: Listener;
   try {
-    extra = value === "-" ? listenStdio() : await listen(value, mode === undefined ? {} : { mode });
+    const listenOptions = {
+      ...(mode === undefined ? {} : { mode }),
+      ...(activation.native === undefined ? {} : { native: activation.native }),
+      ...(activation.allowFdPassingInput === undefined ? {} : { allowFdPassingInput: activation.allowFdPassingInput }),
+      ...(activation.fdPassingInputStrict === undefined
+        ? {}
+        : { fdPassingInputStrict: activation.fdPassingInputStrict }),
+    };
+    extra = value === "-" ? listenStdio() : await listen(value, listenOptions);
   } catch (e) {
     await fromEnv?.close().catch(() => undefined);
     throw e;

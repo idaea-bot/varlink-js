@@ -326,8 +326,10 @@ console.log(`Listening on ${listener.address}`);
 - Exit status: 0 on success, 1 on any failure, 130/143 after SIGINT/SIGTERM; `certify server` exits 0 after a
   signal (it stops gracefully).
 - `call --upgrade ADDRESS METHOD [PARAMS]` (as varlinkctl): after the confirming reply, stdin goes to the service and
-  its bytes to stdout until both sides are done; parameters come from the command line only. Not available yet:
-  `--push-fd` (M11), `serve` and `list-registry`.
+  its bytes to stdout until both sides are done; parameters come from the command line only.
+- `call --push-fd=FD|PATH` and `call --exec ADDRESS METHOD [PARAMS] -- CMD…` (as varlinkctl) need the optional
+  `varlink-js-native` addon (Linux; see `native/README.md`; `VARLINK_JS_NATIVE=<path to native/index.js>` points the
+  CLI at a local build). Not available yet: `serve` and `list-registry`.
 - Integers are lossless in the CLI (it uses `ints: "bigint"` internally): 2⁶³−1 and 2⁶⁴−1 round-trip.
 
 ## Addresses
@@ -357,7 +359,7 @@ subpaths above.
 | Largest message (client, server, HTTP client) | 16 MiB | `maxMessageSize` | `test/docs/defaults.test.ts`, `test/unit/protocol/framer.test.ts` |
 | Complete calls buffered per server connection (then reading stops) | 64 | `maxQueuedCalls` (server) | `test/docs/defaults.test.ts`, `test/unit/protocol/server-session.test.ts` |
 | Open server connections (more are closed at once) | 4096 | `maxConnections` (server) | `test/docs/defaults.test.ts` |
-| Connections per UID | not implemented (needs peer credentials, M11) | — | — |
+| Connections per UID | off (opt-in, as sd-varlink's `SD_VARLINK_SERVER_ACCOUNT_UID`; needs the native addon) | `maxConnectionsPerUid` (server) | `test/unit/rpc/server-peer.test.ts` |
 | Call timeout (clock starts at the head of the reply queue) | 45 s, 0 = none | `timeout` (connection, or per call) | `test/docs/defaults.test.ts`, `test/unit/rpc/connection.test.ts` |
 | Connect phase (`connect()`) | the same `timeout` (45 s) | `timeout`, `signal` | `test/docs/defaults.test.ts`, `test/unit/node/connect.test.ts` |
 | Stream replies buffered unread (then reading pauses) | 64 | `highWaterMark` (connection) | `test/docs/defaults.test.ts`, `test/unit/rpc/connection.test.ts` |
@@ -483,7 +485,8 @@ All from `varlink-js/node`:
   `{ fd }` listener: the socket belongs to the service manager and outlives us, so its entries stay); `listRegistry()`,
   `resolveInterface(name)` (registry first, then `org.varlink.resolver`).
 
-Activation fds are not close-on-exec yet (needs the M11 native addon): children you spawn yourself inherit them.
+Activation fds are close-on-exec only when `listenFromEnv` gets the native addon (`{ native }`); without it, children
+you spawn yourself inherit them.
 `LISTEN_PIDFDID` is ignored.
 
 ## Runtimes
@@ -540,8 +543,9 @@ Activation fds are not close-on-exec yet (needs the M11 native addon): children 
 
 ## Not yet implemented
 
-- **fd passing, peer credentials, per-UID connection limits, `user.varlink` xattr tagging** (M11, a native addon, not
-  started).
+- **No prebuilt binaries for `varlink-js-native`** (fd passing, peer credentials, per-UID limits, `user.varlink`
+  xattr): it is built from source with a C compiler, Linux only, and not published. Without it those features are
+  absent and fd-using calls fail with `OperationNotSupportedError`.
 - **No WebSocket or HTTP server**: those subpaths are clients only.
 - **HTTP mode has no oneway calls** (`HttpClient.oneway()` rejects with `OperationNotSupportedError`).
 - The `org.varlink.resolver` client does `Resolve` and `GetInfo` only, untyped; there is no resolver server.

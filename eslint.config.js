@@ -95,7 +95,7 @@ const runtimeBans = runtimeGlobals.map((name) => ({ name, message: globalMessage
 const ioBans = ioGlobals.map((name) => ({ name, message: ioMessage }));
 
 export default defineConfig(
-  globalIgnores(["dist/", "build/", "pkg/", "coverage/", "test/fixtures/consumer/"]),
+  globalIgnores(["dist/", "build/", "pkg/", "coverage/", "test/fixtures/consumer/", "native/build/"]),
   eslint.configs.recommended,
   tseslint.configs.strictTypeChecked,
   {
@@ -107,7 +107,7 @@ export default defineConfig(
     },
   },
   {
-    files: ["test/**/*.ts"],
+    files: ["test/**/*.ts", "native/test/**/*.ts"],
     rules: {
       // node:test's test()/describe() return promises the runner tracks itself.
       "@typescript-eslint/no-floating-promises": [

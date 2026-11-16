@@ -1,6 +1,7 @@
 // NUL framing of the byte stream (DESIGN.md §4.2, §4.10; fixes F15): one growable buffer, a size limit with
 // bounded memory, strict UTF-8.
 import { MessageTooLargeError, ProtocolError } from "../errors/local.ts";
+import type { FdHandle } from "./channel.ts";
 
 /** Default `maxMessageSize`: sd-varlink's input buffer limit (JSON_STREAM_BUFFER_MAX_DEFAULT, 16 MiB). */
 export const DEFAULT_MAX_MESSAGE_SIZE: number = 16 * 1024 * 1024;
@@ -55,6 +56,13 @@ export class Framer {
   /** A push was ignored because of {@link #pending}: the buffered bytes are not the whole stream. */
   #dropped = false;
   #finished = false;
+  /** Messages completed so far (counted on push), and returned by next(): the stream ordinal of the next one. */
+  #completedTotal = 0;
+  #returnedTotal = 0;
+  /** fds per message (by stream ordinal), received with the chunk that started the message. */
+  readonly #fds: { ordinal: number; fds: FdHandle[] }[] = [];
+  /** fds of the message next() returned last, until takeFds() or the next next() (which closes them). */
+  #lastFds: FdHandle[] | undefined;
 
   constructor(options?: FramerOptions) {
     this.#max = checkMaxMessageSize(options?.maxMessageSize);
@@ -83,12 +91,33 @@ export class Framer {
     return this.#pending === null && this.#failed === null && !this.#finished;
   }
 
-  /** Appends a copy of `bytes`. Never throws for peer data (problems surface from next(), in stream order). */
-  push(bytes: Uint8Array): void {
-    if (this.#finished) throw new TypeError("the framer is finished (takeRemainder was called)");
+  /**
+   * Appends a copy of `bytes`. Never throws for peer data (problems surface from next(), in stream order).
+   *
+   * `fds` (M11, DESIGN.md §4.1) arrived with the first byte of `bytes`: they belong to the message that byte starts,
+   * and next() hands them out with it ({@link takeFds}); the framer owns them until then. Like sd-varlink, fds may
+   * only come with the first byte of a message: fds arriving while a message is incomplete are a protocol error
+   * (json-stream.c:1345-1350 returns EPROTO; here they are closed and, after the complete messages before, next()
+   * throws). The bytes of such a chunk are dropped.
+   */
+  push(bytes: Uint8Array, fds?: readonly FdHandle[]): void {
+    if (this.#finished) {
+      closeFds(fds);
+      throw new TypeError("the framer is finished (takeRemainder was called)");
+    }
     if (this.#pending !== null || this.#failed !== null) {
+      closeFds(fds);
       if (bytes.length > 0) this.#dropped = true;
       return;
+    }
+    if (fds !== undefined && fds.length > 0) {
+      if (this.#end !== this.#msgStart || bytes.length === 0) {
+        closeFds(fds);
+        this.#pending = new ProtocolError("file descriptors received in the middle of a message");
+        this.#dropped = true;
+        return;
+      }
+      this.#fds.push({ ordinal: this.#completedTotal, fds: [...fds] });
     }
     if (bytes.length === 0) return;
     this.#reserve(bytes.length);
@@ -105,7 +134,17 @@ export class Framer {
     if (this.#complete === 0) {
       if (this.#pending === null) return null;
       this.#failed = this.#pending;
+      this.discardFds();
       throw this.#failed;
+    }
+    // The previous message's fds that nobody took are done with.
+    closeFds(this.#lastFds);
+    this.#lastFds = undefined;
+    const ordinal = this.#returnedTotal++;
+    const head = this.#fds[0];
+    if (head?.ordinal === ordinal) {
+      this.#fds.shift();
+      this.#lastFds = head.fds;
     }
     const nul = this.#buf.subarray(0, this.#end).indexOf(NUL, this.#start);
     const bytes = this.#buf.subarray(this.#start, nul);
@@ -116,6 +155,7 @@ export class Framer {
       text = this.#decoder.decode(bytes);
     } catch (e) {
       this.#failed = new ProtocolError("message is not valid UTF-8", { cause: e });
+      this.discardFds();
       throw this.#failed;
     }
     if (this.#start === this.#end) {
@@ -136,13 +176,33 @@ export class Framer {
   }
 
   /**
+   * The fds that came with the message next() returned last (empty if none), handed to the caller, who owns them
+   * from now on. Not taken before the next next() (or {@link discardFds}), they are closed.
+   */
+  takeFds(): FdHandle[] {
+    const fds = this.#lastFds ?? [];
+    this.#lastFds = undefined;
+    return fds;
+  }
+
+  /** Closes every fd the framer still holds (the session is done with the stream). */
+  discardFds(): void {
+    closeFds(this.#lastFds);
+    this.#lastFds = undefined;
+    for (const entry of this.#fds.splice(0)) closeFds(entry.fds);
+  }
+
+  /**
    * Returns the unconsumed bytes (a copy) and finishes the framer: later push/next throw TypeError. For upgrade.
+   * fds still held (with bytes past the varlink part) are closed: the upgraded stream is bytes only.
    *
    * @throws {MessageTooLargeError} (the pending error) if bytes were discarded because of the size limit, so the
    *   remainder would not be the whole rest of the stream. The framer is finished anyway.
    */
   takeRemainder(): Uint8Array {
     if (this.#finished) throw new TypeError("the framer is finished (takeRemainder was called)");
+    // The upgraded stream is bytes only: fds that came with bytes past the varlink part are closed.
+    this.discardFds();
     this.#finished = true;
     const rest = this.#buf.slice(this.#start, this.#end);
     this.#buf = new Uint8Array(0);
@@ -163,6 +223,7 @@ export class Framer {
         return;
       }
       this.#complete++;
+      this.#completedTotal++;
       this.#msgStart = nul + 1;
       i = nul + 1;
     }
@@ -216,6 +277,37 @@ export class Framer {
     this.#end -= shift;
     this.#msgStart -= shift;
     this.#start = 0;
+  }
+}
+
+/** Closes each fd; a failing close() (a caller's handle) is ignored. */
+export function closeFds(fds: readonly FdHandle[] | undefined): void {
+  if (fds === undefined) return;
+  for (const fd of fds) {
+    try {
+      fd.close();
+    } catch {
+      // Closing is best effort here: the fd is no longer ours either way.
+    }
+  }
+}
+
+/**
+ * The fds go from the library to a user (`ctx.takeFd`, an `acceptFds` reply): handles that support it (the native
+ * channel's) stop being tracked by their transport, so tearing that environment down does not close them under their
+ * new owner. Duck-typed: other handles are left alone.
+ */
+export function handOver(fds: readonly FdHandle[] | undefined): void {
+  if (fds === undefined) return;
+  for (const fd of fds) {
+    const h = (fd as { handOver?: unknown }).handOver;
+    if (typeof h === "function") {
+      try {
+        (h as () => void).call(fd);
+      } catch {
+        // Bookkeeping only.
+      }
+    }
   }
 }
 

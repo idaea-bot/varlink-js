@@ -1,6 +1,14 @@
 // Protocol layer (DESIGN.md §4.1–§4.5, §5.4, §4.10): ByteChannel types, framer, messages, sans-IO sessions and
 // dispatch.
-export type { ByteChannel, FdHandle, FdPassing, Listener, PeerCredentials, ReadChunk } from "./channel.ts";
+export {
+  SCM_MAX_FD,
+  type ByteChannel,
+  type FdHandle,
+  type FdPassing,
+  type Listener,
+  type PeerCredentials,
+  type ReadChunk,
+} from "./channel.ts";
 export { ClientSession, type ClientEvent, type ClientSessionOptions } from "./client-session.ts";
 export {
   dispatchCall,

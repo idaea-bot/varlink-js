@@ -36,9 +36,11 @@ Reference implementations read for this design (shallow clones, 2026-10-25):
 
 Facts from those sources that shape this design:
 
-- sd-varlink defaults: method-call timeout **45 s** (`VARLINK_DEFAULT_TIMEOUT_USEC`, sd-varlink.c:47);
-  max **4096** server connections, **128 per UID** (sd-varlink.c:44-45); input buffer max **16 MiB**
-  (`JSON_STREAM_BUFFER_MAX_DEFAULT`, json-stream.c:26); `collect` max 1024 replies (sd-varlink.c:48);
+- sd-varlink defaults (line numbers at 6bd4689f): method-call timeout **45 s** (`VARLINK_DEFAULT_TIMEOUT_USEC`,
+  sd-varlink.c:49); max **4096** server connections (`VARLINK_DEFAULT_CONNECTIONS_MAX`, sd-varlink.c:46), **128 per
+  UID** when `SD_VARLINK_SERVER_ACCOUNT_UID` is set (`VARLINK_DEFAULT_CONNECTIONS_PER_UID_MAX`, sd-varlink.c:47); input
+  buffer max **16 MiB** (`JSON_STREAM_BUFFER_MAX_DEFAULT`, json-stream.c:30); `collect` max 1024 replies
+  (`VARLINK_COLLECT_MAX`, sd-varlink.c:50);
   max 253 fds per message (`SCM_MAX_FD`, sd-varlink.c:3210).
 - sd-varlink address schemes: `unix:` (path or `@abstract`), `exec:`, `ssh:`/`ssh-unix:`, `ssh-exec:`,
   plus *bridge helper binaries* for any other scheme (`$SYSTEMD_VARLINK_BRIDGES_DIR/<scheme>`,
@@ -138,15 +140,15 @@ Cells for C/sd/python/rust come from reading their sources (paths in §0), not f
 | Socket activation (`LISTEN_FDS`, `LISTEN_FDNAMES=varlink`) | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ M8 |
 | `/run/varlink/registry/` lookup | ❌ | ✅ (v260) | ❌ | ❌ | ❌ | ✅ M8 (lookup, list, publish via `serve(…, {registry})`) |
 | `org.varlink.resolver` client | ✅ | ❌ | ✅ | ✅ | ◐ (schema only) | ◐ M8 (untyped, Resolve + GetInfo only) |
-| fd passing (`SCM_RIGHTS`) | ❌ | ✅ (opt-in per direction) | ❌ | ❌ | ❌ | ✅ M11 (optional native addon, Linux) |
-| Peer credentials (`SO_PEERCRED`/pidfd) | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ M11 (native addon) |
-| `user.varlink` xattr tagging | ❌ | ✅ | ❌ | ❌ | ❌ | ◐ M11 (best effort, native addon) |
+| fd passing (`SCM_RIGHTS`) | ❌ | ✅ (opt-in per direction) | ❌ | ❌ | ❌ | ✅ M11 (optional `varlink-js-native`, unix sockets, Node on Linux; §4.15; interop with varlinkctl 262.2 `--push-fd=`/`--exec`) |
+| Peer credentials (`SO_PEERCRED`/pidfd) | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ M11 (native addon; pidfd on Linux ≥ 6.5) |
+| `user.varlink` xattr tagging | ❌ | ✅ | ❌ | ❌ | ❌ | ◐ M11 (best effort, native addon: the roles are set as sd-varlink does, but Linux 6.8 sockfs refuses user xattrs with `EPERM`, so nothing is tagged there) |
 | Per-call timeout | — (caller's event loop) | ✅ (45 s default) | ? | ? | ❌ (socket idle timeout, crashes server, F1/F4) | ✅ M4 |
 | Cancellation | — (close) | — (close) | — | — | ❌ | ✅ M4 `AbortSignal` (closes connection, per spec) |
 | Write backpressure | ? | ✅ (output queue cap) | ? | ? | ❌ (hangs, F3) | ✅ M4 |
 | Read backpressure for streams | ? | ? | ? | ? | ❌ | ✅ M4 |
 | Max message size | ? | ✅ 16 MiB | ? | ? | ❌ (F15) | ✅ M3 (16 MiB default) |
-| Connection limits (total / per UID) | ? | ✅ 4096 / 128 | ? | ◐ (worker cap) | ❌ | ✅ M4 (per-UID needs M11) |
+| Connection limits (total / per UID) | ? | ✅ 4096 / per UID opt-in (`SD_VARLINK_SERVER_ACCOUNT_UID`, then 128) | ? | ◐ (worker cap) | ❌ | ✅ M4 / M11 (`maxConnectionsPerUid`, opt-in like sd-varlink's flag; counted where the peer's credentials are known: unix sockets through the native addon) |
 | Exit-on-idle | ? | ✅ | ? | ✅ (listen idle timeout) | ❌ | ✅ M8 |
 | Graceful shutdown | ? | ✅ (SIGINT/SIGTERM flags) | ? | ? | ❌ | ✅ M4 |
 | Connection pool | — | — | — | — | ◐ (dead conns, F4) | ✅ M4 |
@@ -226,6 +228,8 @@ export interface ReadChunk {
   bytes: Uint8Array;
   /** fds that arrived with the first byte of `bytes` (SCM_RIGHTS). Only on fd-capable channels. */
   fds?: FdHandle[];
+  /** M11: the kernel truncated the fds (MSG_CTRUNC) and the channel closed them; the bytes go on (reported, not fatal). */
+  fdError?: "truncated";
 }
 
 export interface ByteChannel {
@@ -244,6 +248,7 @@ export interface ByteChannel {
   readonly capabilities: {
     fdPassing?: FdPassing;          // M11
     peer?: () => PeerCredentials;   // M11
+    upgraded?: () => void;          // M11: called once on upgrade (the native channel drops its xattr)
   };
 }
 
@@ -251,13 +256,17 @@ export interface ByteChannel {
 export interface FdHandle { readonly fd: number; close(): void; }
 
 export interface FdPassing {
-  /** Receiving is opt-in (UAPI). Off by default; when off, SO_PASSRIGHTS is cleared where the kernel supports it
-   *  (Linux ≥ 6.16) and any fds that still arrive are closed and the message rejected (protocol error). */
+  /** Receiving is opt-in (UAPI). Off by default: fds that arrive are dropped silently, the message going on
+   *  (json-stream.c:1318-1321). On: reads stop at each NUL so fds stay with their message (json-stream.c:1187-1227).
+   *  SO_PASSRIGHTS (Linux ≥ 6.16) stays at the kernel default (on), as in sd-varlink (json-stream.c:691-692,
+   *  sd-varlink.c:3347-3352); only strict channels (`fdPassingInputStrict` listeners, like
+   *  SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT) set it from this, so a sender's sendmsg with fds gets EPERM. */
   setAcceptInput(on: boolean): void;
-  setAllowOutput(on: boolean): void;
+  setAllowOutput(on: boolean): void;         // off: write() with fds rejects (OperationNotSupportedError)
+  duplicate(fd: number): FdHandle;           // M11: F_DUPFD_CLOEXEC, owned by the caller
 }
 
-export interface PeerCredentials { uid: number; gid: number; pid: number; pidfd?: FdHandle; }
+export interface PeerCredentials { uid: number; gid: number; pid: number; pidfd?: FdHandle; } // pidfd: the channel's
 
 export interface Listener extends AsyncIterable<ByteChannel> {
   readonly address: string;          // canonical varlink address, e.g. "unix:/run/x" or "tcp:127.0.0.1:41234"
@@ -270,6 +279,26 @@ are bound to the message that chunk *starts*; fds arriving with a chunk that doe
 message are a protocol error (connection closed); handlers get `ctx.fds` and helpers
 `ctx.takeFd(index)` which throw `InvalidParameter` on a missing index; senders write the whole message
 plus its fds in one `write()`.
+
+**fd ownership (M11, decided once, followed everywhere):**
+- `ByteChannel.write(chunk, fds)` takes no ownership: it neither duplicates nor closes `fds`, which must stay open
+  until the promise settled.
+- fds a *caller* hands to the library (`conn.call(…, {fds})`, `ctx.pushFds(…)`; numbers or FdHandles such as an
+  `fs.FileHandle`) stay the caller's: the library duplicates each one (`F_DUPFD_CLOEXEC`, through
+  `FdPassing.duplicate`) synchronously when the call or `pushFds` is made, sends the duplicates and closes them once
+  the message was written or dropped. So the caller may close its own fds as soon as the method returned, and the
+  library never closes anything it was given. (sd-varlink's `sd_varlink_push_fd` takes ownership instead,
+  sd-varlink.c:3262-3263; duplicating spares JS callers the timing question of "after the write".)
+- Received fds belong to the library until claimed: a client result with `acceptFds` hands them to the caller (who
+  must close them); in a handler `ctx.fds` lists them (library-owned, valid until the call finished) and
+  `ctx.takeFd(i)` claims one; everything unclaimed (also fds of error replies, of dropped or abandoned replies, of
+  an upgrade confirmation, after an upgrade or a close) is closed by the library.
+- `PeerCredentials.pidfd` (fetched on first access) belongs to the channel and is closed with it.
+- What handlers and users are lent is a view, never the owned handle: `ctx.fds[i]` and `peer.pidfd` have a no-op
+  `close()` and report `fd` -1 once the library no longer holds that fd (claimed with `takeFd`, closed at the end of
+  the call, or with the connection), so a stale number is never handed out or closed by mistake.
+- Write errors close what the library owns: a call's duplicates are closed once its write settled, also when it failed
+  (the Connection's write path and dispatch both close in a `finally`).
 
 Helpers: `fromWebStreams({readable, writable})`, `fromNodeSocket(socket)`, `pair()` (in-memory, for
 tests), `faulty(channel, plan)` (fault injection: split chunks at every byte, delay, RST mid-message).
@@ -502,11 +531,12 @@ varlinkctl.c:1188, systemd 2336319d): `/run/varlink/registry` (system) or `$XDG_
     skipped there (Deno 2.9.8 lists them).
 - **Browser**: `varlink-js/websocket` (WebSocket mode against systemd's `varlink-http-bridge` or any
   UAPI bridge). It's standardised now, so it is worth doing. No fds, as the spec says.
-- **fd passing / peer credentials**: no JS runtime exposes `SCM_RIGHTS` or `SO_PEERCRED`. Plan: a
-  separate optional package `varlink-js-native` (small N-API addon, Linux, prebuilt binaries) that
-  provides a `ByteChannel` with `capabilities.fdPassing` and `.peer`. Prior art on npm to evaluate first:
-  `usocket` ("unix local sockets with descriptor passing"), `peercred`. Without the addon those
-  capabilities are simply absent and fd-using calls fail with `OperationNotSupportedError` locally.
+- **fd passing / peer credentials**: no JS runtime exposes `SCM_RIGHTS` or `SO_PEERCRED`. Done in M11 (§4.15, Q5):
+  a separate optional package `varlink-js-native` (`native/`, a small Node-API addon, Linux; no prebuilds yet) whose
+  sockets back a `ByteChannel` with `capabilities.fdPassing` and `.peer`. It is injected (`connect(…, {native})`,
+  `listen(…, {native})`, `listenFromEnv({native})`), never imported by the library. Node only: Bun and Deno lack the
+  libuv access it needs, so there (and when it is not built) the capabilities are simply absent and fd-using calls
+  fail with `OperationNotSupportedError` locally, before anything is sent.
 
 ### 4.8 IDL (M1)
 
@@ -699,7 +729,7 @@ by relative path (§4.11). `src/testing/` (`varlink-js/testing`): `pair()`, `fau
   after the previous finished (final reply produced, or `finish(id)` for oneway, whose `reply()`/`error()` return
   null). `wantsInput` is false while `maxQueuedCalls` (default 64) complete messages are buffered, while at least
   one complete message is buffered and the buffered bytes reach `maxMessageSize` (like sd-varlink's 16 MiB input
-  buffer cap, json-stream.c:1240, with room for one partial message: without a complete message reading goes on,
+  buffer cap, json-stream.c:1245-1246, with room for one partial message: without a complete message reading goes on,
   the framer caps the partial one; so at most about 2 × `maxMessageSize` + one chunk buffered, and since the buffer
   doubles, a framer capacity of about 4 × `maxMessageSize` per connection in the worst case while reading, which
   drops back once the messages are consumed), while paused
@@ -1389,7 +1419,7 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   default 45 s; it bounds the connect and the whole call, `--more` included (sd-varlink's semantics: the CLI runs its own
   deadline and sets the library's timeouts to 0, §5.1's stream timeout does not apply); beyond 2³¹−1 ms it means none.
 - **`call --upgrade`** (M9, `upgrade.ts`, after varlinkctl.c:801-947 at 6bd4689f): PARAMETERS from argv only (absent
-  or `-` → `{}`; stdin is the stream, never parameters); with `--more`/`-E`/`--collect`/`--oneway`/`--graceful` a usage
+  or `-` → `{}`; stdin is the stream, never parameters); with `--more`/`-E`/`--collect`/`--oneway`/`--graceful`/`--push-fd=` (M11) a usage
   error with varlinkctl's text (`--upgrade may not be combined with --collect/--more/--oneway/--push-fd=/--graceful.`).
   An error reply is `Upgrade via M() failed with error: NAME` (exit 1), a local failure `Failed to upgrade connection
   via M(): …`; the confirming reply's parameters are not printed (varlinkctl passes `ret_parameters=NULL`). Then a byte
@@ -1420,6 +1450,33 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   ssh-*, WebSocket); simple HTTP mode is a clear error. Over WebSocket there is no half-close: `end()` closes the
   whole connection (§4.12), so `call --upgrade ws://…` sends stdin's EOF as a WebSocket Close and output the service
   writes after that may be lost (the bridge tears the backend down); prefer unix/tcp/exec:/ssh for upgrade pipes.
+- **`call --push-fd=FD` and `call --exec`** (M11, after varlinkctl.c at 6bd4689f): both load the optional
+  `varlink-js-native` (`node-io.ts`: `VARLINK_JS_NATIVE=<path to its index.js>`, else the `varlink-js-native`
+  package; absent is fine until needed), and only these two load it, so every other command keeps plain Node sockets.
+  `--push-fd=` (repeatable, varlinkctl.c:204-229): a value starting with `/` or `./` is opened read-only, anything else
+  must be a decimal fd number of the CLI process, duplicated at once (early validation; the same fd may be pushed
+  twice); the fds go with the call in every mode (single, `--more`, `--collect`, `--oneway`). Messages as varlinkctl's:
+  `Failed to parse --push-fd= parameter: X`, `Failed to duplicate file descriptor N: …`, `Failed to open 'P': …`;
+  without the addon `--push-fd= requires the optional varlink-js-native addon (Linux)`; a connection that cannot pass
+  fds (tcp, exec:, WebSocket, HTTP) fails the call with OperationNotSupportedError before sending. `--exec ADDRESS
+  METHOD PARAMETERS -- CMDLINE…` (varlinkctl.c:915-921, 1088-1170, exec_with_listen_fds 670-720): PARAMETERS is
+  required (`-` = stdin), `Expected command line to execute.` otherwise; `--exec and --collect/--more/--oneway may not
+  be combined.`; the call accepts fds where the connection can (else a plain call, like varlinkctl's "ignoring");
+  an error reply fails as usual and the command does not run (its fds are closed), except a `--graceful` one, which
+  runs it with the error's parameters and the error reply's fds (as varlinkctl takes the fds of whatever message it
+  got, varlinkctl.c:1139-1155). With fds the command runs through `/bin/sh -c 'LISTEN_PID=$$ … exec "$0" "$@"'`;
+  `exec --` is not portable (dash runs `--` as the command), so a command word starting with `-` is made `./-…` when it
+  is a path and refused when it is a bare name (`Refusing to execute '-x': a command name may not start with '-'`), so
+  it never reaches `exec` as an option. `--push-fd=` to a server that does not accept fds: by default (sd-varlink's
+  default too) the server drops them and the call runs, on every kernel; against a strict server (varlink-js
+  `fdPassingInputStrict`, sd-varlink `SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT`) on Linux ≥ 6.16 its socket refuses
+  them (SO_PASSRIGHTS off: `sendmsg` fails with `EPERM`), so the call fails with `Method call M() failed: connection
+  closed: write failed: the peer does not accept file descriptors (…)` (exit 1; varlinkctl prints `Failed to issue
+  M() call: Operation not permitted`, fds.sh f2). The CLI's own socket never touches SO_PASSRIGHTS (§4.15). The command gets the reply (short JSON plus LF unless `--json`/`-j` asked
+  otherwise) on stdin (a sealed memfd with the addon on Linux, like `memfd_new_and_seal_string`; else a pipe), our
+  stdout/stderr, the reply's fds as 3, 4, … with `LISTEN_FDS=n` and `LISTEN_PID` = its pid (`/bin/sh -c
+  'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"'`), `LISTEN_FDNAMES` removed, and with no fds `LISTEN_FDS`/
+  `LISTEN_PID` removed too. Differences: see below. `call --upgrade` rejects `--push-fd=` with varlinkctl's text.
 - **Output**: `pretty` = sd-json's (TAB, `"key" : value`, `{}`/`[]`, final LF), `short` = minimal + LF, `-j` =
   pretty on a TTY (stdout and stderr both TTYs, systemd's `on_tty()`). `call` defaults to `-j` (varlinkctl.c ~900),
   also for `--json=off`; the others print text unless asked. Strings as `JSON.stringify`, numbers as JS prints them,
@@ -1461,9 +1518,14 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   executable); `--json` takes no `help`; maps print integer-like keys first (JS object order, sd-json keeps the
   wire order); reals print as JS does (`1e+300`; not checked against sd-json's formatter, whose source was not at
   hand; `/`, DEL, C1 and non-ASCII are left raw as by `JSON.stringify`); `format`, `codegen`, `bridge`, `certify`
-  and the HTTP/WebSocket targets are ours; `--upgrade` came with M9; `--exec`, `--push-fd` (M11), `serve`,
-  `list-registry`, `list-sockets`, `--user`/`--system`, `monitor` options are not implemented (M9 left `serve`,
-  `--exec` and `--push-fd` out of scope). `call --upgrade`: a broken stdout (EPIPE) ends both directions and closes
+  and the HTTP/WebSocket targets are ours; `--upgrade` came with M9, `--push-fd=` and `--exec` with M11 (below);
+  `serve`, `list-registry`, `list-sockets`, `--user`/`--system`, `monitor` options are not implemented (M9 left
+  `serve` out of scope). M11's `--exec` differs: the command is spawned, not exec'ed, so its exit status becomes ours
+  (a signal: 128 + its number), the connection is closed before it starts, `LISTEN_PIDFDID` is not set (Node cannot
+  read a pidfd's inode id), SIGTERM is passed on to it (SIGINT reaches it through the terminal's process group),
+  fds we inherited without close-on-exec reach it unless the addon could mark them (varlinkctl closes all others),
+  without the addon its stdin is a pipe instead of a sealed memfd, and `--exec --upgrade` (varlinkctl puts the
+  upgraded connection on the command's stdin/stdout) is not implemented. `call --upgrade`: a broken stdout (EPIPE) ends both directions and closes
   the connection (exit 0), where socket-forward ends only channel → stdout and goes on forwarding stdin until its
   EOF (the service then sees a close instead of a half-close): stopping only that direction can deadlock against a
   cat-like service whose output nobody reads any more. Over WebSocket, stdin's EOF closes the whole connection
@@ -1499,6 +1561,292 @@ OS took the data, `isTTY`; `env`; `signal`), never `process`, so the unit tests 
   `BrokenPipeError`. Fix round 3: an endless (`yes`-like) stdin into a service that answers one line and closes must
   put the answer on stdout (in-process over unix/tcp; real process over unix and `exec:`), plus the channel-level
   cases in `test/unit/node/socket.test.ts` and `test/regression/upgrade.test.ts` (§4.11).
+
+### 4.15 varlink-js-native (M11)
+
+`native/` is the separate, private (`"private": true`, never published, no prebuilds) package `varlink-js-native`
+1.0.0-alpha.0: `src/varlink_native.c` (one C file, Node-API only, `NAPI_VERSION 8`, plus libuv's `uv_poll_t` through
+`napi_get_uv_event_loop`), `scripts/build.js` (no node-gyp: one `${CC:-cc} -std=gnu11 -O2 -Wall -Wextra -Werror
+-fPIC -shared -fvisibility=hidden -I<node>/include/node` call, `-undefined dynamic_lookup` on macOS, `NODE_INCLUDE_DIR`
+and `CFLAGS` override; a missing compiler or missing headers fail with a message, exit 1), `index.js` + `index.d.ts`
+(plain ESM, loads `build/varlink_native.node` with `createRequire`; never throws at import: `isAvailable()`,
+`loadError`, and every other export throws `ERR_VARLINK_NATIVE_UNAVAILABLE` when not loaded; Bun and Deno are refused
+up front), `test/*.test.ts` (`npm --prefix native test`, outside the root `npm test` glob, so Bun/Deno runs and a
+macOS root `npm test` without the addon are unaffected; every file skips when the addon is unavailable). Zero
+dependencies. Supported: Linux (glibc; musl untested). **macOS is a development target only, not supported at
+runtime**: it builds and its tests run so the addon can be worked on there (SCM_RIGHTS works; credentials from
+`getpeereid` + `LOCAL_PEERPID`; no pidfd, no xattr, no `MSG_CMSG_CLOEXEC`: `FD_CLOEXEC` is set right after
+`recvmsg`, so a concurrent fork/exec can inherit a received fd), but its kernel differs where the channel relies on
+Linux semantics and those differences are not handled: a `sendmsg` with fds while the peer's buffer is full fails
+with `EMSGSIZE` instead of `EAGAIN` (the channel treats it as a write error and the connection ends, where Linux would
+wait for `wantWrite`; seen while writing the peek tests, below), fds that do not fit the control buffer stay installed
+unreported instead of `MSG_CTRUNC`, and there is no SO_PASSRIGHTS. Windows: not built.
+
+**Q5 (resolved, §9): our own addon.** `usocket` 1.1.0 is built on `nan` (not ABI-stable: rebuilt per Node major) and
+pulls bindings, debug, nan, node-gyp; `peercred` 1.1.2 (nan + bindings + errno) was last modified 2022-06-23;
+`unix-socket-credentials` 0.1.3 uses ffi/ref (2022). None does pidfd, xattr or the read/write semantics below.
+
+**The addon's API** (`index.d.ts`; src/node defines the `NativeAddon`/`NativeSocket` interfaces it needs, so neither
+core nor rpc imports native types): `connect(sunPathBytes)` (a leading NUL = abstract, exact length; `socket(AF_UNIX,
+SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK)` + `connect`; `EINPROGRESS` → poll writable → `SO_ERROR`, reported through
+`onconnect`; anything else throws, `EAGAIN` (a full backlog: AF_UNIX does not queue the connect) included, as libuv's
+`uv_pipe_connect` does), `adopt(fd)` (a socket over an `F_DUPFD_CLOEXEC` duplicate made non-blocking; the caller keeps
+its fd), `dup`, `close`, `setCloexec`, `isUnixSocket`, `setPassRights(fd, on)` (SO_PASSRIGHTS on a listening socket;
+false where the kernel has none), `pipe`, `setXattr`/`removeXattr`/`setPathXattr`, `memfdSealed` (Linux),
+`SCM_MAX_FD` (253). A socket has `read()` (arms one `recvmsg`, result through `onread(error, bytes, fds, truncated)`),
+`send(bytes, fds?)` (bytes written, or -1 when the buffer is full), `wantWrite()` (→ `onwritable`), `shutdownWrite()`,
+`close()` (idempotent), `setAcceptFds(on)`, `peerCred()` (uid/gid/pid), `peerPidfd()` (a new pidfd, or null),
+`getFd()`, `ref()`/`unref()` and the test hook `setControlBufferFds(n)`; module-level test hooks `eventfd()` and
+`pidfdOpen(pid)` (Linux, else `ENOSYS`; untracked: the caller owns the fd). Callbacks are properties of the socket object
+(looked up by name, so no strong reference from C to JS closures). Errors are JS `Error`s with `code` (errno name),
+`errno` (negative, as Node) and `syscall`; an argument of the wrong type throws (`ERR_INVALID_ARG_TYPE`), every setter
+included.
+
+**C rules.** Every syscall result checked; every fd we create or receive is close-on-exec; no SIGPIPE
+(`MSG_NOSIGNAL`, `SO_NOSIGPIPE` on macOS); `EINTR` retried everywhere except `close()`; no fd is touched after its
+close. One `uv_poll_t` per socket, started only while a read, a write wait or a connect is pending (and then the JS
+wrapper is held by a strong reference, so it cannot be collected while libuv may call back); idle, the reference is
+weak and an unreachable socket is closed by its finalizer (`uv_close`, the struct freed in the close callback). An
+open socket keeps the event loop alive while something is pending, which is always the case for a varlink connection
+(its reader has a read outstanding) except while a stream's buffer is full. Per-environment instance data (one per
+Node environment: the main thread and each worker) holds the class, the 64 KiB read buffer (never shared between
+threads) and the list of live sockets; an async environment cleanup hook (`napi_add_async_cleanup_hook`) closes every
+socket's poll handle and fd when the environment tears down (a worker terminated with open connections, the main
+environment exiting) and lets teardown go on once libuv ran the close callbacks; the instance-data finalizer detaches
+sockets that are finalized later. The instance also tracks the fds its JS holds for the library: fds received with
+messages, the library's duplicates (`dup(fd, true)`, used for every fd the library sends) and its channels' pidfds
+(`peerPidfd(true)`); the addon's exported `dup(fd)`/`peerPidfd()` are untracked, owned by the caller (close them any
+way). Each tracked fd is recorded with its file's identity (`st_dev`, `st_ino`, file type, `F_GETFL` access mode;
+a number tracked again replaces its stale entry, since a number cannot be open twice). JS forgets one with `close()`
+(which closes it) or `release()`, called when the fd is handed to a user (`ctx.takeFd`, an `acceptFds` reply or error;
+`handOver` in the core framer calls the native handle's `handOver()`, duck-typed), so the hook closes exactly what
+the library still held when the environment went away (fds queued in a framer, `ctx.fds` of an unfinished call, a
+pidfd) and never an fd a user owns. The hook is defensive, best effort, about fds closed behind the library's back:
+before closing a tracked number it `fstat`s it and closes it only if it still matches the recorded identity (EBADF or
+any difference: left alone), so a number another thread reused meanwhile is usually not closed under it. What it
+cannot tell apart: a reused number on the same inode (a `dup` of the tracked file, or another open of it with the
+same access mode), and anon-inode fds, which all share one inode (eventfd, epoll, timerfd, signalfd, inotify, and
+pidfds before Linux 6.9, peer pidfds via `SO_PEERPIDFD` from 6.5; from 6.9 pidfds have their own pidfs inodes). The
+anon inode is probed once per environment (`fstat` of an eventfd, or of an epoll fd if eventfd fails; the fallback
+does not help with `EMFILE`/`ENFILE`, which fail both; `stats().anonProbe`); a tracked fd on it is classified when
+tracked from `/proc/self/fd/N` (`anon_inode:[pidfd]`) and, for a pidfd, the `Pid:` of `/proc/self/fdinfo/N`, which
+must be > 0 (-1, a process already gone, and 0, one outside our pid namespace, are shared by unrelated pidfds: such
+a pidfd is treated like any other anon-inode fd).
+What teardown closes: **≥ 6.9**, every tracked fd still matching its identity (received fds, duplicates, pidfds:
+pidfs inodes are per process); **before 6.9**, the same for non-anon fds, and a tracked pidfd only if `/proc` still
+names it a pidfd of the same `Pid:` > 0 (not told apart: another pidfd of the same process on a reused number); any
+other anon-inode fd (a received eventfd, say: libuv's own loop fds in other threads are of these kinds) is left open,
+a documented best-effort leak at worker teardown, as is a pidfd whose process exited meanwhile (`Pid:` -1). Any
+tracked pidfd (peer, received or `dup(fd, true)`) whose `Pid:` is 0 (the process is outside our pid namespace) or
+-1 when tracked is left open at teardown too and counted (round-6 change, see the fix-round notes). Without
+`/proc` no anon-inode fd is closed, and without the probe (both fds failed, e.g. `EMFILE`/`ENFILE`) none at all. Every
+tracked fd left open counts in the process-wide `stats().teardownSkipped`. `more` replies of an `acceptFds` stream or
+collect are handed over when they reach the caller (the iterator yields one, the collection resolves), not on arrival:
+buffered replies never delivered stay tracked, are closed when dropped (`return()`, a failed collect) and otherwise at
+teardown. errno is saved right after each syscall, before any napi
+call; every fd received is settled (handed on or closed) before the first napi call, so a failing handle scope or
+allocation cannot leak one.
+
+Reads follow sd-varlink's `json_stream_read` (json-stream.c:1229-1376): one `recvmsg` per `read()`, flags
+`MSG_DONTWAIT|MSG_CMSG_CLOEXEC`. **While fd input is accepted, reads are bounded**: a `recv(MSG_PEEK)` finds the next
+NUL and only that much is read, as `json_stream_peek_message_boundary` does (json-stream.c:1187-1227, used at 1282;
+our peek starts with a 4 KiB window and widens it ×4 up to the 64 KiB buffer only while no NUL is in sight, so a
+stream of small messages does not copy 64 KiB per peek),
+because "recvmsg() may combine preceding data with the next SCM_RIGHTS-bearing send" (1049-1051): on Linux one
+unbounded `recvmsg` returned a fd-less message plus the next send's start with its fds, which the framer then gave to
+the wrong message (shown in the VM by building without the bound; macOS's kernel ends a read at such a send anyway).
+**While input is off**, fds that arrive are closed at once and the message goes on without them: sd-varlink reads
+with plain `recv()` then (json-stream.c:1318-1321), so the kernel discards them; we keep a control buffer and close
+them ourselves because macOS leaves fds that do not fit installed and unreported. **`MSG_CTRUNC`** (input on; e.g. an
+LSM refused some fds): the fds received are closed, the bytes delivered, `truncated` set, as json-stream.c:1308-1317
+logs, drops and continues ("the request handler will surface a clean error to the peer when it tries to peek the
+missing fd"). An EOF never carries fds. `setAcceptFds(on, passRights)` sets `SO_PASSRIGHTS` only when asked (strict
+mode, below): always on the first such call, later only when the value changes (the value 83 is defined where the headers lack it, asm-generic
+architectures only; a kernel without the option, `ENOPROTOOPT`/`EINVAL`/`EOPNOTSUPP`, is ignored like
+json-stream.c:705-708, and the requested value is recorded anyway, as json-stream.c:711 sets its flag, so later calls
+with the same value do not re-issue it). Writes: `sendmsg` with `SCM_RIGHTS` on the first byte only (a message's first part); more
+than 253 fds is `ENOBUFS` before writing, like sd-varlink.c:3268.
+
+**SO_PASSRIGHTS (Linux ≥ 6.16): sd-varlink's default, strict mode opt-in.** A socket with it off makes the *sender's*
+`sendmsg` with fds fail with `EPERM` (on Linux ≤ 6.15 there is no such option). We copy sd-varlink's default, which
+leaves it alone:
+- **Default (every socket):** never touched; the kernel default (on) stays. `json_stream_set_allow_fd_passing_input`
+  returns early when the input flag does not change (json-stream.c:691-692), so a fresh sd-varlink client keeps the
+  default, and server connections without `SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT` skip the per-connection
+  setsockopt (sd-varlink.c:3347-3352, applied at 3612); the listening socket is touched only in strict mode
+  (sd-varlink.c:3787-3792, 3851-3853). With input off the read path drops the fds and the message goes on, on every
+  kernel: a client without `acceptFds` gets a reply that carried fds (fds dropped, connection usable), a server
+  without `allowFdPassingInput` runs a call that carried fds (fds dropped). **Clients differ from sd-varlink:** its
+  client connections always use the setsockopt when input changes (`with_sockopt = !v->server || …STRICT`,
+  sd-varlink.c:3347-3352), so an sd-varlink client that switches input off after having it on makes a later reply with
+  fds fail the server's write (`EPERM`). Our client never touches SO_PASSRIGHTS: its input is switched per call
+  (`acceptFds`) and stays permissive (a reply's fds while input is off are dropped silently, no peer `EPERM`).
+- **Strict (opt-in, `listen(…, {native, fdPassingInputStrict: true, allowFdPassingInput})`, also on
+  `listenFromEnv`/`listenAuto`):** as `SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT`, the listening socket gets
+  SO_PASSRIGHTS = `allowFdPassingInput` before anything is accepted (accepted sockets inherit it; for an `{fd}` socket
+  before Node serves it, like sd-varlink.c:3787-3792), and each accepted connection sets it when the server switches
+  input: always on the first switch (an accepted socket's value is unknown: inherited from the listening socket, or
+  from a service manager's `PassRights=`; sd-varlink's tracked flag starts off, so its first allow reaches the
+  setsockopt too, sd-varlink.c:3612, json-stream.c:691-692, 705-708; its first *disallow* returns early there and
+  keeps the inherited value, where we set it off), later only when the value changes. A
+  `listen()`/`listenFromEnv()` strict listener carries the `allowFdPassingInput` it was given
+  (`strictFdPassingInput`), and `server.serve()` throws a `TypeError` when it differs from the server's (so the two
+  cannot silently disagree; `server.handle()` on single channels still works, each connection being set from the
+  server). A client sending fds to a strict server without input
+  then fails: the channel turns the `EPERM` into an `OperationNotSupportedError` ("the peer does not accept file
+  descriptors …", `code` "EPERM", the errno error as `cause`); like any write error it ends the connection's writes
+  and the connection closes, which is what sd-varlink does (`json_stream_write` returns the errno,
+  json-stream.c:1151-1161, and `sd_varlink_process` disconnects, sd-varlink.c:1610-1614, 1675-1678); varlinkctl
+  prints `Failed to issue M() call: Operation not permitted` (fds.sh f2). Known windows (strict mode only):
+  sd-varlink sets it before `bind` on a socket it creates (sd-varlink.c:3851-3853); Node creates the listening fd
+  inside `listen()`, so ours is set right after: no client can reach a unix path socket then (still in the private
+  0700 directory), but the bind-at-path fallback and `unix:@` are reachable between Node's `listen()` and our
+  setsockopt, so a client that fast gets the kernel default. Per connection: an accepted socket has its listener's
+  value until the server's `handle()` runs the setsockopt, so where the two differ (a custom accept loop handing a
+  strict listener's channels to a server with another `allowFdPassingInput`; `serve()` and `mergeListeners` refuse the
+  mismatch) a client that sends fds right after connecting gets the listener's value: with a listener without input,
+  `EPERM` (seen in the VM on Linux 7.0: the client's `sendmsg` runs before the server's `accept`, every time, when
+  both are in one process). sd-varlink's per-connection setsockopt also runs only after `accept`
+  (`varlink_server_link_connection`, sd-varlink.c:3612, called from `sd_varlink_server_add_connection_pair`, sd-varlink.c:3659); it avoids the
+  mismatch by setting the listening socket from the same server's flags. Pass the server's `allowFdPassingInput` to `listen()` (`serve()` enforces it).
+The tests probe the kernel (`setPassRights` on a socket) and assert the branch it takes: default behaviour on every
+kernel, the strict branch per kernel; CI's `native` job prints `uname -r`.
+
+**The channel** (`src/node/native.ts`, `nativeChannel`): the `fromNodeSocket` contract (§4.11) over an addon socket:
+reads one `recvmsg` at a time (the kernel buffer is the read backpressure), bytes before an error or EOF first; writes
+queued, each `write()` resolving when all of it went to the kernel; partial writes keep the remainder and never send
+the fds twice (they ride with offset 0 only); `EAGAIN` → `wantWrite`. A write error (EPIPE, ECONNRESET, …) rejects
+that write and every later one but reads go on to the peer's EOF or error (no unread input is lost; the M9 lesson).
+`end()` = `shutdown(SHUT_WR)` after the queue drained; `close()` idempotent (queued writes reject, a pending read gives
+null, the fd and the peer's pidfd are closed, `closed` resolves); once the peer's EOF (or a read error) was read and
+our side is ended (or failed) the channel closes by itself, like a half-open Node socket. `capabilities`: `fdPassing`
+(input off by default, SO_PASSRIGHTS untouched unless strict; output off by default; `duplicate`), `peer` (uid/gid/pid read once at
+accept/connect with `SO_PEERCRED`; when that fails, `peer()` throws the error, so a server enforcing a per-UID limit
+refuses the connection; `pidfd` is fetched with `SO_PEERPIDFD` on first access only (Linux ≥ 6.5; it names the process
+that connected whenever it is asked), owned by the channel, handed out as a view) and `upgraded`.
+
+**Where the channel is used** (only with `native` given and available; without it nothing changes):
+`connect(address, {native})` for `unix:` and `unix:@` (client role); `listen(address, {native})` keeps Node's
+`net.Server` for listening and accepting (activation, `mode`, the private-directory publish and unlink logic stay as
+they are) with `pauseOnConnect: true` (it already was), and on `connection` takes `socket._handle.fd`, has the addon
+adopt a duplicate and destroys the Node socket (closing only Node's copy: nothing was read, so a call sent right with
+the connect is not lost; tested 40 times per run); unix paths, `unix:@` and `{fd}` listeners whose fd is a unix socket
+(`isUnixSocket`), never TCP. A connection the addon cannot take over (no fd, an adopt failure such as `EMFILE`) is
+refused: closed and reported to the listener's `onError`, never served as a plain socket, which would have no
+credentials and escape the per-UID limit (sd-varlink refuses a connection whose credentials it cannot get,
+sd-varlink.c:3568-3570). `listenFromEnv({native, fdPassingInputStrict, allowFdPassingInput})` (and `listenAuto`)
+passes them to `listen({fd})`, adopts connected unix activation fds (closing the original; a unix socket the addon
+cannot adopt is closed too, the connection refused, and `listenFromEnv` rejects; the listeners it already opened are
+closed by its error path, as in M8, so no activation fd is left half-owned) and sets `FD_CLOEXEC` on every `LISTEN_FDS` fd, as `sd_listen_fds` does (the `/dev/null` cover
+of §5.8 stays). `exec:` socketpairs, TCP, ssh, WebSocket and HTTP never get fd passing or peer
+credentials.
+
+**fds through the protocol** (core, §4.1): `Framer.push(bytes, fds)` binds fds to the message starting at the
+chunk's first byte (`takeFds()` after `next()`); fds while a message is incomplete are a protocol error recorded like
+an oversized message (complete messages before it are still delivered, then the connection closes): sd-varlink's
+`json_stream_read` returns `EPROTO` when fds come while its input buffer is not empty (json-stream.c:1345-1350), and
+its input fds belong to the message parsed next. With bounded reads (above) a chunk never reaches past a NUL, so the
+first message it starts is the one sent with the fds. A single send holding several messages carries its fds on the
+first one (tested). An `fdError` ("truncated") is not a protocol error: the server reports `fds-dropped` to `onError`,
+the client to its `onError` (`fds-dropped`), and the message goes on without fds. `ClientSession`/`ServerSession` put a
+message's fds on its `reply`/`error`/`call` event; an upgrade confirmation's and post-upgrade fds are closed. An
+`acceptFds` call's error reply keeps its fds on the rejected error as `fds` (non-enumerable; the caller owns them);
+other error replies' fds are closed.
+Dispatch gives handlers `ctx.fds`, `ctx.takeFd(i, parameter = "fds")`, `ctx.pushFds(...fds)` and `ctx.peer` (§5.4),
+closes unclaimed received fds and unsent pushed duplicates when the call finished, and passes a reply's pushed fds
+to `send(bytes, fds)`. The `UpgradedChannel` is bytes only: it switches fd input off, closes fds that still come,
+rejects writes with fds, keeps only `capabilities.peer` (and calls `upgraded`, which removes the xattr).
+
+**The upgrade boundary and fds (M5 of review-1).** sd-varlink bounds reads for upgradable servers too
+(`JSON_STREAM_BOUNDED_READS`, sd-varlink.c:3604-3606) so it never consumes post-upgrade bytes, then hands the raw fd to
+the upgrade callback, which reads with plain `read()`: fds riding on post-upgrade bytes are discarded by the kernel
+there (or refused with `EPERM` on ≥ 6.16 when input is off). We do not need bounded reads for the bytes: the framer
+keeps everything past the upgrade call's NUL and the upgraded channel yields it first (§4.10). For fds the result is
+the same as systemd's: the server's reader parks after an upgrade call (no read is issued until it is answered),
+reads are bounded at its NUL whenever input is on, and the upgraded channel switches input off before its first read
+and closes any fd that still arrives. So fds sent after the upgrade request are dropped (≤ 6.15) or refused (≥ 6.16),
+never delivered to the varlink side; a protocol that needs fds after an upgrade is out of scope (documented).
+
+**The `user.varlink` xattr** (best effort, sd-varlink.c:165-211): "client" on a connected socket (sd-varlink.c:230,
+648), "server" on an accepted one (3685), "listen" on the listening socket (3798, 3850), "entrypoint" on an absolute
+socket path (3863-3864); removed from a connection socket on upgrade (1524-1527, `ENODATA` no error). Every failure
+is ignored. Seen in the VM: on Linux 6.8 `fsetxattr(user.varlink)` on a unix socket fails with `EPERM`, and setting
+it on the socket's path is refused too (user xattrs only on regular files and directories), so nothing is tagged
+there; Linux 7.0.0-43 (fix round 1) gives the same `EPERM` for the socket; macOS: `ENOTSUP`.
+
+**Per-UID limit** (§5.4): opt-in, like sd-varlink's `SD_VARLINK_SERVER_ACCOUNT_UID` (sd-varlink.c:3492, 3518):
+without `maxConnectionsPerUid` nothing is counted; with a number (sd-varlink uses 128 when the flag is set,
+sd-varlink.c:47) connections are counted by the channel's `peer().uid`, where the channel has the capability (the
+server's side reads it, so with a native listener a client without the addon counts too); checked after the total
+limit like `validate_connection` (sd-varlink.c:3468-3508), the connection refused (closed, `connection-limit`), root
+not exempt; decremented when the connection ends. With the limit set, a channel whose `peer()` throws, or whose UID is
+invalid (`(uid_t) -1`, not an integer), is refused (`connection-refused`), as sd-varlink refuses a connection whose
+credentials it cannot acquire or whose UID is invalid (sd-varlink.c:3494-3497, 3568-3570). Channels without the
+capability (tcp, plain Node sockets) are not counted.
+
+**Tests** (`native/test/`, `{ timeout }` everywhere, each file checks that it leaves no fd behind by counting
+`/proc/self/fd` or `/dev/fd`): `fds.test.ts` (both directions, `more`/collect replies with fds, an abandoned stream, a failed proxy collect,
+the opt-ins and their absence: default behaviour on every kernel (a reply with fds to a call without `acceptFds`
+arrives and the connection stays usable; a server without input runs the call), strict mode per kernel; unclaimed
+fds, a coalesced send, separate sends read in one go (A gets no fd, B its own: bounded reads; on Linux the addon's
+`stats().boundedCuts` counter proves A and B were queued together), 8 MiB messages with fds both ways, the 253 cap,
+no addon → OperationNotSupportedError, upgrade, first call on connect, `ctx.fds` views, a strict listener without
+input whose connections a server with input handles (fds pass), strict `listen({fd})` prepared once), `channel.test.ts`
+(MSG_CTRUNC on the channel and at a server (`fds-dropped`, the call runs), input off by default (dropped on every
+kernel) and on a strict channel (EPERM on ≥ 6.16), input on, bounded reads (two queued sends, a 200 KiB message
+through the widening peek, 2000 small pipelined messages one per read, a message whose NUL is at offset 4095, 4096,
+16383, 16384, 65535 or 65536 followed by one with an fd, the `peekWidenings` counter showing the widening ran), the
+first strict `setAcceptFds` always reaching the setsockopt (`passRightsCalls` counter, and no repeat for an unchanged value on any kernel), a re-tracked number keeping one
+entry (`trackedFds`), setter type checks, output off, half-close,
+close, a write error keeping the peer's data readable, the helpers, error shape), `peer.test.ts` (credentials of a
+child process client, the server's from a client, pidfd on Linux ≥ 6.5 and its lazy view, the per-UID limit, xattr
+probe), `worker.test.ts` (a stress test, not a smoke test: three workers, each 3000 tiny pipelined calls through
+bounded reads plus 40 fd calls with 100 kB replies, at once; a worker terminated while it holds a received fd and a
+pidfd; a worker terminated while it keeps fds handed to it (an `acceptFds` reply, a pulled stream item, `takeFd`: they
+stay open) with two stream replies buffered (closed); a tracked number closed behind the addon's back and reused (left
+open); a worker terminated with an open native connection), `cli.test.ts` (`--push-fd=` and `--exec` end to
+end, their messages, `--push-fd=` to a server without input by default and strict, `--exec --graceful` taking the error
+reply's fds, a command word starting with `-`). Root tests without the addon: `test/unit/protocol/framer-fds.test.ts`
+(fds mid-message, coalesced, unclaimed: deterministic, chunk by chunk), `test/unit/rpc/server-peer.test.ts` (per-UID
+opt-in with more than 128 connections, refusals incl. UIDs 0xFFFFFFFF and 0xFFFF), `test/unit/node/native-listen.test.ts`
+(an addon that cannot adopt: the connection is refused; SO_PASSRIGHTS only in strict mode; `serve()` refusing a strict
+listener whose `allowFdPassingInput` differs, also through `mergeListeners`; `mergeListeners` refusing strict
+sources that disagree). macOS skips MSG_CTRUNC
+(the kernel leaves fds that did not fit installed, unreported) and pidfd. Proofs (each run against the code without
+the fix, in the VM on Linux 7.0 unless said): review-1's bounded-read tests fail without the bound and its
+worker-termination test fails without the cleanup hook (on macOS both pass anyway); review-2's default-behaviour tests
+(fds.test "reply with fds to a call without acceptFds", "server without allowFdPassingInput (default)", cli.test
+"--push-fd= to a server without fd input (default)") fail with fix round 1's code (EPERM); the stress test fails 3 of
+3 runs with one read buffer shared by all environments (corrupted JSON); the worker-hold test fails without closing
+the tracked fds (2 fds leak: the received one and the pidfd). Fix round 3 (review-3, run on macOS against the code
+without each fix): the first-strict-call test fails with the old `-1 = on` logic (0 setsockopt attempts, expected 1;
+on Linux ≥ 6.16 the strict-listener test is then the EPERM case); the reused-number test fails with round 2's
+addon (teardown closed the reused fd); the kept-fds worker test fails with arrival-time `handOver` (2 fds leak: the
+buffered replies); the `serve()` mismatch and `listen({fd})`-once tests fail without their fixes. Fix round 4 (run
+on macOS against the code without each fix): the failed-proxy-collect test leaks 2 fds without `collectSink`; the
+first-strict-call test makes 2 setsockopt attempts for an unchanged value (expected 1) when a kernel without
+SO_PASSRIGHTS leaves the state unrecorded; the re-tracking test keeps 2 entries for one number; the `mergeListeners`
+test sees no exception. The strict-listener test (CI run 43782174441, Linux 7.0-azure; 6 of 6 runs in the VM) sent
+fds right after connecting, inside the per-connection window above (the client's `sendmsg` failed with `EPERM` before
+the server had accepted, 0 setsockopt attempts); it now completes a plain call first. Round 4's drop of a reply
+pushed to a `ReplyStream` after it is done (`#push`, connection.ts) is defensive: no path reaching it is known or
+tested. Fix round 5 (in the VM on Linux 6.8, pidfds on the anon inode): the worker-hold test timed out with round 4's
+addon (the pidfd leaked: anon-inode fds were never closed) and passes with the `/proc` pidfd classification; a Linux
+test asserts `anonProbe` is `"eventfd"`, and the hold test that teardown skipped nothing. Fix round 6 (review-6):
+the native CI job runs on ubuntu-22.04 too (kernel 6.8.0-1070-azure: pidfds on the anon inode; it ran the
+pidfd-reuse test, which passed; ubuntu-24.04/latest are on 7.0-azure); a pidfd is classified as one only with
+`Pid:` > 0; worker tests for a received eventfd (left open, counted) and a reused pidfd number; the
+`teardownSkipped` counter is an `unsigned long` (lock-free on 32-bit targets). Fix round 7 (review-7, tests and
+docs): a regression test for the `Pid:` > 0 rule (a tracked pidfd of a reaped child, its number reused by a pidfd of
+a second reaped child, both `Pid:` -1: left open, `teardownSkipped` +1; in the VM on Linux 6.8 it fails with the
+`pid > 0` guard removed, the fd being closed); CI's ubuntu-22.04 entry sets `VJN_REQUIRE_ANON_PIDFD=1`, which turns
+that test's "pidfds are not on the anon inode" skip into a failure; the pidfd probe of the tests never throws
+(ENOSYS/EPERM become a skip reason); the eventfd test reads back a counter (0x5eed) the worker wrote, proving the
+fd left open is that eventfd; the pidfd-reuse test runs on every kernel with pidfds (≥ 6.9: different pidfs inodes);
+`pidfdOpen`'s argument error says "pid". macOS quirk seen
+while writing the peek tests: a `sendmsg` with fds while unread bytes fill the peer's buffer fails with `EMSGSIZE`
+(not `EAGAIN`), so there the fd message goes after the first was read (dev platform; not handled in the channel).
+`test/interop/vm/fds.sh` (§7.4): varlinkctl 262.2 ↔ varlink-js.
 
 ---
 
@@ -1559,11 +1907,26 @@ Semantics:
 - **Backpressure**: `stream()` buffers at most `highWaterMark` replies (our default 64; sd-varlink has no
   equivalent knob), then stops reading the socket so the kernel pushes back on the server.
 - Errors: remote error replies reject with a `VarlinkError` subclass (§6).
-- **fds** (M11, fd-capable channels only): `conn.call(m, p, { fds: [h1, h2] })` attaches fds to that
-  call's message; `{ acceptFds: true }` opts in to receiving fds for that call only (UAPI: clients MUST
-  NOT accept fds unless they invoke a method that returns them). With `acceptFds`, the result is
-  `{ parameters, fds }` instead of bare parameters (and stream items likewise). fds arriving for a call
-  without the opt-in are closed, and the connection is treated as a protocol error.
+- **fds** (M11, implemented; fd-capable channels only: `connect("unix:…", { native })`, §4.15):
+  `conn.call(m, p, { fds: [h1, 3, fileHandle] })` attaches fds (numbers or FdHandles, at most 253: more is a
+  `RangeError`) to that call's message, in every kind of call (`call`, `stream`, `collect`, `oneway`, `upgrade`). The
+  caller keeps its fds: the library sends duplicates made when the call is made and closes them after the write
+  (§4.1), so `fh.close()` right after `conn.call(…)` returned is fine. `{ acceptFds: true }` opts in to receiving fds
+  for that call only (UAPI: clients MUST NOT accept fds unless they invoke a method that returns them; fd input is
+  switched on while such a call is in flight). With `acceptFds`, the result is `{ parameters, fds }` (`WithFds<T>`)
+  instead of bare parameters, and stream/collect items likewise; overloads type it (`acceptFds?: false` on the plain
+  options), so typed results still match their types; the caller owns those fds. `acceptFds` on `oneway`/`upgrade` is
+  a `TypeError`. With no `acceptFds` call in flight the client's input is off: fds a server sends then arrive and are
+  dropped silently, the reply going through and the connection staying usable, on every kernel (the client never
+  touches SO_PASSRIGHTS, so the server's `sendmsg` is not refused; json-stream.c:691-692, 1318-1321). fds that do come
+  with a reply to a call without the opt-in (input on for another, pipelined call) close the connection as a protocol
+  error, and are closed. An `acceptFds` call's error reply rejects with the error carrying its fds as `fds`
+  (non-enumerable; the caller owns them and must close them, as the `call()`/`acceptFds` JSDoc says). Buffered or
+  collected replies that never reach the caller (an abandoned stream, a failed collect) have their fds closed; the
+  caller's ownership (the transport's `handOver`) starts when a `more` reply is yielded or the collection resolves, a
+  single reply's at once (§4.15). Without fd capability,
+  `fds`/`acceptFds` reject with `OperationNotSupportedError` before anything is sent. Not on the Pool or typed clients
+  (use a Connection: `conn.call(Desc.Method, p, { acceptFds: true })` is typed).
 
 ### 5.2 Pool
 
@@ -1651,6 +2014,7 @@ server.addInterface(idlText, { Ping: async (p) => ({ pong: p.ping }) });
 await server.serve(await listen("unix:/run/org.example.ftl", { mode: 0o644 }));
 // 0o644 = owner can connect, others can only read the xattr (UAPI recommendation). Widen deliberately.
 // also: listen("tcp:127.0.0.1:0"), listenFromEnv() (socket activation), any Listener / ByteChannel
+// M11: listen(address, { native }) (import * as native from "varlink-js-native"): fds, ctx.peer, per-UID limit
 await server.shutdown({ graceful: true, timeout: 5_000 });
 ```
 
@@ -1684,6 +2048,29 @@ Handler context `ctx`: `signal` (aborts when the client disconnects or the serve
 `continues` reply from a plain async handler, sd-varlink style), `upgrade(replyParams?)` (M9, §5.6; the flag was
 `ctx.upgrade` before M9 and is `upgradeRequested` now that `upgrade` is the method).
 
+M11 (implemented, §4.15): `ctx.peer` (`{uid, gid, pid, pidfd?}` or undefined: credentials exist on unix connections
+accepted by a listener with the native addon; read once at accept; `pidfd` is fetched on first access and is a view:
+the connection owns and closes it, its `close()` does nothing, its `fd` is -1 once the connection closed), `ctx.fds`
+(the fds of this call as views: library-owned and closed when the call finished; a view's `close()` does nothing and
+its `fd` is -1 once the fd was claimed or closed, so a handler that keeps `ctx.fds` past the call or past `takeFd`
+never sees a number that may have been reused), `ctx.takeFd(index, parameter = "fds")` (claims one, returning the
+owned handle; `InvalidParameterError({parameter})` for a missing or already claimed index, so a handler can let it
+propagate), and
+`ctx.pushFds(...fds)` (like `sd_varlink_push_fd`, sd-varlink.c:3258-3277: fds for the call's *next* message, a
+notify, yield, returned value or error; duplicated at once, so the handler may close its own right away; at most 253
+per message, `RangeError`; `OperationNotSupportedError` unless the server allows fd output on that connection).
+fd passing is opt-in per server, like `sd_varlink_server_new` flags `SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT`/
+`OUTPUT` applied per connection in `varlink_server_link_connection` (sd-varlink.c:3612-3613): `createServer({
+allowFdPassingInput, allowFdPassingOutput })` (default false). Fds sent with a call to a server without input are
+dropped and the call runs without them, on every kernel (sd-varlink's default: SO_PASSRIGHTS untouched, plain `recv()`,
+json-stream.c:1318-1321). Strict mode is opt-in on the listener, like `SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT`:
+`listen(…, {native, fdPassingInputStrict: true, allowFdPassingInput})` (pass the server's `allowFdPassingInput`) sets
+SO_PASSRIGHTS on the listening socket and per connection (§4.15), so on Linux ≥ 6.16 a client sending fds to a server
+without input fails its `sendmsg` with `EPERM` (its call rejects, its connection closes).
+fds the kernel truncated (MSG_CTRUNC) are dropped and reported to `onError` as `fds-dropped`; the call runs. No
+per-method or per-connection switch (sd's `sd_varlink_set_allow_fd_passing_*` from a connect callback): input must be
+decided before the call's bytes are read, and we have no connect callback.
+
 **Dispatch rules (the spec, from UAPI.20; these fix F5–F7):**
 
 | Situation | Reply (none at all if `oneway`) |
@@ -1711,8 +2098,11 @@ server default is `"warn"`: an invalid reply is still sent, and the mismatch is 
 That catches handler bugs against the IDL, like sd-varlink's `validate_method_reply`. Core never reads
 environment variables; set the option explicitly (e.g. `"off"` for hot paths).
 
-Limits: from sd-varlink, `maxConnections` 4096, `maxConnectionsPerUid` 128 (only when peer credentials
-are available, M11) and `maxMessageSize` 16 MiB; our own default, `maxQueuedCalls` 64 per connection
+Limits: from sd-varlink, `maxConnections` 4096, `maxConnectionsPerUid` (M11, §4.15: opt-in like sd-varlink's
+`SD_VARLINK_SERVER_ACCOUNT_UID`, sd-varlink.c:3492, 3518; unset = no per-UID counting; sd-varlink uses 128 with the
+flag, sd-varlink.c:47; counted where peer credentials are available; a connection over it is closed and reported as
+`connection-limit`, root included; with it set, unreadable credentials or an invalid UID are refused as
+`connection-refused`) and `maxMessageSize` 16 MiB; our own default, `maxQueuedCalls` 64 per connection
 (beyond that, stop reading: backpressure). No idle timeout on server connections (F1). Optional
 `exitOnIdle: ms` for socket-activated services (M8): the *server* shuts down after that long without any open
 connection (0 = when the last one closed), and `server.closed` resolves after any shutdown (§5.8).
@@ -1754,7 +2144,9 @@ our target (ENOENT ignored; no `realpath` matching on removal), so foreign entri
 adopted entry spelled differently (it may be another binder's spelling of the same socket); the check and the `unlink` are two steps (no atomic compare-and-unlink),
 so an entry another binder puts in place between them is removed. On macOS/BSD a live socket with a full backlog
 refuses connects like a stale one (Linux gives `EAGAIN`, counted as live), so a busy service's entry may be replaced
-there, as with `listen()`. The `user.varlink` xattr is M11 (native addon).
+there, as with `listen()`. The `user.varlink` xattr is M11 (native addon, best effort: `listen(…, {native})` sets
+"entrypoint" on the socket path and "listen" on the socket, as sd-varlink does; registry entries are symlinks and
+get none; §4.15).
 
 The binding of a `listen({fd})` listener (an inherited socket: socket activation, so also a merged activation
 listener delegating to it) has an `unbind()` that does nothing: the socket belongs to the service manager and
@@ -2099,8 +2491,28 @@ without NUL → connection closed and memory bounded, wire output contains no `c
     head -n1` it printed `y` in only 1 of 3 earlier runs); e1: varlinkctl gives the FIFO reader EOF only at exit,
     because it forwards a reopened copy of stdout (`dup_stdio_fd`), so socket-forward's close at the peer's EOF
     leaves fd 1 open.
+  - M11 fd passing interop (VM only, not CI, not `npm test`): `npm --prefix native run build`, then
+    `VARLINKCTL=/path/to/varlinkctl [NODE=node] [SYSTEM_VARLINKCTL=/usr/bin/varlinkctl] test/interop/vm/fds.sh`
+    (helper `fds-server.ts`, a varlink-js server with the addon): (a) `varlinkctl call --push-fd=3 … 3<file` → the
+    server reads the file through the fd; (a2) `--push-fd=/path`; (b) `varlinkctl --exec call … OpenPipes -- reader`
+    → the command reads the reply on stdin and two pipes as fds 3 and 4, with `LISTEN_FDS=2` and `LISTEN_PID` its
+    pid; (c) `varlink-js call --push-fd=3`; (c2) `varlink-js call --exec`, its output compared with (b)'s; (e) a plain
+    `varlinkctl call` (fd input off) to a method that replies with fds: the reply must arrive (sd-varlink's client
+    never turns SO_PASSRIGHTS off unless it enabled input, so our sendmsg succeeds and the kernel drops the fds); (f1)
+    `varlinkctl call --push-fd=3` to a varlink-js server without fd input (default policy): the call runs, the fd is
+    dropped; (f2) INFO: the same against a strict server (`fdPassingInputStrict`), where varlinkctl's sendmsg is refused
+    on ≥ 6.16; (d) INFO: which systemd services of the machine declare fd-carrying fields (introspection only). First
+    run on the M11 head (Linux 6.8): a, a2, b, c, c2 PASS. Fix round 1 (Linux 7.0.0-43): a, a2, b, c, c2, e PASS, and
+    on Linux 6.8 (the re-test after that round) all PASS. Fix round 2, UTM VM, 2026-11-16 (Ubuntu 24.04 arm64, Linux 7.0.0-43, which has
+    SO_PASSRIGHTS and SO_PEERPIDFD; Node 24.22.3, varlinkctl 262.2, system systemd 255.4), output in
+    `test/interop/vm/results-fds-systemd-262-k7.0.log` (kernel in its header; `results-fds-systemd-262.log` is the
+    other kernel's run): a, a2, b, c, c2, e, f1 PASS; f2: varlinkctl exits 1 with `Failed to issue
+    org.example.Fds.Count() call: Operation not permitted`; c2 parity: both CLIs gave the command the same input; d: of
+    3 sockets (2 answered as a normal user: ManagedOOM, UserDatabase) none mentions fds, so no systemd 255 service of
+    that VM passes fds and the "systemd service" side of the interop is varlinkctl's client.
 - **Runtimes**: CI matrix Node 22 / 24 / 26; Bun latest and Deno 2 run the unit tests plus the unix/tcp
-  integration subset (M10).
+  integration subset (M10). The `native` CI job (M11) builds the addon and runs `npm --prefix native test` on
+  ubuntu-24.04 and ubuntu-latest, Node 24.
 
 ### 7.5 Fuzz and soak (M4, cheap)
 
@@ -2183,7 +2595,7 @@ Defaults are what gets built if there's no answer.
 | Q2 | Wire error for *unexpected* handler exceptions: there's no standard one, and UAPI says calls SHOULD only return errors defined in an interface. Options: (a) a tiny interface the server auto-registers (so it is introspectable), e.g. `io.github.pzmarzly.varlinkjs` with `error InternalError ()`, no details on the wire; (b) reuse systemd's `io.systemd.System` (but we can't fill its `errno` honestly); (c) close the connection (kills unrelated pipelined calls). Interface name is your call. | (a), details only to `onError`. |
 | Q3 | Default `ints` mode: `"number"` (reject unsafe ints) vs `"bigint"`. | `"number"` with rejection. Opt in to `bigint`. |
 | Q4 | `upgrade` flag on a method that doesn't support it: `InvalidParameter{parameter:"upgrade"}` vs `ExpectedUpgrade` vs treat as a plain call. UAPI is silent. | **Resolved in M9: a plain call, as sd-varlink** (systemd 6bd4689f, 263~devel): `varlink_idl_validate_method_call()` (sd-varlink-idl.c:2126-2142) checks only `REQUIRES_MORE` without `more` and `REQUIRES_UPGRADE` without `upgrade`; `varlink_dispatch_method()` sets `PROCESSING_METHOD_UPGRADE` (sd-varlink.c:1339-1342) and calls the callback as usual (1412-1419); a plain `sd_varlink_reply()` is allowed there (`VARLINK_STATE_WANTS_REPLY`, varlink-internal.h:79-83) and leads back to `IDLE_SERVER` (sd-varlink.c:2587, 2647-2657, 1460-1466), errors go out as usual; the client takes any non-error reply as acceptance (965-980); only `sd_varlink_respond_and_upgrade()` checks the call flag (2704-2708), not the IDL. Not copied: no `ExpectedMore` for an upgrade call to a `[Requires 'more' flag]` method (sent only in `VARLINK_PROCESSING_METHOD`, 1386; we send it), and any callback may upgrade (our `ctx.upgrade()` needs the method's upgrade support). Confirmed on the wire by the M9 interop run (§7.4, case c2: `GetInfo` with `upgrade: true`, then a plain call, got two plain replies from sd-varlink of systemd 262.2). |
-| Q5 | Native addon for fd passing / peer creds (M11): own small N-API addon vs depending on `usocket`/`peercred`. | Evaluate in M11. Prefer own ~200-line C addon with prebuilds, Linux only. |
+| Q5 | Native addon for fd passing / peer creds (M11): own small N-API addon vs depending on `usocket`/`peercred`. | **Resolved in M11: our own addon** (`native/`, §4.15), Node-API only (`NAPI_VERSION 8`, ABI-stable across Node majors) plus libuv's `uv_poll_t` through `napi_get_uv_event_loop`, built without node-gyp, Linux (macOS for development), no prebuilds yet (a follow-up). Evidence: `usocket` 1.1.0 (npm, modified 2026-07-20) is built on `nan` (not ABI-stable: rebuilt per Node major) with runtime deps bindings, debug, nan, node-gyp; `peercred` 1.1.2 (nan + bindings + errno) was last modified 2022-06-23; `unix-socket-credentials` 0.1.3 uses ffi/ref (2022); none does pidfd, xattr or the read/write semantics we need (fds bound to messages, data before errors, writes failing without losing input). About 1200 lines of C (including comments) rather than 200. |
 | Q6 | Keep TCP listen support in the server (systemd dropped TCP; UAPI says OPTIONAL)? | Keep, bind `127.0.0.1` in all examples. |
 
 ---
@@ -2208,7 +2620,7 @@ M ≈ 1, L ≈ 2–3).
 | **M8** | Addresses II and activation: `exec:`, `ssh-unix:`, `ssh-exec:`, bridge argv, `listenAuto()`/`listenFromEnv()`, stdio serving, exit-on-idle, registry lookup and server-side registry binding (`server.serve(listener, {registry: true})` symlinks the entrypoint into `/run/varlink/registry/<iface>` for every registered interface except `org.varlink.service`, or `registry: ["…"]` for an explicit list; removed on shutdown), resolver client | `src/node/spawn*`, `src/node/activation*`, `src/node/registry*` | M4 | Tests on macOS + VM (`systemd-socket-activate`, ssh to localhost) | M |
 | **M9** | `upgrade`: client + server + CLI `--upgrade`; resolve Q4 | touches `src/core/protocol/`, `src/rpc/`, `src/cli/` | M7, M8 | Interop with `varlinkctl call --upgrade` / `serve` in VM (systemd ≥ 261). **Implemented** (§5.6, §4.14; Q4 resolved; `test/interop/vm/upgrade.sh` run against varlinkctl 262.2 in the UTM VM, 2026-11-15: all 5 cases PASS, §7.4) | S |
 | **M10** | WebSocket + HTTP client transports; Bun and Deno CI; browser smoke test (Playwright optional) | `src/websocket/`, `src/http/`, `.github/workflows/runtimes.yml` | M4 | Tests against a local WebSocket bridge fixture; Bun/Deno green | M |
-| **M11** | `varlink-js-native` (separate package in `native/`): fds (incl. client `fds`/`acceptFds` and CLI `--push-fd`), peer creds, `user.varlink` xattr tagging (`listen`/`server`/`entrypoint`/`client`, best effort), per-UID limits; resolve Q5 | `native/` (+ small touches to `src/rpc/`, `src/cli/` after M9) | M4 (addon), M9 (rpc/CLI integration) | fd passing to/from a systemd service in the VM | L |
+| **M11** | `varlink-js-native` (separate package in `native/`): fds (incl. client `fds`/`acceptFds` and CLI `--push-fd`), peer creds, `user.varlink` xattr tagging (`listen`/`server`/`entrypoint`/`client`, best effort), per-UID limits; resolve Q5 | `native/` (+ small touches to `src/rpc/`, `src/cli/` after M9) | M4 (addon), M9 (rpc/CLI integration) | fd passing to/from a systemd service in the VM. **Implemented** (§4.15, §5.1, §5.4, §4.14 `--push-fd=`/`--exec`; Q5 resolved; `test/interop/vm/fds.sh` against varlinkctl 262.2 in the UTM VM, 2026-11-15: a, a2, b, c, c2 PASS on Linux 6.8, and after fix round 1 a, a2, b, c, c2, e PASS on Linux 7.0, §7.4; no systemd 255 service there passes fds, so "to/from a systemd service" is varlinkctl's client side only. Fix round 1 (review-1 + CI on kernels ≥ 6.16): bounded reads, SO_PASSRIGHTS semantics per kernel, per-environment buffers and cleanup hook, opt-in per-UID limit, MSG_CTRUNC tolerated, fd views, §4.15. Fix round 2 (review-2): sd-varlink's default SO_PASSRIGHTS policy (never touched) with strict mode opt-in (`fdPassingInputStrict`), tracked fds closed at environment teardown, a widening peek window, a real worker stress test; fds.sh a, a2, b, c, c2, e, f1 PASS on Linux 7.0, `results-fds-systemd-262-k7.0.log`) | L |
 | **M12** | Docs: README, `docs/MIGRATION.md`, TSDoc, examples (incl. a safe reference server bound to 127.0.0.1, mode 0644), release workflow (not run); open PR `rewrite → master` **inside the fork** for Pawel | `README.md`, `docs/`, `examples/` (except certification), `.github/workflows/release.yml` | M5–M7 (others may follow) | PR open with test evidence | S |
 
 Critical path: M0 → M1 → M2 → M3 → M4 → (M5 ∥ M6) → M7 → M12. After M4, these can run in parallel because

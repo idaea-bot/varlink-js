@@ -4,6 +4,7 @@ import { parseAddress, type AddressSpec } from "../core/address/parse.ts";
 import { CallTimeoutError, OperationNotSupportedError } from "../core/errors/local.ts";
 import { createConnection, DEFAULT_TIMEOUT, type Connection, type ConnectionOptions } from "../rpc/connection.ts";
 import { checkTimeout } from "../rpc/util.ts";
+import { connectNative, usableNative, type NativeAddon } from "./native.ts";
 import { fromNodeSocket } from "./socket.ts";
 import { connectSpawned, type ExecProcessOptions } from "./spawn.ts";
 
@@ -13,6 +14,12 @@ export interface ConnectOptions extends ConnectionOptions {
   signal?: AbortSignal;
   /** `exec:`, `ssh-unix:`, `ssh-exec:`: how the child is spawned (see `connectExec`); ignored for socket kinds. */
   spawn?: ExecProcessOptions;
+  /**
+   * M11: the optional `varlink-js-native` addon (`import * as native from "varlink-js-native"`). With it, `unix:`
+   * and `unix:@` connections can pass fds (`fds`/`acceptFds` call options) and know their peer's credentials;
+   * other kinds ignore it. Ignored where it is not available (not built, Bun, Deno): plain sockets, as without it.
+   */
+  native?: NativeAddon;
 }
 
 /** The `net.connect` options for an address, or an OperationNotSupportedError for kinds Node cannot dial here. */
@@ -92,10 +99,20 @@ export function openSocket(spec: AddressSpec, timeout: number, signal: AbortSign
  */
 export async function connect(address: string | AddressSpec, options?: ConnectOptions): Promise<Connection> {
   const spec = typeof address === "string" ? parseAddress(address) : address;
-  const { signal, spawn, ...connectionOptions } = options ?? {};
+  const { signal, spawn, native, ...connectionOptions } = options ?? {};
   if (spec.kind === "exec" || spec.kind === "ssh-unix" || spec.kind === "ssh-exec")
     return connectSpawned(spec, connectionOptions, spawn, signal);
   const timeout = checkTimeout(connectionOptions.timeout, "timeout", DEFAULT_TIMEOUT);
+  const addon = usableNative(native);
+  if (addon !== undefined && (spec.kind === "unix" || spec.kind === "unix-abstract")) {
+    const channel = await connectNative(addon, spec, timeout, signal);
+    try {
+      return createConnection(channel, connectionOptions);
+    } catch (e) {
+      channel.close();
+      throw e;
+    }
+  }
   const socket = await openSocket(spec, timeout, signal);
   try {
     return createConnection(fromNodeSocket(socket), connectionOptions);

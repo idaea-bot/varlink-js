@@ -1,16 +1,23 @@
 // The client side of one varlink connection over a ByteChannel (DESIGN.md §5.1, §4.11): a serialized write
 // queue feeding a ClientSession, one reader loop routing its events, timeouts, abort, read backpressure for
 // streams, reply/error validation for registered interfaces.
-import { CallTimeoutError, ConnectionClosedError, isVarlinkLocalError, safeQuote } from "../core/errors/local.ts";
+import {
+  CallTimeoutError,
+  ConnectionClosedError,
+  isVarlinkLocalError,
+  OperationNotSupportedError,
+  ProtocolError,
+  safeQuote,
+} from "../core/errors/local.ts";
 import { createErrorRegistry, type ErrorRegistry } from "../core/errors/registry.ts";
 import { ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
 import { VarlinkError, type ErrorClass } from "../core/errors/varlink-error.ts";
 import type { Interface } from "../core/idl/ast.ts";
 import { parseInterface } from "../core/idl/parser.ts";
-import type { ByteChannel } from "../core/protocol/channel.ts";
+import { SCM_MAX_FD, type ByteChannel, type FdHandle } from "../core/protocol/channel.ts";
 import { ClientSession, type ClientEvent } from "../core/protocol/client-session.ts";
-import type { ValidateReplies } from "../core/protocol/dispatch.ts";
-import { checkMaxMessageSize } from "../core/protocol/framer.ts";
+import { fdNumber, type ValidateReplies } from "../core/protocol/dispatch.ts";
+import { checkMaxMessageSize, closeFds, handOver } from "../core/protocol/framer.ts";
 import type { CallInit } from "../core/protocol/messages.ts";
 import { jsonCodec, type Codec } from "../core/types/codec.ts";
 import { compileInterfaceText, type CompiledInterface, type IntsMode, type Validator } from "../core/types/compile.ts";
@@ -35,7 +42,11 @@ export const DEFAULT_HIGH_WATER_MARK: number = 64;
 export const DEFAULT_COLLECT_MAX: number = 1024;
 
 /** Why {@link ConnectionOptions.onError} was called. */
-export type ConnectionErrorReason = "invalid-reply" | "invalid-error";
+export type ConnectionErrorReason =
+  | "invalid-reply"
+  | "invalid-error"
+  /** M11: fds of a reply were dropped by the kernel (MSG_CTRUNC); the reply was delivered without them. */
+  | "fds-dropped";
 
 /** Options for {@link createConnection}. */
 export interface ConnectionOptions {
@@ -81,6 +92,55 @@ export interface CallOptions {
   timeout?: number;
   /** Aborting rejects with `signal.reason`; once the call was written, it also closes the connection (UAPI). */
   signal?: AbortSignal;
+  /** M11: see {@link AcceptFdsOptions} (the overloads that take `acceptFds: true` return {@link WithFds}). */
+  acceptFds?: false;
+  /**
+   * M11: fds sent with the call's message (numbers, or FdHandles such as a Node `fs.FileHandle`), at most 253. Each
+   * is duplicated (close-on-exec) when the call is made, so the caller keeps its own fds and may close them as soon
+   * as the method returned; the duplicates are closed once the message was written or dropped. Needs an fd-capable
+   * channel (a unix socket through varlink-js-native), else the call rejects with OperationNotSupportedError before
+   * anything is sent.
+   */
+  fds?: readonly (FdHandle | number)[];
+}
+
+/** M11: options of a call that accepts fds in its replies (UAPI: only for methods that return fds). */
+export interface AcceptFdsOptions {
+  /**
+   * Receive fds with this call's replies: the result is `{ parameters, fds }` ({@link WithFds}) instead of the
+   * parameters, for each stream item too; the caller owns those fds and must close them. An error reply rejects with
+   * the error carrying the reply's fds as a non-enumerable `fds` property (`(e as { fds?: FdHandle[] }).fds`): the
+   * caller owns those too and must close them (they are never closed for you). fds that come with replies of other
+   * calls close the connection (protocol error). Needs an fd-capable channel (OperationNotSupportedError).
+   */
+  acceptFds: true;
+}
+
+/** M11: a reply with the fds that came with it; the caller owns them (close them when done). */
+// A type alias (not an interface), so it is assignable to Record<string, unknown> like any reply.
+export type WithFds<T = Record<string, unknown>> = {
+  readonly parameters: T;
+  readonly fds: FdHandle[];
+};
+
+/** `options` of a call, stream or collect that accepts fds: theirs without `acceptFds`, plus `acceptFds: true`. */
+export type WithAcceptFds<O extends CallOptions> = Omit<O, "acceptFds"> & AcceptFdsOptions;
+
+/** Replies handed out as {@link WithFds} (so abandoned or failed collections can close their fds). */
+const fdReplies = new WeakSet<object>();
+
+/** Closes the fds of buffered or collected replies that will never reach the caller. */
+function dropReplies(values: readonly Record<string, unknown>[]): void {
+  for (const v of values) if (fdReplies.has(v)) closeFds((v as unknown as WithFds).fds);
+}
+
+/**
+ * Internal: `more` replies reach the caller (a stream yields one, a collection resolves): the caller owns their fds
+ * from now on, so their transport stops tracking them (`handOver`). Until then they stay the library's: buffered
+ * replies that are dropped are closed, and so are those of a torn-down environment (a terminated worker).
+ */
+export function deliverReplies(values: readonly Record<string, unknown>[]): void {
+  for (const v of values) if (fdReplies.has(v)) handOver((v as unknown as WithFds).fds);
 }
 
 /** Options for `stream()`: `timeout` covers only the time to the first reply. */
@@ -123,11 +183,15 @@ export interface CallSpec {
   readonly errors?: CompiledInterface | undefined;
 }
 
+/** Internal: every per-call option, `acceptFds` as a plain boolean. */
+export type StartOptions = Omit<StreamOptions & CollectOptions, "acceptFds"> & { acceptFds?: boolean | undefined };
+
 /** Internal: the shape of a call on the wire. */
 export type OpKind = "single" | "more" | "oneway" | "upgrade";
 
 /** Internal: where a call's outcome goes. */
 export interface Sink {
+  /** A reply; with `acceptFds` the value is a {@link WithFds}. */
   value(value: Record<string, unknown>, final: boolean): void;
   fail(error: unknown): void;
   /** Undelivered stream replies (backpressure). */
@@ -152,6 +216,14 @@ class Op {
   readonly signal: AbortSignal | undefined;
   readonly sink: Sink;
   readonly onDone: (() => void) | undefined;
+  /** M11: duplicates of the caller's fds, sent with the call and closed once written (or dropped). */
+  readonly fds: FdHandle[];
+  /** M11: replies carry fds ({@link WithFds}). */
+  readonly acceptFds: boolean;
+  /** Counted in the connection's accepting calls (fd input switched on for it). */
+  acceptCounted = false;
+  /** The call's bytes are being written (its fds must stay open until the write settled). */
+  writing = false;
   stage: "queued" | "sent" | "done" = "queued";
   id = 0;
   count = 0;
@@ -169,7 +241,11 @@ class Op {
     signal: AbortSignal | undefined,
     sink: Sink,
     onDone: (() => void) | undefined,
+    fds: FdHandle[],
+    acceptFds: boolean,
   ) {
+    this.fds = fds;
+    this.acceptFds = acceptFds;
     this.kind = kind;
     this.method = method;
     this.init = init;
@@ -212,10 +288,17 @@ class ReplyStream implements StreamIterator {
   };
 
   #push(v: Record<string, unknown>, final: boolean): void {
-    if (this.#done) return;
+    if (this.#done) {
+      // Nobody will take it (the stream was returned or failed): its fds (acceptFds) are closed. Defensive (fix
+      // round 4): no path that pushes after #done is known or tested; this guards against one, it fixes no seen leak.
+      dropReplies([v]);
+      return;
+    }
     const w = this.#waiters.shift();
-    if (w !== undefined) w.resolve({ value: v, done: false });
-    else this.#items.push(v);
+    if (w !== undefined) {
+      deliverReplies([v]);
+      w.resolve({ value: v, done: false });
+    } else this.#items.push(v);
     if (final) {
       this.#final = true;
       if (this.#items.length === 0) this.#flushDone();
@@ -241,6 +324,7 @@ class ReplyStream implements StreamIterator {
   next(): Promise<IteratorResult<Record<string, unknown>, undefined>> {
     const v = this.#items.shift();
     if (v !== undefined) {
+      deliverReplies([v]);
       this.onPull();
       return Promise.resolve({ value: v, done: false });
     }
@@ -263,7 +347,8 @@ class ReplyStream implements StreamIterator {
 
   return(): Promise<IteratorResult<Record<string, unknown>, undefined>> {
     if (!this.#final && !this.#done && this.#error === undefined) this.onReturn();
-    this.#items.length = 0;
+    // Replies nobody will take: their fds (acceptFds) are closed.
+    dropReplies(this.#items.splice(0));
     this.#error = undefined;
     this.#flushDone();
     return Promise.resolve({ value: undefined, done: true });
@@ -301,7 +386,7 @@ export interface ConnectionInternals {
     kind: OpKind,
     method: string,
     parameters: Record<string, unknown> | undefined,
-    options: (StreamOptions & CollectOptions) | undefined,
+    options: StartOptions | undefined,
     spec: CallSpec | undefined,
     sink: Sink,
     onDone?: () => void,
@@ -309,7 +394,7 @@ export interface ConnectionInternals {
   stream(
     method: string,
     parameters: Record<string, unknown> | undefined,
-    options: StreamOptions | undefined,
+    options: StartOptions | undefined,
     spec: CallSpec | undefined,
     onDone?: () => void,
   ): StreamIterator;
@@ -332,15 +417,22 @@ function promiseSink(resolve: (v: Record<string, unknown>) => void, reject: (e: 
   };
 }
 
-/** Promise-based sink collecting every reply. */
-function collectSink(resolve: (v: Record<string, unknown>[]) => void, reject: (e: unknown) => void): Sink {
+/** Internal (the proxy's `collect` too): promise-based sink collecting every reply. */
+export function collectSink(resolve: (v: Record<string, unknown>[]) => void, reject: (e: unknown) => void): Sink {
   const all: Record<string, unknown>[] = [];
   return {
     value: (v, final) => {
       all.push(v);
-      if (final) resolve(all);
+      if (final) {
+        deliverReplies(all);
+        resolve(all);
+      }
     },
-    fail: reject,
+    fail: (e) => {
+      // The collected replies never reach the caller: their fds (acceptFds) are closed.
+      dropReplies(all.splice(0));
+      reject(e);
+    },
   };
 }
 
@@ -367,6 +459,8 @@ export class Connection {
   readonly #byId = new Map<number, Op>();
   /** The oneway call being written. */
   #writingOneway: Op | undefined;
+  /** M11: calls in flight with `acceptFds` (fd input is on while there are any). */
+  #accepting = 0;
   #pumping = false;
   #closing = false;
   /** An upgrade call succeeded: the connection is finished and the channel belongs to the upgrade's caller. */
@@ -476,17 +570,32 @@ export class Connection {
   /**
    * A call with a single reply. Rejects with the error reply (a VarlinkError, §6), a local error
    * (ConnectionClosedError, CallTimeoutError, ValidationError) or the abort reason.
+   *
+   * M11 fds: `options.fds` are sent with the call (duplicated now; close yours whenever you like). With
+   * `options.acceptFds: true` the result is `{ parameters, fds }` and you own `fds` (close them); an error reply
+   * then rejects with a VarlinkError whose non-enumerable `fds` property holds the error reply's fds, which you own
+   * and must close as well (`for (const fd of (e as { fds?: FdHandle[] }).fds ?? []) fd.close()`).
    */
+  call<M extends MethodDescriptor<object, object>>(
+    method: M,
+    parameters: MethodInput<M>,
+    options: WithAcceptFds<CallOptions>,
+  ): Promise<WithFds<MethodOutput<M>>>;
   call<M extends MethodDescriptor<object, object>>(
     method: M,
     parameters: MethodInput<M>,
     options?: CallOptions,
   ): Promise<MethodOutput<M>>;
+  call(
+    method: string,
+    parameters: Record<string, unknown> | undefined,
+    options: WithAcceptFds<CallOptions>,
+  ): Promise<WithFds>;
   call(method: string, parameters?: Record<string, unknown>, options?: CallOptions): Promise<Record<string, unknown>>;
   call(
     method: string | MethodDescriptor<object, object>,
     parameters?: object,
-    options?: CallOptions,
+    options?: CallOptions | WithAcceptFds<CallOptions>,
   ): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       const [name, spec] = this.#resolve(method);
@@ -525,13 +634,23 @@ export class Connection {
   stream<M extends MethodDescriptor<object, object>>(
     method: M,
     parameters: MethodInput<M>,
+    options: WithAcceptFds<StreamOptions>,
+  ): StreamIterator<WithFds<MethodOutput<M>>>;
+  stream<M extends MethodDescriptor<object, object>>(
+    method: M,
+    parameters: MethodInput<M>,
     options?: StreamOptions,
   ): StreamIterator<MethodOutput<M>>;
+  stream(
+    method: string,
+    parameters: Record<string, unknown> | undefined,
+    options: WithAcceptFds<StreamOptions>,
+  ): StreamIterator<WithFds>;
   stream(method: string, parameters?: Record<string, unknown>, options?: StreamOptions): StreamIterator;
   stream(
     method: string | MethodDescriptor<object, object>,
     parameters?: object,
-    options?: StreamOptions,
+    options?: StreamOptions | WithAcceptFds<StreamOptions>,
   ): StreamIterator {
     let resolved: [string, CallSpec | undefined];
     try {
@@ -548,8 +667,18 @@ export class Connection {
   collect<M extends MethodDescriptor<object, object>>(
     method: M,
     parameters: MethodInput<M>,
+    options: WithAcceptFds<CollectOptions>,
+  ): Promise<WithFds<MethodOutput<M>>[]>;
+  collect<M extends MethodDescriptor<object, object>>(
+    method: M,
+    parameters: MethodInput<M>,
     options?: CollectOptions,
   ): Promise<MethodOutput<M>[]>;
+  collect(
+    method: string,
+    parameters: Record<string, unknown> | undefined,
+    options: WithAcceptFds<CollectOptions>,
+  ): Promise<WithFds[]>;
   collect(
     method: string,
     parameters?: Record<string, unknown>,
@@ -558,7 +687,7 @@ export class Connection {
   collect(
     method: string | MethodDescriptor<object, object>,
     parameters?: object,
-    options?: CollectOptions,
+    options?: CollectOptions | WithAcceptFds<CollectOptions>,
   ): Promise<Record<string, unknown>[]> {
     return new Promise((resolve, reject) => {
       const [name, spec] = this.#resolve(method);
@@ -675,7 +804,7 @@ export class Connection {
   #stream(
     method: string,
     parameters: Record<string, unknown> | undefined,
-    options: StreamOptions | undefined,
+    options: StartOptions | undefined,
     spec: CallSpec | undefined,
     onDone: (() => void) | undefined,
   ): ReplyStream {
@@ -697,7 +826,7 @@ export class Connection {
     kind: OpKind,
     method: string,
     parameters: Record<string, unknown> | undefined,
-    options: (StreamOptions & CollectOptions) | undefined,
+    options: StartOptions | undefined,
     spec: CallSpec | undefined,
     sink: Sink,
     onDone?: () => void,
@@ -733,7 +862,9 @@ export class Connection {
       if (kind === "oneway") init.oneway = true;
       if (kind === "more") init.more = true;
       if (kind === "upgrade") init.upgrade = true;
-      op = new Op(kind, method, init, spec ?? { mode: "off" }, times, signal, sink, onDone);
+      const acceptFds = this.#acceptFdsOption(kind, options?.acceptFds);
+      const fds = this.#duplicateFds(options?.fds, acceptFds);
+      op = new Op(kind, method, init, spec ?? { mode: "off" }, times, signal, sink, onDone, fds, acceptFds);
     } catch (e) {
       finish(e);
       return undefined;
@@ -749,6 +880,47 @@ export class Connection {
     this.#queue.push(op);
     void this.#pump();
     return op;
+  }
+
+  /** The `acceptFds` option checked. @throws {TypeError} for a non-boolean, or on a oneway/upgrade call. */
+  #acceptFdsOption(kind: OpKind, value: unknown): boolean {
+    if (value === undefined || value === false) return false;
+    if (value !== true) throw new TypeError("acceptFds must be a boolean");
+    if (kind === "oneway" || kind === "upgrade")
+      throw new TypeError(`acceptFds is not available for ${kind} calls (they return no fds)`);
+    return true;
+  }
+
+  /**
+   * The `fds` option as duplicates the call owns (M11: the caller keeps its fds). Checks the fd capability for them
+   * and for `acceptFds` before anything is sent.
+   *
+   * @throws {TypeError} for a non-array or an invalid fd, {@link RangeError} past SCM_MAX_FD,
+   *   {@link OperationNotSupportedError} when the channel cannot pass fds; `duplicate`'s errors (EBADF).
+   */
+  #duplicateFds(value: unknown, acceptFds: boolean): FdHandle[] {
+    if (value !== undefined && !Array.isArray(value)) throw new TypeError("fds must be an array");
+    const numbers = (value as readonly unknown[] | undefined)?.map(fdNumber) ?? [];
+    if (numbers.length > SCM_MAX_FD) throw new RangeError(`at most ${String(SCM_MAX_FD)} fds per message (SCM_MAX_FD)`);
+    if (numbers.length === 0 && !acceptFds) return [];
+    const fdPassing = this.#channel.capabilities.fdPassing;
+    if (fdPassing === undefined)
+      throw new OperationNotSupportedError(
+        "this connection cannot pass file descriptors (it needs a unix socket through varlink-js-native)",
+      );
+    const copies: FdHandle[] = [];
+    try {
+      for (const n of numbers) copies.push(fdPassing.duplicate(n));
+    } catch (e) {
+      closeFds(copies);
+      throw e;
+    }
+    return copies;
+  }
+
+  /** The call's fd duplicates, once they are no longer needed (not while its write is in flight). */
+  #releaseFds(op: Op): void {
+    if (!op.writing) closeFds(op.fds.splice(0));
   }
 
   /** Writes queued calls one at a time; a call is handed to the session only when its turn comes. */
@@ -780,13 +952,28 @@ export class Connection {
           this.#byId.set(op.id, op);
           this.#armHead();
         }
+        const fdPassing = this.#channel.capabilities.fdPassing;
+        if (op.acceptFds && fdPassing !== undefined) {
+          // Input on before the call goes out, so its replies' fds are delivered (off again when no such call is left).
+          op.acceptCounted = true;
+          if (this.#accepting++ === 0) fdPassing.setAcceptInput(true);
+        }
+        op.writing = true;
         try {
-          await this.#channel.write(bytes);
+          if (op.fds.length > 0) {
+            fdPassing?.setAllowOutput(true);
+            await this.#channel.write(bytes, op.fds);
+          } else {
+            await this.#channel.write(bytes);
+          }
         } catch (e) {
           // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- close() may run during the await
           if (!this.#closing)
             this.#closeWith(new ConnectionClosedError("connection closed: write failed", { cause: e }), e);
           return;
+        } finally {
+          op.writing = false;
+          this.#releaseFds(op);
         }
         if (op.kind === "oneway") {
           this.#writingOneway = undefined;
@@ -825,7 +1012,14 @@ export class Connection {
           if (!this.#closing) this.#closeWith(new ConnectionClosedError("connection closed by peer"), undefined);
           return;
         }
-        this.#route(this.#session.receive(chunk.bytes));
+        if (chunk.fdError === "truncated")
+          // The kernel truncated the fds (MSG_CTRUNC): the message goes on without them (json-stream.c:1308-1317).
+          this.#report(
+            new Error("file descriptors were dropped: the kernel truncated their control data (MSG_CTRUNC)"),
+            this.#inflight[0]?.method ?? "",
+            "fds-dropped",
+          );
+        this.#route(this.#session.receive(chunk.bytes, chunk.fds));
       }
     } catch (e) {
       if (!this.#closing) this.#closeWith(new ConnectionClosedError("connection lost", { cause: e }), e);
@@ -834,18 +1028,46 @@ export class Connection {
 
   #route(events: ClientEvent[]): void {
     for (const ev of events) {
-      if (this.#closing) return;
+      if (this.#closing) {
+        if (ev.type === "reply") closeFds(ev.fds);
+        continue;
+      }
       switch (ev.type) {
         case "reply": {
           const op = this.#byId.get(ev.id);
-          if (op !== undefined) this.#onReply(op, ev.parameters, ev.continues);
+          if (op === undefined) {
+            closeFds(ev.fds);
+            break;
+          }
+          if (ev.fds !== undefined && !op.acceptFds) {
+            // UAPI: fds only for calls that asked for them; anything else is a protocol violation.
+            closeFds(ev.fds);
+            const error = new ProtocolError(
+              `file descriptors received with a reply to ${safeQuote(op.method)}, which does not accept them`,
+            );
+            this.#closeWith(new ConnectionClosedError("connection closed: protocol error", { cause: error }), error);
+            break;
+          }
+          this.#onReply(op, ev.parameters, ev.continues, ev.fds);
           break;
         }
         case "error": {
           const op = this.#byId.get(ev.id);
-          if (op === undefined) break;
+          if (op === undefined) {
+            closeFds(ev.fds);
+            break;
+          }
           this.#settle(op);
-          op.sink.fail(this.#mapError(op, ev.error, ev.parameters));
+          const error = this.#mapError(op, ev.error, ev.parameters);
+          // An acceptFds call owns the fds of its error reply too (varlinkctl --exec takes them, varlinkctl.c:1139-
+          // 1155); they are on the error as `fds`. Other calls never have input on, so fds would be a peer bug.
+          if (ev.fds !== undefined) {
+            if (op.acceptFds) {
+              handOver(ev.fds);
+              Object.defineProperty(error, "fds", { value: ev.fds, enumerable: false });
+            } else closeFds(ev.fds);
+          }
+          op.sink.fail(error);
           break;
         }
         case "failed": {
@@ -870,9 +1092,10 @@ export class Connection {
     }
   }
 
-  #onReply(op: Op, parameters: Record<string, unknown>, continues: boolean): void {
+  #onReply(op: Op, parameters: Record<string, unknown>, continues: boolean, fds: FdHandle[] | undefined): void {
     if (!continues) this.#settle(op);
     if (op.max !== undefined && ++op.count > op.max) {
+      closeFds(fds);
       this.#reject(op, new RangeError(`${op.method}: more than ${String(op.max)} replies`));
       return;
     }
@@ -883,11 +1106,20 @@ export class Connection {
         value = output.decode(parameters, { unknownFields: "drop" }) as Record<string, unknown>;
       } catch (e) {
         if (op.spec.mode === "throw" || (this.#ints === "number" && isIntRange(e))) {
+          closeFds(fds);
           this.#reject(op, e);
           return;
         }
         this.#report(e, op.method, "invalid-reply");
       }
+    }
+    if (op.acceptFds) {
+      // The caller owns these fds from now on (DESIGN.md §5.1): a single reply reaches it at once; `more` replies when
+      // the stream yields them or the collection resolves (the sinks call deliverReplies).
+      const reply: WithFds = { parameters: value, fds: fds ?? [] };
+      if (op.kind !== "more") handOver(fds);
+      fdReplies.add(reply);
+      value = reply;
     }
     op.sink.value(value, !continues);
     if (continues) {
@@ -1053,6 +1285,17 @@ export class Connection {
     if (op.stage === "done") return;
     op.stage = "done";
     this.#clearTimer(op);
+    this.#releaseFds(op);
+    if (op.acceptCounted) {
+      op.acceptCounted = false;
+      if (--this.#accepting === 0) {
+        try {
+          this.#channel.capabilities.fdPassing?.setAcceptInput(false);
+        } catch {
+          // The channel is closed already.
+        }
+      }
+    }
     if (op.onAbort !== undefined) op.signal?.removeEventListener("abort", op.onAbort);
     op.onAbort = undefined;
     this.#byId.delete(op.id);

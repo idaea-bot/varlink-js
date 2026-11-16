@@ -11,6 +11,7 @@ export {
 } from "./activation.ts";
 export { connect, type ConnectOptions } from "./connect.ts";
 export { listen, type ListenOptions, type NodeListener } from "./listen.ts";
+export { fdHandle, type NativeAddon, type NativeErrnoError, type NativeSocket } from "./native.ts";
 export { createPool } from "./pool.ts";
 export {
   bindRegistry,

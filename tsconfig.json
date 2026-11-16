@@ -29,6 +29,6 @@
     "outDir": "build",
     "noEmit": true
   },
-  "include": ["src", "test", "examples", "scripts"],
+  "include": ["src", "test", "examples", "scripts", "native/index.d.ts", "native/test"],
   "exclude": ["test/fixtures/consumer"]
 }

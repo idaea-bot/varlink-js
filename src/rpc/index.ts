@@ -5,6 +5,7 @@ export {
   DEFAULT_COLLECT_MAX,
   DEFAULT_HIGH_WATER_MARK,
   DEFAULT_TIMEOUT,
+  type AcceptFdsOptions,
   type CallOptions,
   type CollectOptions,
   type ConnectionErrorReason,
@@ -12,6 +13,8 @@ export {
   type ServiceInfo,
   type StreamIterator,
   type StreamOptions,
+  type WithAcceptFds,
+  type WithFds,
 } from "./connection.ts";
 export { createPool, Pool, type ConnectionFactory, type PoolOptions } from "./pool.ts";
 export type { InterfaceProxy, ProxyMethod, ProxyOptions } from "./proxy.ts";

@@ -1,17 +1,180 @@
 // The process side of the CLI (DESIGN.md §4.14), used only by main.ts: a CliIo over process.stdin/stdout/stderr,
-// SIGINT/SIGTERM → io.signal, and the cleanup that lets the process exit by itself.
-import { closeSync, fstatSync, openSync } from "node:fs";
+// SIGINT/SIGTERM → io.signal, and the cleanup that lets the process exit by itself. M11: the optional
+// varlink-js-native addon (`--push-fd=`, `--exec`) and the `--exec` command.
+import { spawn, type StdioOptions } from "node:child_process";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readdirSync } from "node:fs";
+import { constants as osConstants } from "node:os";
+import { resolve } from "node:path";
 import { isatty } from "node:tty";
+import { pathToFileURL } from "node:url";
+import type { FdHandle } from "../core/protocol/index.ts";
+import { closeFds } from "../core/protocol/framer.ts";
+import { usableNative, type NativeAddon } from "../node/native.ts";
 import {
   BrokenPipeError,
   CliError,
   describeError,
+  escapeControls,
   isDisconnectCode,
   signalExitCode,
   type CliInput,
   type CliIo,
   type CliOutput,
+  type ExecInput,
 } from "./io.ts";
+
+/**
+ * The varlink-js-native addon: `VARLINK_JS_NATIVE` (a path to its index.js, for tests and unusual installs), else the
+ * `varlink-js-native` package. Undefined when absent or unusable here (not built, not Linux/macOS).
+ */
+async function loadNative(env: NodeJS.ProcessEnv): Promise<NativeAddon | undefined> {
+  const override = env.VARLINK_JS_NATIVE;
+  const specifier =
+    override !== undefined && override !== "" ? pathToFileURL(resolve(override)).href : "varlink-js-native";
+  try {
+    const mod = (await import(specifier)) as unknown;
+    return usableNative(mod);
+  } catch {
+    return undefined;
+  }
+}
+
+/** An fd the CLI owns, closed through the addon (idempotent). */
+function ownedFd(fd: number, close: (fd: number) => void): FdHandle {
+  let closed = false;
+  return {
+    fd,
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        close(fd);
+      } catch {
+        // Already closed.
+      }
+    },
+  };
+}
+
+/** `--push-fd=`: a path opened read-only (close-on-exec, as Node opens files), or a duplicate of one of our fds. */
+function openPushFd(spec: { fd: number } | { path: string }, native: NativeAddon): FdHandle {
+  if ("path" in spec) return ownedFd(openSync(spec.path, fsConstants.O_RDONLY | fsConstants.O_NOCTTY), closeSync);
+  return ownedFd(native.dup(spec.fd), (fd) => {
+    native.close(fd);
+  });
+}
+
+/**
+ * varlinkctl's exec closes every fd but the ones it passes (close_all_fds, varlinkctl.c:686). A spawn cannot close
+ * our fds in the child, but it does not inherit close-on-exec ones: with the addon, every open fd ≥ 3 is made so
+ * (libuv's own are already). Best effort; without the addon, fds we inherited without it reach the command.
+ */
+function closeOnExecAll(native: NativeAddon | undefined): void {
+  if (native === undefined) return;
+  let names: string[];
+  try {
+    names = readdirSync(process.platform === "linux" ? "/proc/self/fd" : "/dev/fd");
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const fd = Number(name);
+    if (!Number.isSafeInteger(fd) || fd < 3) continue;
+    try {
+      native.setCloexec(fd);
+    } catch {
+      // Gone meanwhile (e.g. the directory's own fd).
+    }
+  }
+}
+
+/**
+ * `call --exec` (varlinkctl.c:1122-1170, exec_with_listen_fds at 670-720): `command` runs with the reply on stdin (a
+ * sealed memfd on Linux with the addon, as varlinkctl does; else a pipe), our stdout/stderr, and the reply's fds as
+ * 3, 4, … with `LISTEN_FDS=n` and `LISTEN_PID` (the command's pid: set by `/bin/sh -c 'LISTEN_PID=$$ … exec …'`,
+ * Node cannot set the environment after fork); `LISTEN_FDNAMES` is removed, and with no fds `LISTEN_FDS`/`LISTEN_PID`
+ * too; `LISTEN_PIDFDID` is not set (Node cannot read a pidfd's inode id). The fds are closed here once the command
+ * has them. Resolves with its exit status (128 + the signal's number after a signal). SIGTERM is passed on to it
+ * (SIGINT from a terminal reaches it through the process group).
+ */
+function execCommand(command: readonly string[], input: ExecInput): Promise<number> {
+  const [file, ...args] = command;
+  if (file === undefined) return Promise.reject(new CliError("Expected command line to execute."));
+  const native = input.native;
+  let stdinFd: number | undefined;
+  if (native !== undefined && process.platform === "linux") {
+    try {
+      stdinFd = native.memfdSealed?.("varlink-reply", input.reply);
+    } catch {
+      stdinFd = undefined;
+    }
+  }
+  closeOnExecAll(native);
+  const env: Record<string, string | undefined> = { ...input.env };
+  delete env.LISTEN_FDNAMES;
+  delete env.LISTEN_PIDFDID;
+  const n = input.fds.length;
+  let program = file;
+  let argv = args;
+  if (n > 0) {
+    // The shell sets LISTEN_PID to the command's pid (Node cannot after fork). `exec -- "$0"` is not portable (dash
+    // runs "--" as the command), so a command word starting with "-" must not reach `exec` as an option (bash's exec
+    // takes -a/-c/-l): as a path it is made "./-…" (the same file), a bare name is refused.
+    let target = file;
+    if (target.startsWith("-")) {
+      if (!target.includes("/"))
+        return Promise.reject(
+          new CliError(`Refusing to execute '${escapeControls(file)}': a command name may not start with '-'`),
+        );
+      target = `./${target}`;
+    }
+    env.LISTEN_FDS = String(n);
+    delete env.LISTEN_PID;
+    program = "/bin/sh";
+    argv = ["-c", 'LISTEN_PID=$$; export LISTEN_PID; exec "$0" "$@"', target, ...args];
+  } else {
+    delete env.LISTEN_FDS;
+    delete env.LISTEN_PID;
+  }
+  const stdio: StdioOptions = [stdinFd ?? "pipe", "inherit", "inherit", ...input.fds.map((f) => f.fd)];
+  return new Promise((resolvePromise) => {
+    let child: ReturnType<typeof spawn>;
+    const release = (): void => {
+      if (stdinFd !== undefined) closeSync(stdinFd);
+      stdinFd = undefined;
+      closeFds(input.fds);
+    };
+    try {
+      child = spawn(program, argv, { stdio, env });
+    } catch (e) {
+      release();
+      process.stderr.write(`Failed to execute ${escapeControls(file)}: ${escapeControls(describeError(e))}\n`);
+      resolvePromise(1);
+      return;
+    }
+    const onAbort = (): void => {
+      if (input.signal?.reason === "SIGTERM") child.kill("SIGTERM");
+    };
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    child.once("spawn", release);
+    child.once("error", (e) => {
+      release();
+      input.signal?.removeEventListener("abort", onAbort);
+      process.stderr.write(`Failed to execute ${escapeControls(file)}: ${escapeControls(describeError(e))}\n`);
+      resolvePromise(1);
+    });
+    child.once("exit", (code, signal) => {
+      input.signal?.removeEventListener("abort", onAbort);
+      const number = signal === null ? undefined : (osConstants.signals as Record<string, number | undefined>)[signal];
+      resolvePromise(code ?? 128 + (number ?? 0));
+    });
+    if (child.stdin !== null) {
+      // The command may not read its stdin at all: EPIPE is fine.
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(input.reply);
+    }
+  });
+}
 
 /** A CliIo bound to the process, plus `dispose()` (removes the signal handlers, releases stdin). */
 export interface NodeIo extends CliIo {
@@ -152,6 +315,9 @@ export function nodeIo(): NodeIo {
     stderr: output(process.stderr, 2),
     env: process.env,
     signal: controller.signal,
+    loadNative: () => loadNative(process.env),
+    openPushFd,
+    exec: execCommand,
     dispose() {
       process.off("SIGINT", onInt);
       process.off("SIGTERM", onTerm);

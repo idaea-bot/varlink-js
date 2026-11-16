@@ -6,6 +6,7 @@ import { formatAddress, parseAddress, type AddressSpec } from "../core/address/p
 import { OperationNotSupportedError } from "../core/errors/local.ts";
 import type { ByteChannel, Listener } from "../core/protocol/channel.ts";
 import type { RegistryBindOptions, RegistryBinding } from "../rpc/server.ts";
+import { adoptAccepted, markEntrypoint, prepareListener, usableNative, type NativeAddon } from "./native.ts";
 import { bindRegistry } from "./registry.ts";
 import { fromNodeSocket } from "./socket.ts";
 
@@ -30,6 +31,25 @@ export interface ListenOptions {
    * cannot learn from the fd). Parsed and stored in canonical form; never unlinked.
    */
   address?: string;
+  /**
+   * M11: the optional `varlink-js-native` addon. With it, connections accepted on a unix socket (path, `unix:@`, or a
+   * unix `{fd}`) are fd-capable channels that know their peer's credentials (`ctx.peer`, the server's per-UID
+   * limit), and the sockets get sd-varlink's `user.varlink` xattr (best effort). TCP ignores it, and so does every
+   * listener where it is not available (not built, Bun, Deno).
+   */
+  native?: NativeAddon;
+  /**
+   * M11, with `native`, opt-in like sd-varlink's SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT: SO_PASSRIGHTS (Linux ≥ 6.16)
+   * is set from `allowFdPassingInput` on the listening socket before anything is accepted (accepted sockets inherit
+   * it; sd-varlink.c:3787-3792, 3851-3853) and on each connection when the server switches input
+   * (sd-varlink.c:3347-3352, 3612). A client sending fds to a server without input then fails with EPERM. Default
+   * false, as sd-varlink: SO_PASSRIGHTS is left alone, and a server without input drops fds that come with calls (the
+   * calls run). Known window: a unix path bound without the private directory (the fallback) and `unix:@` are reachable
+   * between Node's listen() and our setsockopt, so a client that fast still gets the kernel default.
+   */
+  fdPassingInputStrict?: boolean;
+  /** M11, strict mode only (`fdPassingInputStrict`): the server's `allowFdPassingInput`. Ignored otherwise. */
+  allowFdPassingInput?: boolean;
 }
 
 /** A {@link Listener} over a `net.Server`. */
@@ -43,6 +63,21 @@ export interface NodeListener extends Listener {
    * socket belongs to the service manager and outlives us, so its entries stay (a later binder adopts them).
    */
   readonly bindRegistry?: (interfaces: readonly string[], options: RegistryBindOptions) => Promise<RegistryBinding>;
+  /**
+   * M11, present only on strict native listeners (`fdPassingInputStrict` with the addon in use): the
+   * `allowFdPassingInput` given to `listen()`. `server.serve()` throws a TypeError when it differs from the server's.
+   */
+  readonly strictFdPassingInput?: boolean;
+}
+
+/** Strict fd input (ListenOptions.fdPassingInputStrict), with the server's input setting. */
+interface Strict {
+  readonly allowFdInput: boolean;
+}
+
+/** The strict-mode settings of `options`, or undefined (the default: SO_PASSRIGHTS left alone). */
+function strictOf(options: ListenOptions): Strict | undefined {
+  return options.fdPassingInputStrict === true ? { allowFdInput: options.allowFdPassingInput === true } : undefined;
 }
 
 interface Waiter {
@@ -95,16 +130,26 @@ class NodeListenerImpl implements NodeListener {
     interfaces: readonly string[],
     options: RegistryBindOptions,
   ) => Promise<RegistryBinding>;
+  declare readonly strictFdPassingInput?: boolean;
   readonly #queue: ByteChannel[] = [];
   readonly #unix: UnixOwnership | undefined;
   #waiter: Waiter | undefined;
   #iterating = false;
   #closing: Promise<void> | undefined;
 
-  constructor(server: Server, address: string, onError: ((error: unknown) => void) | undefined, unix?: UnixOwnership) {
+  constructor(
+    server: Server,
+    address: string,
+    onError: ((error: unknown) => void) | undefined,
+    unix?: UnixOwnership,
+    native?: NativeAddon,
+    strict?: Strict,
+  ) {
     this.server = server;
     this.address = address;
     this.#unix = unix;
+    // Strict mode only with the addon in use (it is what sets SO_PASSRIGHTS): serve() checks it against the server.
+    if (native !== undefined && strict !== undefined) this.strictFdPassingInput = strict.allowFdInput;
     // Only a unix path socket can be a registry entry's target (absolute: the cwd may change later).
     const path = unixPath(address);
     if (path !== undefined) {
@@ -116,7 +161,21 @@ class NodeListenerImpl implements NodeListener {
           : (interfaces, options) => bindRegistry(target, interfaces, options);
     }
     server.on("connection", (socket) => {
-      const channel = fromNodeSocket(socket);
+      // pauseOnConnect: nothing was read yet, so the addon can take the fd over without losing a byte.
+      let channel: ByteChannel;
+      if (native === undefined) channel = fromNodeSocket(socket);
+      else
+        try {
+          channel = adoptAccepted(native, socket, strict !== undefined);
+        } catch (e) {
+          // Refused (the socket is closed): never served without the addon (M1). Reported like an accept failure.
+          try {
+            onError?.(e);
+          } catch {
+            // onError must not throw; if it does, the listener carries on.
+          }
+          return;
+        }
       if (this.#closing !== undefined) {
         channel.close();
         return;
@@ -439,7 +498,18 @@ async function listenPrivate(
   }
   // Listeners before any other await: errors and connections during the setup are handled.
   const unix: UnixOwnership = { path, inode: undefined };
-  const listener = new NodeListenerImpl(server, formatAddress({ kind: "unix", path }), options.onError, unix);
+  const native = usableNative(options.native);
+  const strict = strictOf(options);
+  const listener = new NodeListenerImpl(
+    server,
+    formatAddress({ kind: "unix", path }),
+    options.onError,
+    unix,
+    native,
+    strict,
+  );
+  // Still in the private 0700 directory: nobody has connected yet, so strict mode's SO_PASSRIGHTS holds for everyone.
+  if (native !== undefined) prepareListener(native, serverFd(server), strict);
   try {
     if (options.mode !== undefined) await chmod(socket, options.mode);
     const st = await lstat(socket);
@@ -451,6 +521,7 @@ async function listenPrivate(
     unix.inode = { dev: st.dev, ino: st.ino };
     await unlink(socket);
     await rmdir(dir);
+    if (native !== undefined) markEntrypoint(native, resolve(path));
     return listener;
   } catch (e) {
     // close() leaves `path` alone unless it is ours (inode set): only a failed cleanup gets here then.
@@ -481,11 +552,23 @@ async function listenUnixDirect(path: string, options: ListenOptions): Promise<N
   const server = createServer({ allowHalfOpen: true, pauseOnConnect: true });
   await bind(server, { path, ...(options.backlog === undefined ? {} : { backlog: options.backlog }) });
   const unix: UnixOwnership = { path, inode: undefined };
-  const listener = new NodeListenerImpl(server, formatAddress({ kind: "unix", path }), options.onError, unix);
+  const native = usableNative(options.native);
+  const strict = strictOf(options);
+  const listener = new NodeListenerImpl(
+    server,
+    formatAddress({ kind: "unix", path }),
+    options.onError,
+    unix,
+    native,
+    strict,
+  );
+  // Strict mode's known window (fallback only): reachable between Node's listen() and this setsockopt.
+  if (native !== undefined) prepareListener(native, serverFd(server), strict);
   try {
     if (options.mode !== undefined) await chmod(path, options.mode);
     const st = await lstat(path);
     unix.inode = { dev: st.dev, ino: st.ino };
+    if (native !== undefined) markEntrypoint(native, resolve(path));
     return listener;
   } catch (e) {
     await listener.close();
@@ -498,15 +581,28 @@ export function listenUnixWithHooks(path: string, options: ListenOptions, hooks:
   return listenUnix(path, options, hooks);
 }
 
+/** The fd of a listening Node server (libuv's), if it has one. */
+function serverFd(server: Server): number | undefined {
+  const fd = (server as unknown as { _handle?: { fd?: unknown } | null })._handle?.fd;
+  return typeof fd === "number" && fd >= 0 ? fd : undefined;
+}
+
 async function listenServer(
   options: BindOptions,
   address: (server: Server) => string,
   onError: ((error: unknown) => void) | undefined,
+  native?: NativeAddon,
+  strict?: Strict,
+  prepared = false,
 ): Promise<NodeListener> {
   const server = createServer({ allowHalfOpen: true, pauseOnConnect: true });
   await bind(server, options);
   try {
-    return new NodeListenerImpl(server, address(server), onError);
+    const listener = new NodeListenerImpl(server, address(server), onError, undefined, native, strict);
+    // Strict mode's known window for `unix:@`: reachable as soon as Node's listen() ran, before this setsockopt. A
+    // strict `{fd}` socket was `prepared` before Node took it, in listen().
+    if (native !== undefined && !prepared) prepareListener(native, serverFd(server), strict);
+    return listener;
   } catch (e) {
     server.close();
     throw e;
@@ -562,11 +658,31 @@ export async function listen(
   if (opts.onError !== undefined && typeof opts.onError !== "function")
     throw new TypeError("onError must be a function");
   const backlog = opts.backlog === undefined ? {} : { backlog: opts.backlog };
+  for (const key of ["allowFdPassingInput", "fdPassingInputStrict"] as const)
+    if (opts[key] !== undefined && typeof opts[key] !== "boolean") throw new TypeError(`${key} must be a boolean`);
+  const strict = strictOf(opts);
   if (typeof address === "object" && "fd" in address) {
     const fd = address.fd;
     if (!Number.isSafeInteger(fd) || fd < 0) throw new TypeError("fd must be a non-negative integer");
     const known = opts.address === undefined ? undefined : formatAddress(parseAddress(opts.address));
-    return listenServer({ fd, ...backlog }, (server) => known ?? addressOf(server, fd), opts.onError);
+    let native = usableNative(opts.native);
+    try {
+      if (native !== undefined && !native.isUnixSocket(fd)) native = undefined;
+    } catch {
+      native = undefined;
+    }
+    // Strict mode: on the inherited fd before Node serves it, as sd_varlink_server_listen_fd does (sd-varlink.c:
+    // 3787-3792); connections already in its backlog were made under the old setting.
+    const prepared = native !== undefined && strict !== undefined;
+    if (native !== undefined && strict !== undefined) prepareListener(native, fd, strict);
+    return listenServer(
+      { fd, ...backlog },
+      (server) => known ?? addressOf(server, fd),
+      opts.onError,
+      native,
+      strict,
+      prepared,
+    );
   }
   if (opts.address !== undefined) throw new TypeError("the address option is only valid with {fd}");
   const spec = typeof address === "string" ? parseAddress(address) : address;
@@ -576,7 +692,13 @@ export async function listen(
     case "unix-abstract":
       if (process.platform !== "linux")
         throw new OperationNotSupportedError(`abstract unix sockets (unix:@) need Linux, not ${process.platform}`);
-      return listenServer({ path: `\0${spec.name}`, ...backlog }, () => formatAddress(spec), opts.onError);
+      return listenServer(
+        { path: `\0${spec.name}`, ...backlog },
+        () => formatAddress(spec),
+        opts.onError,
+        usableNative(opts.native),
+        strict,
+      );
     case "tcp":
       return listenServer(
         { host: spec.host, port: spec.port, ...backlog },

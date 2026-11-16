@@ -39,6 +39,8 @@ const COMMANDS: Readonly<Record<string, Table>> = {
     oneway: { type: "boolean" },
     upgrade: { type: "boolean" },
     graceful: { type: "string", multiple: true },
+    exec: { type: "boolean" },
+    "push-fd": { type: "string", multiple: true },
   },
   "validate-idl": {},
   format: { check: { type: "boolean" }, "in-place": { type: "boolean", short: "i" } },
@@ -74,6 +76,10 @@ export interface CommandLine {
   readonly mode: CallMode;
   /** `--graceful` error names, sorted and unique. */
   readonly graceful: readonly string[];
+  /** `call --exec` (M11): run the command after the arguments with the reply on stdin and the reply's fds. */
+  readonly exec: boolean;
+  /** `call --push-fd=` values (M11), in order: fd numbers or paths (`/…`, `./…`). */
+  readonly pushFds: readonly string[];
   readonly check: boolean;
   readonly inPlace: boolean;
   readonly output: string | undefined;
@@ -271,6 +277,8 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
   let importPath: string | undefined;
   let address: string | undefined;
   let upgrade = false;
+  let exec = false;
+  const pushFds: string[] = [];
   for (const token of parsed.tokens) {
     if (token.kind !== "option") continue;
     if (defs[token.name]?.shortOnly === true && token.rawName.startsWith("--"))
@@ -319,6 +327,12 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
       case "upgrade":
         upgrade = true;
         break;
+      case "exec":
+        exec = true;
+        break;
+      case "push-fd":
+        pushFds.push(value);
+        break;
       case "graceful":
         if (!isQualifiedName(value)) throw new UsageError(`Not a valid Varlink error name: ${escapeControls(value)}`);
         graceful.add(value);
@@ -345,8 +359,9 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
         break;
     }
   }
-  // varlinkctl's check and message (verb_call); --push-fd= is M11's.
-  if (upgrade && (modes.size > 0 || graceful.size > 0))
+  // varlinkctl's checks and messages (verb_call, varlinkctl.c:920-925 at 6bd4689f).
+  if (exec && modes.size > 0) throw new UsageError("--exec and --collect/--more/--oneway may not be combined.");
+  if (upgrade && (modes.size > 0 || graceful.size > 0 || pushFds.length > 0))
     throw new UsageError("--upgrade may not be combined with --collect/--more/--oneway/--push-fd=/--graceful.");
   if (upgrade) mode = "upgrade";
   if (modes.size > 1) throw new UsageError("--more/-E, --collect and --oneway are mutually exclusive.");
@@ -361,6 +376,8 @@ export function parseCommandLine(argv: readonly string[]): CommandLine {
     timeout,
     mode,
     graceful: [...graceful].sort(),
+    exec,
+    pushFds,
     check,
     inPlace,
     output,
@@ -380,6 +397,8 @@ const EMPTY: CommandLine = {
   timeout: undefined,
   mode: "single",
   graceful: [],
+  exec: false,
+  pushFds: [],
   check: false,
   inPlace: false,
   output: undefined,

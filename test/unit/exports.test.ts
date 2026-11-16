@@ -110,13 +110,14 @@ test("varlink-js/codegen exports generate(); the root entry the typed-client run
   assert.equal("OrgVarlinkService" in root, false);
 });
 
-test("varlink-js/node exports the socket adapter (M4), spawning, activation, registry and resolver (M8)", () => {
+test("varlink-js/node exports the socket adapter (M4), spawning, activation, registry and resolver (M8), fdHandle (M11)", () => {
   const fns = [
     "bindRegistry",
     "connect",
     "connectBridge",
     "connectExec",
     "createPool",
+    "fdHandle",
     "fromNodeSocket",
     "fromNodeStreams",
     "listen",

@@ -1,7 +1,7 @@
 // Runs one call's handler and produces its replies through a ServerSession (DESIGN.md §5.4, §4.10): the
 // dispatch table, the streaming handler contract, error mapping and reply validation. No timers, no I/O except
 // through `send`.
-import { ConnectionClosedError, isVarlinkLocalError } from "../errors/local.ts";
+import { ConnectionClosedError, isVarlinkLocalError, OperationNotSupportedError } from "../errors/local.ts";
 import {
   ExpectedMoreError,
   ExpectedUpgradeError,
@@ -14,7 +14,8 @@ import {
 import { isErrorName, isVarlinkError, type VarlinkError } from "../errors/varlink-error.ts";
 import { isInterfaceName, isMemberName } from "../idl/names.ts";
 import type { Validator } from "../types/compile.ts";
-import type { ByteChannel } from "./channel.ts";
+import { SCM_MAX_FD, type ByteChannel, type FdHandle, type PeerCredentials } from "./channel.ts";
+import { closeFds, handOver } from "./framer.ts";
 import { isPlainObject, type Call } from "./messages.ts";
 import type { ServerSession } from "./server-session.ts";
 
@@ -71,6 +72,34 @@ export interface CallContext {
    * busy-loops for a oneway or non-`more` call. Methods meant to stream should declare `more: "requires"`.
    */
   notify(parameters: Record<string, unknown>): Promise<void>;
+  /**
+   * The client's credentials (M11): set on connections that have them (unix sockets through the native addon,
+   * §4.15), read once when the connection was accepted. Its `pidfd` (fetched on first access, Linux ≥ 6.5) is a view:
+   * the connection owns and closes it, its `close()` does nothing, and its `fd` is -1 once the connection closed.
+   */
+  readonly peer: PeerCredentials | undefined;
+  /**
+   * The fds that came with this call (M11; empty unless the server allows fd passing input), as views: they belong to
+   * the library and are closed when the call is finished, unless claimed with {@link takeFd}. A view's `close()` does
+   * nothing (use takeFd to own one), and its `fd` is -1 once the fd was claimed or closed, so a stale number is never
+   * used after the call or the claim.
+   */
+  readonly fds: readonly FdHandle[];
+  /**
+   * Claims fd number `index` of {@link fds}: the handle is the caller's from now on (close it when done), and it is
+   * not closed when the call ends. Throws `InvalidParameterError({parameter})` (default parameter name `"fds"`) if
+   * there is no such fd or it was claimed already, so a handler can let it propagate as the call's error.
+   */
+  takeFd(index: number, parameter?: string): FdHandle;
+  /**
+   * Attaches fds to the next reply of this call (a `notify`, a yielded or returned value, or an error), like
+   * sd_varlink_push_fd (sd-varlink.c:3258-3277). Each fd (a number or an FdHandle) is duplicated at once
+   * (close-on-exec): the caller keeps its own fd and may close it right away; the duplicates are closed once the
+   * reply was written or dropped. Throws OperationNotSupportedError unless the server allows fd passing output on
+   * this connection, RangeError past 253 fds per reply (SCM_MAX_FD; sd-varlink.c:3268 refuses early too) and
+   * TypeError for anything but a non-negative integer fd.
+   */
+  pushFds(...fds: readonly (FdHandle | number)[]): void;
 }
 
 // `void` in the result types lets handlers without a return statement (`async () => {}`) type-check.
@@ -151,6 +180,23 @@ export interface DispatchOptions {
    * rejects (unavailable), and a confirmed upgrade is `upgrade-unclaimed`.
    */
   upgrade?: () => ByteChannel;
+  /** M11: fds received with the call (`ctx.fds`); dispatch owns them and closes those not claimed at the end. */
+  fds?: readonly FdHandle[] | undefined;
+  /** M11: the client's credentials (`ctx.peer`). */
+  peer?: PeerCredentials | undefined;
+  /**
+   * M11: duplicates an fd for `ctx.pushFds` (the channel's `fdPassing.duplicate`); absent unless the server allows fd
+   * passing output on this connection (then `pushFds` throws OperationNotSupportedError).
+   */
+  duplicateFd?: ((fd: number) => FdHandle) | undefined;
+}
+
+/** A caller's fd (a number or an FdHandle) as a number. @throws {TypeError} unless a non-negative integer. */
+export function fdNumber(fd: unknown): number {
+  const n = typeof fd === "object" && fd !== null ? (fd as { fd?: unknown }).fd : fd;
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0 || n > 0x7fffffff)
+    throw new TypeError("an fd must be a non-negative integer or an object with one in `fd`");
+  return n;
 }
 
 /**
@@ -222,8 +268,13 @@ class Dispatch {
   readonly #id: number;
   readonly #call: Call;
   readonly #table: DispatchTable;
-  readonly #send: (bytes: Uint8Array) => Promise<void>;
+  readonly #send: (bytes: Uint8Array, fds?: readonly FdHandle[]) => Promise<void>;
   readonly #options: DispatchOptions;
+  /** The call's received fds (M11); a claimed slot (takeFd) is undefined. Unclaimed ones are closed at the end. */
+  readonly #received: (FdHandle | undefined)[];
+  readonly #receivedView: readonly FdHandle[];
+  /** Duplicates made by ctx.pushFds for the next reply (M11): owned here, closed once written or at the end. */
+  #pushed: FdHandle[] = [];
   readonly #mode: ValidateReplies;
   readonly #controller = new AbortController();
   #entry: MethodEntry | undefined;
@@ -250,7 +301,7 @@ class Dispatch {
     id: number,
     call: Call,
     table: DispatchTable,
-    send: (bytes: Uint8Array) => Promise<void>,
+    send: (bytes: Uint8Array, fds?: readonly FdHandle[]) => Promise<void>,
     options: DispatchOptions,
   ) {
     this.#session = session;
@@ -259,6 +310,21 @@ class Dispatch {
     this.#table = table;
     this.#send = send;
     this.#options = options;
+    this.#received = [...(options.fds ?? [])];
+    // What handlers see (DESIGN.md §5.4): views that cannot close our fd and report -1 once it is no longer ours to
+    // lend (claimed with takeFd, or closed when the call finished), so a stale number is never used.
+    const received = this.#received;
+    this.#receivedView = Object.freeze(
+      received.map((owned, i): FdHandle => {
+        const n = owned?.fd ?? -1;
+        return Object.freeze({
+          get fd() {
+            return received[i] === undefined ? -1 : n;
+          },
+          close: () => undefined,
+        });
+      }),
+    );
     // Untyped callers may pass anything; dispatch never rejects, so an unknown mode means the default.
     const mode = options.validateReplies;
     this.#mode = mode === "off" || mode === "throw" ? mode : "warn";
@@ -301,6 +367,10 @@ class Dispatch {
       this.#sendError(InternalError.errorName, {});
     }
     await this.#chain;
+    // The call is finished: fds nobody claimed, and pushed ones no reply took, are closed (DESIGN.md §4.1).
+    closeFds(this.#received.filter((fd) => fd !== undefined));
+    this.#received.length = 0;
+    closeFds(this.#pushed.splice(0));
     closedSignal.removeEventListener("abort", onClosed);
     if (this.#call.upgrade && this.#session.state === "upgraded" && !this.#claimed)
       this.#report(
@@ -462,7 +532,41 @@ class Dispatch {
       upgrade: (parameters) => quiet(this.#upgrade(parameters)),
       ext: call.ext,
       notify: (parameters) => this.#notify(parameters),
+      peer: this.#options.peer,
+      fds: this.#receivedView,
+      takeFd: (index, parameter) => this.#takeFd(index, parameter),
+      pushFds: (...fds) => {
+        this.#pushFds(fds);
+      },
     };
+  }
+
+  #takeFd(index: unknown, parameter: unknown): FdHandle {
+    const name = typeof parameter === "string" ? parameter : "fds";
+    const fd = typeof index === "number" && Number.isSafeInteger(index) ? this.#received[index] : undefined;
+    if (fd === undefined) throw new InvalidParameterError({ parameter: name });
+    this.#received[index as number] = undefined;
+    handOver([fd]);
+    return fd;
+  }
+
+  #pushFds(fds: readonly unknown[]): void {
+    const duplicate = this.#options.duplicateFd;
+    if (duplicate === undefined)
+      throw new OperationNotSupportedError("fd passing output is not enabled on this connection");
+    const numbers = fds.map(fdNumber);
+    if (this.#pushed.length + numbers.length > SCM_MAX_FD)
+      throw new RangeError(`at most ${String(SCM_MAX_FD)} fds per message (SCM_MAX_FD)`);
+    const copies: FdHandle[] = [];
+    try {
+      for (const n of numbers) copies.push(duplicate(n));
+    } catch (e) {
+      closeFds(copies);
+      throw e;
+    }
+    // A reply after the call is over takes nothing: close them now rather than at the end.
+    if (this.#done && this.#settled) closeFds(copies);
+    else this.#pushed.push(...copies);
   }
 
   /** Why ctx.upgrade() cannot be used for this call, or undefined if it can. */
@@ -702,12 +806,16 @@ class Dispatch {
     if (final) this.#done = true;
     if (bytes !== null) {
       const chunk = bytes;
+      // ctx.pushFds' duplicates ride with this message and are closed once it was written (or dropped).
+      const fds = this.#pushed.splice(0);
       this.#chain = this.#chain.then(async () => {
-        if (this.#dead) return;
         try {
-          await this.#send(chunk);
+          if (this.#dead) return;
+          await (fds.length > 0 ? this.#send(chunk, fds) : this.#send(chunk));
         } catch (e) {
           this.#sendFailed(e);
+        } finally {
+          closeFds(fds);
         }
       });
     }
@@ -746,7 +854,7 @@ export async function dispatchCall(
   id: number,
   call: Call,
   table: DispatchTable,
-  send: (bytes: Uint8Array) => Promise<void>,
+  send: (bytes: Uint8Array, fds?: readonly FdHandle[]) => Promise<void>,
   options?: DispatchOptions,
 ): Promise<void> {
   await new Dispatch(session, id, call, table, send, options ?? {}).run();

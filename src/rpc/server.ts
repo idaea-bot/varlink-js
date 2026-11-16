@@ -2,7 +2,7 @@
 // over ServerSession + dispatchCall (DESIGN.md §4.10 contract), accept loops, limits and shutdown.
 import { ConnectionClosedError, OperationNotSupportedError, safeQuote } from "../core/errors/local.ts";
 import { INTERNAL_ERROR_INTERFACE, ORG_VARLINK_SERVICE } from "../core/errors/standard.ts";
-import type { ByteChannel, ReadChunk } from "../core/protocol/channel.ts";
+import type { ByteChannel, FdHandle, PeerCredentials, ReadChunk } from "../core/protocol/channel.ts";
 import {
   dispatchCall,
   type CallContext,
@@ -12,7 +12,7 @@ import {
   type Handler,
   type ValidateReplies,
 } from "../core/protocol/dispatch.ts";
-import { checkMaxMessageSize } from "../core/protocol/framer.ts";
+import { checkMaxMessageSize, closeFds } from "../core/protocol/framer.ts";
 import { isPlainObject } from "../core/protocol/messages.ts";
 import { DEFAULT_MAX_QUEUED_CALLS, ServerSession } from "../core/protocol/server-session.ts";
 import { jsonCodec, type Codec } from "../core/types/codec.ts";
@@ -34,8 +34,15 @@ export type ServerErrorReason =
   | "protocol-error"
   /** `read()` rejected (e.g. a reset); the connection was closed. */
   | "transport-error"
-  /** A channel arrived while `maxConnections` were open; it was closed at once. */
+  /** A channel arrived while `maxConnections` (or `maxConnectionsPerUid` of its UID) were open; it was closed at once. */
   | "connection-limit"
+  /**
+   * M11: a channel was refused because the per-UID limit needs its peer's credentials and they could not be read, or
+   * name an invalid UID (sd-varlink.c:3494-3497, 3568-3570); it was closed at once.
+   */
+  | "connection-refused"
+  /** M11: the kernel dropped the fds that came with a call (MSG_CTRUNC); the call went on without them. */
+  | "fds-dropped"
   /** A served listener's iteration failed; that accept loop ended and the listener was closed. */
   | "accept-failed"
   /** Removing a listener's registry entries failed (shutdown, or its accept loop ended); the rest carried on. */
@@ -65,6 +72,22 @@ export interface ServerOptions {
   maxQueuedCalls?: number;
   /** Open connections; more are closed at once (`connection-limit`); default 4096. */
   maxConnections?: number;
+  /**
+   * M11, opt-in like sd-varlink's SD_VARLINK_SERVER_ACCOUNT_UID (sd-varlink.c:3492, 3518): unset (default), connections
+   * are not counted per UID; a number enforces it (sd-varlink uses 128 with the flag, sd-varlink.c:47). More are
+   * closed at once (`connection-limit`), root not exempt (validate_connection, sd-varlink.c:3492-3505). Counted for
+   * channels that know their peer (`capabilities.peer`: unix sockets through varlink-js-native, §4.15); a channel
+   * whose credentials cannot be read, or name an invalid UID, is refused (`connection-refused`,
+   * sd-varlink.c:3494-3497, 3568-3570); channels without the capability (tcp, plain Node sockets) are not counted.
+   */
+  maxConnectionsPerUid?: number;
+  /**
+   * M11: accept fds sent with calls (`ctx.fds`), on connections that can pass fds (SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT).
+   * Default false: fds that arrive anyway are closed and the connection is closed as a protocol error.
+   */
+  allowFdPassingInput?: boolean;
+  /** M11: let handlers send fds with replies (`ctx.pushFds`; SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT). Default false. */
+  allowFdPassingOutput?: boolean;
   /**
    * Exit-on-idle for socket-activated services (§5.8), in ms: once serving started (the first `serve()` or
    * `handle()`), the server shuts down (graceful defaults) when it had no open connection for this long; a new
@@ -139,6 +162,13 @@ export interface ServeListener extends AsyncIterable<ByteChannel> {
    * unix-path listener has it, see `varlink-js/node` `bindRegistry`). Used by `serve(listener, {registry})`.
    */
   bindRegistry?(interfaces: readonly string[], options: RegistryBindOptions): Promise<RegistryBinding>;
+  /**
+   * M11: present on a strict listener (`varlink-js/node` `listen(…, {native, fdPassingInputStrict: true})`): the
+   * `allowFdPassingInput` its listening socket's SO_PASSRIGHTS was set from. `serve()` refuses a listener whose value
+   * differs from the server's (TypeError), since connections accepted from it would refuse (or take) fds until the
+   * server switches each one.
+   */
+  readonly strictFdPassingInput?: boolean;
 }
 
 /** Options for {@link Server.serve}. */
@@ -170,12 +200,24 @@ export interface ShutdownOptions {
 
 const DEFAULT_MAX_CONNECTIONS = 4096;
 
+/** UID_INVALID ((uid_t) -1) and anything that is no uid_t: refused like sd-varlink's !uid_is_valid. */
+function validUid(uid: unknown): uid is number {
+  // systemd's uid_is_valid (user-util.c:52-65): not UID_INVALID (0xFFFFFFFF), nor the 16-bit -1 (0xFFFF).
+  return typeof uid === "number" && Number.isSafeInteger(uid) && uid >= 0 && uid < 0xffffffff && uid !== 0xffff;
+}
+
 /** Graceful close: how long input is discarded after our FIN before the connection is closed hard (ms). */
 const GRACEFUL_LINGER_MS = 2000;
 
 function defaultOnError(_error: unknown, info: { method?: string; reason: ServerErrorReason }): void {
   const where = info.method === undefined ? "" : ` in ${safeQuote(info.method)}`;
   console.warn(`varlink-js server: ${info.reason}${where} (set the server's onError to handle it)`);
+}
+
+function checkFlag(value: unknown, name: string): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") throw new TypeError(`${name} must be a boolean`);
+  return value;
 }
 
 function infoString(value: unknown, name: string): string {
@@ -218,11 +260,18 @@ interface ConnectionHost {
   report(error: unknown, reason: ServerErrorReason, method?: string): void;
 }
 
+/** Per-connection dispatch extras (M11): the peer's credentials and fd output. */
+interface ConnectionExtras {
+  readonly peer: PeerCredentials | undefined;
+  readonly duplicateFd: ((fd: number) => FdHandle) | undefined;
+}
+
 /** One served connection: a reader task and a dispatcher task over one ServerSession (DESIGN.md §4.10). */
 class ServerConnection {
   readonly #channel: ByteChannel;
   readonly #session: ServerSession;
   readonly #host: ConnectionHost;
+  readonly #extras: ConnectionExtras;
   readonly #readerWake = new Wakeup();
   readonly #dispatcherWake = new Wakeup();
   /** The driver signal of the active call. */
@@ -245,10 +294,11 @@ class ServerConnection {
   /** Resolves when the transport was handed to an upgrade handler (graceful shutdown does not wait for it). */
   readonly released: Promise<void>;
 
-  constructor(channel: ByteChannel, session: ServerSession, host: ConnectionHost) {
+  constructor(channel: ByteChannel, session: ServerSession, host: ConnectionHost, extras: ConnectionExtras) {
     this.#channel = channel;
     this.#session = session;
     this.#host = host;
+    this.#extras = extras;
     this.released = new Promise((resolve) => {
       this.#resolveReleased = resolve;
     });
@@ -328,16 +378,28 @@ class ServerConnection {
         const state: string = session.state;
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
         if (!this.#closing && this.#finishing === undefined && state === "upgraded") {
-          // After the confirming reply, before the hand-over: kept for the upgraded channel.
+          // After the confirming reply, before the hand-over: kept for the upgraded channel (bytes only: the
+          // session closes any fds).
           if (chunk === null) this.#upgradeEnd = {};
-          else session.receive(chunk.bytes);
+          else session.receive(chunk.bytes, chunk.fds);
           return;
         }
         // Closing, finishing or no longer open: the top of the loop decides (the chunk is dropped).
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- may change during the await
-        if (this.#closing || this.#finishing !== undefined || session.state !== "open") continue;
+        if (this.#closing || this.#finishing !== undefined || session.state !== "open") {
+          closeFds(chunk?.fds);
+          continue;
+        }
         if (chunk === null) session.receiveEnd();
-        else session.receive(chunk.bytes);
+        else {
+          if (chunk.fdError === "truncated")
+            // MSG_CTRUNC: the call goes on without its fds (json-stream.c:1308-1317 logs, drops, continues).
+            this.#host.report(
+              new Error("file descriptors were dropped: the kernel truncated their control data (MSG_CTRUNC)"),
+              "fds-dropped",
+            );
+          session.receive(chunk.bytes, chunk.fds);
+        }
         this.#dispatcherWake.notify();
       }
     } catch (e) {
@@ -365,8 +427,12 @@ class ServerConnection {
   async #discard(ended: Promise<void>): Promise<void> {
     await ended;
     try {
-      while (!this.#closing && (await this.#channel.read()) !== null) {
-        // dropped
+      for (;;) {
+        if (this.#closing) break;
+        const chunk = await this.#channel.read();
+        if (chunk === null) break;
+        // dropped (fds included)
+        closeFds(chunk.fds);
       }
     } catch {
       // The peer is gone: nothing left to protect.
@@ -398,6 +464,7 @@ class ServerConnection {
         }
         // Graceful shutdown: buffered calls are dropped unanswered.
         if (this.#draining) {
+          closeFds(ev.fds);
           graceful = true;
           break;
         }
@@ -405,11 +472,21 @@ class ServerConnection {
         this.#readerWake.notify();
         const ac = new AbortController();
         this.#active = ac;
-        await dispatchCall(session, ev.id, ev.call, this.#host.table, (bytes) => this.#channel.write(bytes), {
-          ...this.#host.dispatchOptions,
-          signal: ac.signal,
-          upgrade: () => this.#handOver(),
-        });
+        await dispatchCall(
+          session,
+          ev.id,
+          ev.call,
+          this.#host.table,
+          (bytes, fds) => (fds === undefined ? this.#channel.write(bytes) : this.#channel.write(bytes, fds)),
+          {
+            ...this.#host.dispatchOptions,
+            signal: ac.signal,
+            upgrade: () => this.#handOver(),
+            fds: ev.fds,
+            peer: this.#extras.peer,
+            duplicateFd: this.#extras.duplicateFd,
+          },
+        );
         this.#active = undefined;
         this.#readerWake.notify();
         // Upgraded: the handler took the transport (ctx.upgrade), or nobody did (dispatch reported
@@ -488,6 +565,12 @@ export class Server {
   readonly #maxMessageSize: number;
   readonly #maxQueuedCalls: number;
   readonly #maxConnections: number;
+  /** Undefined: no per-UID accounting (M11: opt-in, like SD_VARLINK_SERVER_ACCOUNT_UID). */
+  readonly #maxConnectionsPerUid: number | undefined;
+  readonly #allowFdInput: boolean;
+  readonly #allowFdOutput: boolean;
+  /** Open connections per peer UID (only those whose channel knows its peer), like sd-varlink's by_uid. */
+  readonly #byUid = new Map<number, number>();
   readonly #interfaces = new Map<string, RegisteredInterface>();
   readonly #service: RegisteredInterface;
   readonly #internal: RegisteredInterface;
@@ -521,6 +604,12 @@ export class Server {
     this.#maxMessageSize = checkMaxMessageSize(options?.maxMessageSize);
     this.#maxQueuedCalls = checkPositiveInt(options?.maxQueuedCalls, "maxQueuedCalls", DEFAULT_MAX_QUEUED_CALLS);
     this.#maxConnections = checkPositiveInt(options?.maxConnections, "maxConnections", DEFAULT_MAX_CONNECTIONS);
+    this.#maxConnectionsPerUid =
+      options?.maxConnectionsPerUid === undefined
+        ? undefined
+        : checkPositiveInt(options.maxConnectionsPerUid, "maxConnectionsPerUid", 1);
+    this.#allowFdInput = checkFlag(options?.allowFdPassingInput, "allowFdPassingInput");
+    this.#allowFdOutput = checkFlag(options?.allowFdPassingOutput, "allowFdPassingOutput");
     const exitOnIdle = options?.exitOnIdle;
     if (exitOnIdle !== undefined && (typeof exitOnIdle !== "number" || !Number.isFinite(exitOnIdle) || exitOnIdle < 0))
       throw new RangeError("exitOnIdle must be a finite non-negative number of milliseconds");
@@ -601,8 +690,11 @@ export class Server {
   }
 
   /**
-   * Serves one connection; resolves when it is closed, never rejects. After {@link shutdown}, or at
-   * `maxConnections`, the channel is closed at once (the latter reported as `connection-limit`).
+   * Serves one connection; resolves when it is closed, never rejects. After {@link shutdown}, at `maxConnections`,
+   * or (with `maxConnectionsPerUid` set) at that many connections of the channel's peer UID, the channel is closed at
+   * once (`connection-limit`); with `maxConnectionsPerUid` set, a channel whose credentials cannot be read or name an
+   * invalid UID is refused too (`connection-refused`). On an fd-capable channel, fd input and output are set per
+   * `allowFdPassingInput`/`allowFdPassingOutput`.
    */
   async handle(channel: ByteChannel): Promise<void> {
     if (this.#shutdown !== undefined) {
@@ -612,6 +704,67 @@ export class Server {
     this.#serving = true;
     if (this.#connections.size >= this.#maxConnections) {
       this.#report(new Error(`connection limit (${String(this.#maxConnections)}) reached`), "connection-limit");
+      channel.close();
+      return;
+    }
+    let peer: PeerCredentials | undefined;
+    let peerError: { value: unknown } | undefined;
+    try {
+      peer = channel.capabilities.peer?.();
+    } catch (e) {
+      peerError = { value: e };
+    }
+    // sd-varlink's per-UID accounting, only with SD_VARLINK_SERVER_ACCOUNT_UID (validate_connection/count_connection,
+    // sd-varlink.c:3492-3531): the total limit first, then the UID's; a connection over it is refused (closed), root
+    // included. Credentials that cannot be read, or an invalid UID, are refused as well (3494-3497, 3568-3570).
+    const max = this.#maxConnectionsPerUid;
+    let uid: number | undefined;
+    if (max !== undefined && (peerError !== undefined || peer !== undefined)) {
+      if (peerError !== undefined || !validUid(peer?.uid)) {
+        this.#report(
+          new Error("the peer's credentials could not be read or name an invalid UID: refused", {
+            cause: peerError?.value,
+          }),
+          "connection-refused",
+        );
+        channel.close();
+        return;
+      }
+      uid = peer.uid;
+    }
+    if (max !== undefined && uid !== undefined) {
+      const count = this.#byUid.get(uid) ?? 0;
+      if (count >= max) {
+        this.#report(
+          new Error(`per-UID connection limit (${String(max)}) reached for UID ${String(uid)}`),
+          "connection-limit",
+        );
+        channel.close();
+        return;
+      }
+      this.#byUid.set(uid, count + 1);
+    }
+    try {
+      await this.#serveChannel(channel, peer);
+    } finally {
+      if (uid !== undefined) {
+        const count = (this.#byUid.get(uid) ?? 1) - 1;
+        if (count <= 0) this.#byUid.delete(uid);
+        else this.#byUid.set(uid, count);
+      }
+    }
+  }
+
+  async #serveChannel(channel: ByteChannel, peer: PeerCredentials | undefined): Promise<void> {
+    const fdPassing = channel.capabilities.fdPassing;
+    let duplicateFd: ((fd: number) => FdHandle) | undefined;
+    try {
+      fdPassing?.setAcceptInput(this.#allowFdInput);
+      fdPassing?.setAllowOutput(this.#allowFdOutput);
+      if (fdPassing !== undefined && this.#allowFdOutput) duplicateFd = (fd) => fdPassing.duplicate(fd);
+    } catch (e) {
+      // The channel is broken already (e.g. closed under us): nothing to serve.
+      this.#report(e, "transport-error");
       channel.close();
       return;
     }
@@ -629,7 +782,7 @@ export class Server {
       this.#updateIdle();
       return;
     }
-    const conn = new ServerConnection(channel, session, this.#host);
+    const conn = new ServerConnection(channel, session, this.#host, { peer, duplicateFd });
     this.#connections.add(conn);
     this.#updateIdle();
     const done = conn.run().catch((e: unknown) => {
@@ -676,8 +829,10 @@ export class Server {
    * served and is closed (connections accepted meanwhile are served on). Await or handle it when using `registry`
    * (an unhandled rejection ends a Node process).
    *
-   * @throws {TypeError} if `listener` is already being served by this server (it is left alone), or for invalid
-   *   `options` (an unknown or unregistered interface, a built-in one, a bad `directory`/`scope`).
+   * @throws {TypeError} if `listener` is already being served by this server (it is left alone), if it is a strict
+   *   listener set up with another `allowFdPassingInput` than this server's ({@link ServeListener.strictFdPassingInput};
+   *   left alone), or for invalid `options` (an unknown or unregistered interface, a built-in one, a bad
+   *   `directory`/`scope`).
    * @throws {OperationNotSupportedError} if `registry` is requested and the listener has no `bindRegistry` (a TCP,
    *   abstract or stdio listener); it is left alone.
    * @throws whatever `listener[Symbol.asyncIterator]()` throws (a Node listener: TypeError when another Server
@@ -687,6 +842,12 @@ export class Server {
   serve(listener: ServeListener, options: ServeOptions): Promise<void>;
   serve(listener: ServeListener, options?: ServeOptions): Promise<void> | void {
     if (this.#listeners.has(listener)) throw new TypeError("this listener is already being served");
+    const strict = listener.strictFdPassingInput;
+    if (strict !== undefined && strict !== this.#allowFdInput)
+      throw new TypeError(
+        `the strict listener was set up with allowFdPassingInput ${String(strict)}, the server has ` +
+          `${String(this.#allowFdInput)}: pass the server's allowFdPassingInput to listen()`,
+      );
     const registry = this.#registryRequest(options);
     if (registry !== undefined && typeof listener.bindRegistry !== "function")
       throw new OperationNotSupportedError("this listener cannot be published in a registry (not a unix path socket)");

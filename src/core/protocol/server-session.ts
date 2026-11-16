@@ -2,8 +2,9 @@
 // per non-oneway call, none for oneway, bounded read-ahead, a pause after an upgrade call.
 import { ProtocolError } from "../errors/local.ts";
 import { jsonCodec, type Codec } from "../types/codec.ts";
+import type { FdHandle } from "./channel.ts";
 import { concat } from "./client-session.ts";
-import { checkMaxMessageSize, Framer, frameMessage } from "./framer.ts";
+import { checkMaxMessageSize, closeFds, Framer, frameMessage } from "./framer.ts";
 import { decodeCall, encodeReply, type Call } from "./messages.ts";
 
 /** Default `maxQueuedCalls`: complete messages buffered before the driver stops reading. */
@@ -21,7 +22,13 @@ export interface ServerSessionOptions {
 
 /** What {@link ServerSession.nextEvent} returns. */
 export type ServerEvent =
-  | { type: "call"; id: number; call: Call }
+  | {
+      type: "call";
+      id: number;
+      call: Call;
+      /** fds that came with the call (M11): owned by whoever handles the event (dispatch closes unclaimed ones). */
+      fds?: FdHandle[];
+    }
   | {
       type: "close";
       /**
@@ -81,7 +88,7 @@ export class ServerSession {
    * False while maxQueuedCalls complete messages are buffered, while at least one complete message is buffered and
    * the buffered bytes reach maxMessageSize, while paused after an upgrade call, after EOF, after a framing error,
    * or when not open: the driver stops reading (backpressure). The byte bound is like sd-varlink's 16 MiB input
-   * buffer cap (json-stream.c:1240), with room for one partial message: without a complete message the driver
+   * buffer cap (json-stream.c:1245-1246), with room for one partial message: without a complete message the driver
    * keeps reading (the partial message needs it; the framer caps it at maxMessageSize). So a connection buffers at
    * most about 2 × maxMessageSize + one read chunk; as the framer's buffer doubles, its capacity is about
    * 4 × maxMessageSize in the worst case while reading, and drops back once the messages are consumed.
@@ -98,14 +105,22 @@ export class ServerSession {
     );
   }
 
-  /** Bytes read from the peer. */
-  receive(bytes: Uint8Array): void {
-    if (this.#state === "closed") return;
+  /**
+   * Bytes read from the peer, with the chunk's `fds`/`fdError` (M11, {@link Framer.push}): a call's fds come with
+   * its `call` event; fds after the session closed or upgraded are closed.
+   */
+  receive(bytes: Uint8Array, fds?: readonly FdHandle[]): void {
+    if (this.#state === "closed") {
+      closeFds(fds);
+      return;
+    }
     if (this.#remainder !== null) {
+      // Upgraded: the stream is bytes only.
+      closeFds(fds);
       if (bytes.length > 0) this.#remainder.push(bytes.slice());
       return;
     }
-    this.#framer.push(bytes);
+    this.#framer.push(bytes, fds);
   }
 
   /** The peer closed its side (EOF). Buffered complete calls are still delivered; a partial message is discarded. */
@@ -128,25 +143,30 @@ export class ServerSession {
     }
     if (this.#active !== null) return null;
     let call: Call;
+    let fds: FdHandle[] = [];
     try {
       const text = this.#framer.next();
       if (text === null) {
         if (!this.#eof) return null;
         this.#closeDelivered = true;
+        this.#framer.discardFds();
         this.#setClosed();
         return { type: "close" };
       }
+      fds = this.#framer.takeFds();
       call = decodeCall(this.#codec.decode(text));
     } catch (e) {
+      closeFds(fds);
       this.#closeDelivered = true;
       const error = e instanceof ProtocolError ? e : new ProtocolError("malformed message", { cause: e });
+      this.#framer.discardFds();
       this.#setClosed();
       return { type: "close", error };
     }
     const id = this.#nextId++;
     this.#active = { id, call, plain: false };
     if (call.upgrade) this.#paused = true;
-    return { type: "call", id, call };
+    return fds.length > 0 ? { type: "call", id, call, fds } : { type: "call", id, call };
   }
 
   /**
@@ -262,6 +282,7 @@ export class ServerSession {
     const wasOpen = this.#state === "open";
     this.#state = "closed";
     this.#active = null;
+    this.#framer.discardFds();
     if (wasOpen && !this.#closeDelivered && this.#closeEvent === null) this.#closeEvent = { type: "close" };
     this.#setClosed();
   }
